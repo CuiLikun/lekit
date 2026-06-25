@@ -1,0 +1,81 @@
+# rerun: rerun+http://localhost:9876/proxy
+
+# Robot configuration
+robot:
+  type: ros_robot
+  enable: bimanual
+  cameras:
+    head: { type: opencv, camera_index: 4, fps: 60, width: 640, height: 480, fourcc: MJPG }
+    left: { type: opencv, camera_index: 2, fps: 60, width: 640, height: 480, fourcc: MJPG }
+    right: { type: opencv, camera_index: 0, fps: 60, width: 640, height: 480, fourcc: MJPG }
+
+# Batch of tasks to execute. Each number corresponds to a task ID defined below.
+batch: [1, 2, 3, 4, 5, 6]  
+
+# Task configuration
+tasks:
+  - id: 1
+    prompt: pick up the yellow bin from the table with the right arm
+    policy: tcp://172.20.69.32:9005
+    budget: 60.0  # time budget in seconds
+    preset:
+      location: C
+      torso_height: 0.55
+      joint_angles:
+        - [0.3,0.0,0.0,2.1,0.0,0.27,0.0,0.0,-0.3,0.0,0.0,-2.1,0.0,-0.27,0.0,0.0]
+      # You can set multiple steps to move robot arms sequentially in preset progress.
+
+  - id: 2
+    prompt: handover the yellow bin from the left arm to the right arm
+    policy: tcp://172.20.69.32:9005
+    budget: 10.0
+    preset:
+      location: E
+      torso_height: 0.55
+      joint_angles:
+        - [-0.7026, -0.8920, 0.9053, 1.1186, -1.2761, -0.2629, 1.5338, 0.0, 0.7922, 0.8416, -0.8807, -1.6745,1.1042,-0.0606, -0.4, 0.0]
+
+  - id: 3
+    prompt: place the yellow bin into the left-side rail
+    policy: tcp://172.20.69.32:9005
+    budget: 30.0
+    preset:
+      location: A
+      torso_height: 0.65
+      joint_angles:
+        - [0.3,0.0,0.0,2.1,0.0,0.27,0.0,0.0,-0.3,0.0,0.0,-2.1,0.0,-0.27,0.0,0.0]
+
+  - id: 4
+    prompt: place the yellow bin into the right-side rail
+    policy: tcp://172.20.69.32:9005
+    budget: 30.0
+    preset:
+      location: A
+      torso_height: 0.65
+      joint_angles:
+        - [0.3,0.0,0.0,2.1,0.0,0.27,0.0,0.0,-0.3,0.0,0.0,-2.1,0.0,-0.27,0.0,0.0]
+
+  - id: 5
+    prompt: pick the yellow bin from the rack with the right arm
+    policy: tcp://172.20.69.32:9005
+    budget: 10.0
+    preset:
+      location: B
+      torso_height: 0.53
+      joint_angles:
+        - [0.3,0.0,0.0,2.1,0.0,0.27,0.0,0.0,-0.3,0.0,0.0,-2.1,0.0,-0.27,0.0,0.0]
+
+  - id: 6
+    prompt: place the box on the left side of the table
+    policy: rule-based
+    budget: 10.0
+    preset:
+      location: D
+      torso_height: 0.53
+      joint_angles:
+        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, 0.1, 0.0, 0.0, -2.2, 0.0, -0.63, 0.0, 1.0]  # neutral position
+        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, 0.2, -0.27, -0.58, -1.33, -0.13, 0.13, 0.70, 1.0]  # approach
+        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, 0.2, -0.27, -0.58, -1.13, -0.13, 0.13, 0.70, 0.0]  # place
+        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, 0.08, -0.26, -0.62, -1.6, -0.13, -0.21, 0.68, 0.0]  # retract
+        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, 0.1, 0.0, 0.0, -2.2, 0.0, -0.63, 0.0, 0.0]  # neutral position
+

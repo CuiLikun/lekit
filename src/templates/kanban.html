@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Multi-Task Diagnostics</title>
+  <script src="/static/tailwindcss.js"></script>
+  <script src="/static/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="/static/font-awesome/css/all.min.css" />
+</head>
+<body class="bg-slate-50 text-slate-700">
+<div id="root" class="px-6 py-8 max-w-7xl mx-auto space-y-8">
+  <div class="text-center text-slate-400 py-20">
+    <i class="fa-solid fa-spinner fa-spin text-4xl"></i>
+    <p class="mt-3 font-bold">Loading telemetry...</p>
+  </div>
+</div>
+
+<script>
+  const COLOR_PALETTE = [
+    { border: 'rgb(79, 70, 229)', bg: 'rgba(79, 70, 229, 0.05)' },
+    { border: 'rgb(219, 39, 119)', bg: 'rgba(219, 39, 119, 0.05)' },
+    { border: 'rgb(5, 150, 105)', bg: 'rgba(5, 150, 105, 0.05)' },
+    { border: 'rgb(217, 119, 6)', bg: 'rgba(217, 119, 6, 0.05)' },
+    { border: 'rgb(124, 58, 237)', bg: 'rgba(124, 58, 237, 0.05)' },
+    { border: 'rgb(225, 29, 72)', bg: 'rgba(225, 29, 72, 0.05)' }
+  ];
+
+  function getSRBadgeColor(rate) {
+    if (rate === null || rate === undefined) return 'bg-slate-100 text-slate-500 border-slate-200';
+    if (rate >= 90) return 'bg-emerald-50 text-emerald-700 border-emerald-200';
+    if (rate >= 60) return 'bg-amber-50 text-amber-700 border-amber-200';
+    return 'bg-rose-50 text-rose-700 border-rose-200';
+  }
+
+  function getPolicyBadge(policy) {
+    if (!policy) return '';
+    const isRule = policy === 'rule-based';
+    const cls = isRule
+      ? 'bg-slate-100 text-slate-700 border-slate-200'
+      : 'bg-indigo-50 text-indigo-700 border-indigo-100';
+    const icon = isRule ? 'fa-solid fa-code mr-1' : 'fa-solid fa-brain mr-1';
+    return `<span class="inline-flex items-center px-2.5 py-0.5 rounded text-sm font-mono font-bold border ${cls}"><i class="${icon}"></i>${policy}</span>`;
+  }
+
+  function toggleAccordion(id, rowEl) {
+    const detail = document.getElementById(id + '-detail');
+    const icon = document.getElementById(id + '-icon');
+    if (detail.classList.contains('hidden')) {
+      detail.classList.remove('hidden');
+      icon.innerHTML = '<i class="fa-solid fa-chevron-up"></i>';
+      rowEl.classList.add('bg-slate-50/50');
+    } else {
+      detail.classList.add('hidden');
+      icon.innerHTML = '<i class="fa-solid fa-chevron-down"></i>';
+      rowEl.classList.remove('bg-slate-50/50');
+    }
+  }
+
+  function buildKPICard(label, value, sub, icon, color) {
+    const colorMap = {
+      indigo: 'bg-indigo-50 text-indigo-600 border-indigo-100',
+      rose: 'bg-rose-50 text-rose-600 border-rose-100',
+      emerald: 'bg-emerald-50 text-emerald-600 border-emerald-100',
+      amber: 'bg-amber-50 text-amber-600 border-amber-100'
+    };
+    return `
+      <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-6 flex items-center justify-between">
+        <div class="space-y-2">
+          <div class="text-base font-bold text-slate-400 uppercase tracking-wider">${label}</div>
+          <div class="text-5xl font-black text-slate-800 leading-none">${value}</div>
+          <div class="text-sm text-slate-500 font-bold mt-2">${sub}</div>
+        </div>
+        <div class="${colorMap[color]} p-5 rounded-2xl text-4xl border">
+          <i class="${icon}"></i>
+        </div>
+      </div>
+    `;
+  }
+
+  function render(data) {
+    const root = document.getElementById('root');
+    const kpi = data.kpi;
+    const avgSR = kpi.average_success_rate_percent !== null ? kpi.average_success_rate_percent.toFixed(1) + '%' : '-';
+
+    const cardsHTML = `
+      <div class="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-4">
+        ${buildKPICard('🏃 Total Runs', kpi.total_runs, '<i class="fa-solid fa-circle-play text-indigo-500"></i> All sessions', 'fa-solid fa-circle-play', 'indigo')}
+        ${buildKPICard('⛔️ Aborts', kpi.total_aborts, '<i class="fa-solid fa-circle-stop text-rose-500"></i> Cumulative', 'fa-solid fa-circle-stop', 'rose')}
+        ${buildKPICard('🎯 Success Rate', avgSR, '<i class="fa-solid fa-bullseye text-emerald-500"></i> Avg performance', 'fa-solid fa-bullseye', 'emerald')}
+        ${buildKPICard('🤖 Policies', kpi.total_policies, '<i class="fa-solid fa-robot text-amber-500"></i> Distinct models', 'fa-solid fa-robot', 'amber')}
+      </div>
+    `;
+
+    const runsHTML = data.runs.map((run, idx) => {
+      const runId = `run-${idx}`;
+      const summaryRuns = run.summary?.total_runs || 0;
+      const summaryAborts = run.summary?.total_aborts || 0;
+      const completed = Math.max(0, summaryRuns - summaryAborts);
+      const sr = summaryRuns > 0 ? (completed / summaryRuns * 100).toFixed(1) + '%' : '-';
+      const srColor = getSRBadgeColor(parseFloat(sr));
+
+      const tasksHTML = run.tasks.map(t => {
+        const tSR = t.success_rate;
+        const tAvg = t.average_duration;
+        return `
+          <tr>
+            <td class="py-3 font-mono text-indigo-500 font-extrabold text-lg">#${t.task_id}</td>
+            <td class="py-3 font-bold text-slate-800 text-lg">${t.prompt}</td>
+            <td class="py-3">${getPolicyBadge(t.policy)}</td>
+            <td class="py-3 text-center font-extrabold text-lg">${t.runs}</td>
+            <td class="py-3 text-center font-extrabold text-rose-500 text-lg">${t.aborts}</td>
+            <td class="py-3 text-right font-black text-lg ${tSR !== null && tSR !== undefined && tSR >= 90 ? 'text-emerald-600' : tSR !== null && tSR !== undefined && tSR >= 60 ? 'text-amber-600' : 'text-rose-600'}">${tSR !== null && tSR !== undefined ? tSR + '%' : '-'}</td>
+            <td class="py-3 text-right font-black text-lg text-fuchsia-600">${tAvg !== null && tAvg !== undefined ? tAvg.toFixed(2) + 's' : '-'}</td>
+          </tr>
+        `;
+      }).join('');
+
+      return `
+        <tr class="hover:bg-slate-50 cursor-pointer transition-colors" onclick="toggleAccordion('${runId}', this)">
+          <td class="px-6 py-5 flex items-center space-x-3">
+            <i class="fa-regular fa-clock text-slate-400 text-2xl"></i>
+            <div>
+              <span class="font-bold text-slate-800 block text-lg">${run.timestamp}</span>
+              <span class="text-sm font-mono text-slate-400">${run.filename}</span>
+            </div>
+          </td>
+          <td class="px-6 py-5 text-center font-extrabold text-slate-800 text-xl">${summaryRuns}</td>
+          <td class="px-6 py-5 text-center font-extrabold text-rose-500 text-xl">${summaryAborts}</td>
+          <td class="px-6 py-5 text-center">
+            <span class="inline-flex items-center px-3 py-1 rounded-full text-base font-bold border ${srColor}">${sr}</span>
+          </td>
+          <td class="px-6 py-5 text-right text-slate-400 font-bold text-2xl">
+            <span id="${runId}-icon"><i class="fa-solid fa-chevron-down"></i></span>
+          </td>
+        </tr>
+        <tr id="${runId}-detail" class="bg-slate-50/20 hidden">
+          <td colspan="5" class="px-8 py-6">
+            <div class="bg-white rounded-lg border border-slate-200 p-5 space-y-4 shadow-inner">
+              <div class="text-base font-bold text-indigo-600 uppercase tracking-wider"><i class="fa-solid fa-cube mr-1"></i> Task Metrics</div>
+              <div class="overflow-x-auto">
+                <table class="min-w-full text-base text-left">
+                  <thead>
+                    <tr class="text-slate-400 font-medium border-b border-slate-100">
+                      <th class="pb-3 text-lg">ID</th>
+                      <th class="pb-3 text-lg">📝 Prompt</th>
+                      <th class="pb-3 text-lg w-72">🤖 Policy</th>
+                      <th class="pb-3 text-center text-lg w-16">🏃</th>
+                      <th class="pb-3 text-center text-lg w-16">⛔️</th>
+                      <th class="pb-3 text-center text-lg w-16">🎯</th>
+                      <th class="pb-3 text-center text-lg w-16">⏱</th>
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-slate-50 text-slate-600">
+                    ${tasksHTML}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </td>
+        </tr>
+      `;
+    }).join('');
+
+    root.innerHTML = `
+      <!-- Header -->
+
+      <!-- KPI Cards -->
+      ${cardsHTML}
+
+      <!-- Trend Chart -->
+      <div class="bg-white p-7 rounded-xl border border-slate-200">
+        <div class="flex items-center justify-between mb-6">
+          <div class="flex items-center space-x-4">
+            <div class="bg-slate-50 text-slate-600 p-3 rounded-xl border border-slate-150 text-2xl">
+              <i class="fa-solid fa-chart-line text-indigo-500"></i>
+            </div>
+            <div>
+              <h3 class="text-2xl font-extrabold text-slate-950">Trends</h3>
+              <p class="text-sm text-slate-500 font-medium">Aggregated success rate trends across all sessions</p>
+            </div>
+          </div>
+          <label class="flex items-center space-x-2 bg-white border-2  rounded-xl px-3 py-2 shadow-sm text-sm text-slate-600">
+            <i class="fa-solid fa-filter text-indigo-500"></i>
+            <span>Min runs</span>
+            <input
+              id="minRunsInput"
+              type="number"
+              min="0"
+              step="1"
+              value="5"
+              onchange="loadData()"
+              class="w-16 text-center border border-slate-200 rounded-md px-1 py-0.5 font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+              title="Drop sessions whose total_runs is below this value"
+            />
+          </label>
+        </div>
+        <div class="h-80 relative">
+          <canvas id="taskTrendChart"></canvas>
+        </div>
+      </div>
+
+      <!-- TOP 5 Policies per Task: one card per task, each chart ranks the
+           top 5 policies that ran that task by aggregated success rate. -->
+      <div class="bg-white p-7 rounded-xl border border-slate-200 shadow-sm space-y-6">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center space-x-4">
+            <div class="bg-amber-50 text-amber-600 p-3 rounded-xl border border-amber-100 text-2xl">
+              <i class="fa-solid fa-trophy text-amber-500"></i>
+            </div>
+            <div>
+              <h3 class="text-2xl font-extrabold text-slate-950">TOP 5</h3>
+              <p class="text-sm text-slate-500 font-medium">TOP 5 policies for each task by aggregated success rate</p>
+            </div>
+          </div>
+          <span id="top5TaskCount" class="inline-flex items-center px-3 py-1 rounded-full text-sm font-bold border bg-slate-50 text-slate-500 border-slate-200">
+            <i class="fa-solid fa-medal mr-1.5 text-amber-500"></i><span id="top5TaskCountText">0 tasks</span>
+          </span>
+        </div>
+        <div id="top5Grid" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-2 gap-5"></div>
+        <div id="top5Empty" class="hidden h-40 flex flex-col items-center justify-center text-slate-400 font-bold">
+          <i class="fa-regular fa-folder-open text-3xl mb-2"></i>
+          <p>No tasks with runs yet — the leaderboard will populate after the first session.</p>
+        </div>
+      </div>
+
+      <!-- Records Table -->
+      <div class="space-y-3">
+        <div class="flex items-center space-x-4">
+          <div class="bg-slate-50 text-slate-600 p-3 rounded-xl border border-slate-150 text-2xl">
+            <i class="fa-solid fa-list-check text-indigo-500"></i>
+          </div>
+          <div>
+            <h3 class="text-2xl font-extrabold text-slate-950">Records</h3>
+            <p class="text-sm text-slate-500 font-medium">Detailed records for each session</p>
+          </div>
+        </div>
+
+        <div class="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <table class="min-w-full text-left text-base text-slate-700">
+            <thead class="bg-slate-50 text-slate-500 font-bold uppercase tracking-wider border-b-2 border-slate-200">
+              <tr>
+                <th class="px-6 py-5 text-lg">📅 Session</th>
+                <th class="px-6 py-5 text-center text-lg">🏃 Runs</th>
+                <th class="px-6 py-5 text-center text-lg">⛔️ Aborts</th>
+                <th class="px-6 py-5 text-center text-lg">🎯 Rate</th>
+                <th class="px-6 py-5 text-right text-lg">👁️</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-150 text-base">
+              ${runsHTML || '<tr><td colspan="5" class="text-center py-10 text-slate-400 font-bold"><i class="fa-regular fa-folder-open mr-2"></i>No telemetry records found.</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+
+    // Render trend chart
+    const ctx = document.getElementById('taskTrendChart').getContext('2d');
+    new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: data.trend_chart.labels,
+        datasets: data.trend_chart.datasets.map((d, i) => {
+          const color = COLOR_PALETTE[i % COLOR_PALETTE.length];
+          return {
+            label: d.label,
+            data: d.data,
+            borderColor: color.border,
+            backgroundColor: color.bg,
+            borderWidth: 2.5,
+            pointBackgroundColor: color.border,
+            pointRadius: 5,
+            pointHoverRadius: 7,
+            tension: 0.15,
+            spanGaps: true
+          };
+        })
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { position: 'top', labels: { usePointStyle: false, boxWidth: 10, font: { size: 13, weight: '600' } } }
+        },
+        scales: {
+          x: { grid: { display: false }, ticks: { color: '#475569', font: { size: 13 } } },
+          y: { min: -20, max: 120, grid: { color: '#f1f5f9' }, ticks: { color: '#475569', font: { size: 13 }, callback: (v) => v >= 0 && v <= 100 ? v + '%' : '' } }
+        }
+      }
+    });
+
+    // Render per-task TOP 5 policies leaderboard: one card per task with a
+    // horizontal bar chart of the top 5 policies (by aggregated success rate
+    // on that task). Cards laid out in a responsive 1/2/3 column grid.
+    const taskCharts = (data.task_top5_policies || []);
+    const top5Grid = document.getElementById('top5Grid');
+    const top5Empty = document.getElementById('top5Empty');
+    const top5CountText = document.getElementById('top5TaskCountText');
+    if (top5CountText) {
+      top5CountText.textContent = `${taskCharts.length} ${taskCharts.length === 1 ? 'task' : 'tasks'}`;
+    }
+    if (!taskCharts.length) {
+      top5Grid.innerHTML = '';
+      top5Empty.classList.remove('hidden');
+    } else {
+      top5Empty.classList.add('hidden');
+      top5Grid.innerHTML = taskCharts.map((c, idx) => {
+        const bestColor = getSRBadgeColor(c.best_rate);
+        const bestStr = c.best_rate !== null && c.best_rate !== undefined ? c.best_rate.toFixed(2) + '%' : '-';
+        const policyCount = (c.policies || []).length;
+        return `
+        <div class="bg-slate-50/40 border border-slate-200 rounded-xl p-5 flex flex-col space-y-3 shadow-sm">
+          <div class="flex items-start justify-between space-x-3">
+            <h4 class="text-base font-extrabold text-slate-900 leading-tight truncate" title="${c.prompt}">${c.title}</h4>
+
+          </div>
+          <div class="flex items-center justify-between text-sm text-slate-500 font-bold">
+            <span><i class="fa-solid fa-brain text-indigo-500 mr-1"></i>${policyCount} ${policyCount === 1 ? 'policy' : 'policies'}</span>
+            <span><i class="fa-solid fa-circle-play text-emerald-500 mr-1"></i>${c.total_runs} ${c.total_runs === 1 ? 'run' : 'runs'}</span>
+          </div>
+          <div class="h-40 relative">
+            <canvas id="top5TaskChart-${idx}"></canvas>
+          </div>
+        </div>
+      `;
+      }).join('');
+
+      // One Chart instance per canvas. Each chart has up to 5 horizontal bars
+      // (one per policy), with bar length = success rate (0–100%) and the
+      // policy name on the y-axis. Color tiers match the rate badge palette.
+      taskCharts.forEach((c, idx) => {
+        const policies = c.policies || [];
+        const labels = policies.map(p => p.policy);
+        const rates = policies.map(p => p.success_rate ?? 0);
+        const bgColors = rates.map(r => {
+          if (r === null || r === undefined) return 'rgba(148, 163, 184, 0.6)';
+          if (r >= 90) return 'rgba(5, 150, 105, 0.78)';
+          if (r >= 60) return 'rgba(217, 119, 6, 0.78)';
+          return 'rgba(225, 29, 72, 0.78)';
+        });
+        const borderColors = rates.map(r => {
+          if (r === null || r === undefined) return 'rgb(148, 163, 184)';
+          if (r >= 90) return 'rgb(5, 150, 105)';
+          if (r >= 60) return 'rgb(217, 119, 6)';
+          return 'rgb(225, 29, 72)';
+        });
+        const canvas = document.getElementById(`top5TaskChart-${idx}`);
+        if (!canvas) return;
+        new Chart(canvas.getContext('2d'), {
+          type: 'bar',
+          data: {
+            labels: labels,
+            datasets: [{
+              label: 'Success Rate',
+              data: rates,
+              backgroundColor: bgColors,
+              borderColor: borderColors,
+              borderWidth: 1.5,
+              borderRadius: 4,
+              barThickness: 14
+            }]
+          },
+          options: {
+            indexAxis: 'y',
+            responsive: true,
+            maintainAspectRatio: false,
+            layout: { padding: { right: 30, top: 4, bottom: 4 } },
+            plugins: {
+              legend: { display: false },
+              tooltip: {
+                callbacks: {
+                  title: (items) => `🤖 ${items[0].label}`,
+                  label: (item) => {
+                    const i = item.dataIndex;
+                    const p = policies[i] || {};
+                    const rate = item.parsed.x ?? 0;
+                    return [
+                      `Success Rate: ${rate.toFixed(2)}%`,
+                      `Runs: ${p.runs ?? 0}   Aborts: ${p.aborts ?? 0}`
+                    ];
+                  }
+                }
+              }
+            },
+            scales: {
+              x: {
+                min: 0,
+                max: 120,
+                grid: { color: '#f1f5f9' },
+                ticks: {
+                  color: '#475569',
+                  font: { size: 10, weight: '600' },
+                  callback: (v) => v >= 0 && v <= 100 ? v + '%' : ''
+                }
+              },
+              y: {
+                grid: { display: false },
+                ticks: {
+                  color: '#1e293b',
+                  font: { size: 10, weight: '600' },
+                  autoSkip: false,
+                }
+              }
+            }
+          },
+          plugins: [{
+            // Inline data labels per bar so each policy's rate is readable.
+            id: 'top5DataLabels',
+            afterDatasetsDraw(chart) {
+              const { ctx } = chart;
+              const dataset = chart.data.datasets[0];
+              const metaLocal = chart.getDatasetMeta(0);
+              ctx.save();
+              ctx.fillStyle = '#0f172a';
+              ctx.font = '700 11px ui-sans-serif, system-ui';
+              ctx.textBaseline = 'middle';
+              dataset.data.forEach((value, i) => {
+                const bar = metaLocal.data[i];
+                if (!bar) return;
+                const text = (value === null || value === undefined) ? '-' : value.toFixed(1) + '%';
+                const x = bar.x + 6;
+                const y = bar.y;
+                ctx.textAlign = 'left';
+                ctx.fillText(text, x, y);
+              });
+              ctx.restore();
+            }
+          }]
+        });
+      });
+    }
+  }
+
+  // Last value the user submitted via the min-runs input. render() rebuilds
+  // the entire root innerHTML (which resets the input to its hardcoded
+  // default), so we re-apply this value to the freshly-created input after
+  // every render.
+  let currentMinRuns = 5;
+
+  function loadData() {
+    // Read the min-runs filter from the header input (default 5). The
+    // backend drops sessions whose total_runs is below this value.
+    const input = document.getElementById('minRunsInput');
+    let minRuns = 10;
+    if (input) {
+      const parsed = parseInt(input.value, 10);
+      if (Number.isFinite(parsed) && parsed >= 0) minRuns = parsed;
+    }
+    currentMinRuns = minRuns;
+    fetch('/api/records?min_runs=' + encodeURIComponent(minRuns))
+      .then(r => r.json())
+      .then(data => {
+        render(data);
+        // Re-apply the user's value to the freshly-created input — the
+        // render() function rebuilds the entire root innerHTML, which
+        // restores the input's default `value="5"`.
+        const fresh = document.getElementById('minRunsInput');
+        if (fresh) fresh.value = String(currentMinRuns);
+      })
+      .catch(err => {
+        document.getElementById('root').innerHTML = `
+          <div class="bg-rose-50 border border-rose-200 text-rose-700 rounded-xl p-6">
+            <i class="fa-solid fa-triangle-exclamation text-2xl mr-2"></i>
+            <strong class="font-extrabold">Failed to load telemetry:</strong> ${err.message}
+          </div>
+        `;
+      });
+  }
+
+  loadData();
+</script>
+</body>
+</html>
