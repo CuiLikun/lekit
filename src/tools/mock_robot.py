@@ -1,3 +1,4 @@
+import math
 import time
 from dataclasses import dataclass, field
 
@@ -56,6 +57,13 @@ class MockRobot:
         self.motors = list(range(16))
         self.policy_control = True
         self.connect()  # Auto-connect on initialization
+        self.chassis_info = {
+            "call_id": 0,
+            "status": "moving",
+            "position": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+            "torso_height": 0.75,
+        }
 
     def connect(self):
         self.is_connected = True
@@ -68,6 +76,22 @@ class MockRobot:
     def stop(self):
         """alias for disconnect() to match the Robot interface"""
         self.disconnect()
+
+    def get_chassis_info(self):
+        """Get the current chassis information."""
+        # Return mock chassis info with position and orientation
+        self.chassis_info["call_id"] += 1
+        # Mock position update for demonstration (butterfly curve - Temple H. Fay)
+        t = self.chassis_info["call_id"] * 0.05
+        # Butterfly curve: r = exp(cos(t)) - 2*cos(4t) - sin(t/12)^5
+        scale = 0.3
+        expr = math.exp(math.cos(t)) - 2 * math.cos(4 * t) - math.sin(t / 12) ** 5
+        self.chassis_info["position"]["x"] = scale * math.sin(t) * expr
+        self.chassis_info["position"]["y"] = scale * math.cos(t) * expr
+        # Heading rotates along the path
+        self.chassis_info["orientation"]["z"] = math.sin(t)
+        self.chassis_info["orientation"]["w"] = math.cos(t)
+        return self.chassis_info
 
     def move_to_location(self, value, **kwargs):
         """Move to a specified location."""

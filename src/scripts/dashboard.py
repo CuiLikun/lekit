@@ -62,6 +62,7 @@ class Coordinator:
     def __init__(self):
         self.keyboard = KeyboardListener()
         self.robot, self.proxy, self.tasks, self.batch, self.rerun = make_parts()
+        self.locations = {x["preset"]["location"]["name"]: x["preset"]["location"]["position"] for x in self.tasks}
         self.logs_stream = []
         self._live = None
 
@@ -72,6 +73,7 @@ class Coordinator:
             "curr_task": None,  # Active task dict currently selected
             "pause": False,  # Task execution paused flag
             "abort": False,  # Task execution abort flag
+            "retry": False,  # Task execution retry flag
             "pending_confirm_prompt": None,  # Active confirmation message for the confirmation Modal
             "confirm_result": None,  # Keypress confirmation result (True for Yes/Enter, False for No/Esc)
             "show_help": False,  # Help Overlay active flag
@@ -84,18 +86,16 @@ class Coordinator:
             "batch_index": -1,  # Index into self.batch of the currently-executing task (-1 = not running a batch)
         }
 
+        # Permanent trajectory of robot positions (deduped on 5cm threshold)
+        self.trajectory = []
+
         # Persistent Console used to query terminal size for scroll-window math
         self.console = Console()
 
         # Task execution history statistics: {task_id: {"runs": int, "aborts": int, "policy": str, "average_duration": float}}
         self.history = {}
         for t in self.tasks:
-            self.history[t["id"]] = {
-                "runs": 0,
-                "aborts": 0,
-                "policy": "",
-                "average_duration": 0.0,
-            }
+            self.history[t["id"]] = {"runs": 0, "aborts": 0, "policy": "", "average_duration": 0.0}
 
         # Lock for safe state updates, queue for asynchronous rendering requests, and render thread
         self.state_lock = threading.Lock()
@@ -171,9 +171,7 @@ class Coordinator:
         self.keyboard.bind_key("?", self.toggle_help, "Show/Hide Key Bindings")
         for task in self.tasks:
             self.keyboard.bind_key(
-                str(task["id"]),
-                lambda key, t=task: self.select_task_by_key(t),
-                f"Select task {task['id']}",
+                str(task["id"]), lambda key, t=task: self.select_task_by_key(t), f"Select task {task['id']}"
             )
         self.keyboard.bind_key("y", self.handle_confirm_yes, "Confirm (Yes)")
         self.keyboard.bind_key("n", self.handle_confirm_no, "Confirm (No)")
@@ -284,11 +282,7 @@ class Coordinator:
     def build_tui_layout(self) -> Layout:
         """Construct the standard layout / modals for full-screen monitoring."""
         layout = Layout()
-        layout.split_column(
-            Layout(name="header", size=1),
-            Layout(name="body"),
-            Layout(name="footer", size=1),
-        )
+        layout.split_column(Layout(name="header", size=1), Layout(name="body"), Layout(name="footer", size=1))
 
         time_str = datetime.now().strftime("%H:%M:%S")  # noqa
         header_text = f"Mobile Robot · Multi-Task Coordinator{' ' * 10}"
@@ -330,20 +324,16 @@ class Coordinator:
             help_table.add_row("R", "Retry task (on error)")
             help_table.add_row("B", "Run batch sequence (auto)")
             help_table.add_row("?", "Show / Hide this help modal")
-            modal = Panel(
-                help_table,
-                title="[bold green]⌨  Key Bindings[/bold green]",
-                border_style="blue",
-                width=50,
-            )
+            modal = Panel(help_table, title="[bold green]⌨  Key Bindings[/bold green]", border_style="blue", width=50)
             layout["body"].update(Align.center(modal, vertical="middle"))
             return layout
 
         # Main Layout: Split into Left Column (Task Card List) and Right Column
         layout["body"].split_row(Layout(name="left", ratio=1), Layout(name="right", ratio=1))
 
-        # Right Column: Split into StatusPanel (top) and LogsPanel (bottom)
-        layout["right"].split_column(Layout(name="status", size=10), Layout(name="logs"))
+        # Right Column: StatusPanel (top), MapPanel (middle), LogsPanel (bottom)
+        # Map panel is fixed at 25 lines; the 41×53 grid will be clipped by Rich.
+        layout["right"].split_column(Layout(name="status", size=10), Layout(name="map", size=25), Layout(name="logs"))
 
         # Left Column: Task Card List (with scrolling + cursor highlight)
         visible_count = self._compute_visible_tasks()
@@ -388,8 +378,9 @@ class Coordinator:
             preset = t.get("preset", {})
             joint_motions = len(preset.get("joint_angles", []))
             motion_desc = f"{joint_motions} motion" if joint_motions > 0 else "none"
+            location = preset.get("location", {}).get("name", "")
             content.append(
-                f"Location={preset.get('location', '')}, Torso={preset.get('torso_height') or 0.5}m, Joints={motion_desc}\n",
+                f"Location={location}, Torso={preset.get('torso_height') or 0.5}m, Joints={motion_desc}\n",
                 style="green" if is_active else "dim",
             )
             content.append("Budget : ", style="bold cyan" if is_active else "dim")
@@ -411,25 +402,14 @@ class Coordinator:
             content.append(f"{rate_str}", style="white" if is_active else "dim")
 
             # Embed live progress bar and telemetry metrics directly inside the active task card
-            if is_active and self.state["status"] in (
-                "executing",
-                "paused",
-                "done",
-                "aborted",
-            ):
+            if is_active and self.state["status"] in ("executing", "paused", "done", "aborted"):
                 pct = min(self.state["elapsed"] / t.get("budget", 10.0), 1.0) if t.get("budget", 10.0) > 0 else 0.0
                 filled = int(pct * 25)
                 pbar = "▓" * filled + "░" * (25 - filled)
                 content.append("\n")
                 content.append("Status : ", style="bold yellow")
-                content.append(
-                    f"{pbar} {self.state['elapsed']:.1f}/{t.get('budget', 10.0):.1f}s",
-                    style="yellow",
-                )
-                content.append(
-                    f"  ⚡ {self.state['fps']}fps  steps={self.state['steps']}",
-                    style="cyan",
-                )
+                content.append(f"{pbar} {self.state['elapsed']:.1f}/{t.get('budget', 10.0):.1f}s", style="yellow")
+                content.append(f"  ⚡ {self.state['fps']}fps  steps={self.state['steps']}", style="cyan")
 
             # Cursor prefix: "👉 " in bold green when this card is under the cursor
             cursor_prefix = "[bold green]👉 [/bold green]" if is_cursor else ""
@@ -537,15 +517,9 @@ class Coordinator:
             status_title = f"[blink]{warning_dot}[/blink] Confirmation Required"
 
             op_text.append(f"❓ {self.state['pending_confirm_prompt']}\n", style="bold white")
-            op_text.append(
-                "[Y] Yes / Enter",
-                style="bold bright_green" if is_breathe_fast else "bold green",
-            )
+            op_text.append("[Y] Yes / Enter", style="bold bright_green" if is_breathe_fast else "bold green")
             op_text.append(" " * 6)
-            op_text.append(
-                "[N] No / Esc",
-                style="bold bright_red" if is_breathe_fast else "bold red",
-            )
+            op_text.append("[N] No / Esc", style="bold bright_red" if is_breathe_fast else "bold red")
         elif self.state["status"] == "selecting":
             op_text.append("All set. Ready to go. 👌\n", style="bold green")
             op_text.append("Select a task from list, or Q to quit.", style="cyan")
@@ -576,24 +550,15 @@ class Coordinator:
             )
         elif self.state["status"] == "done":
             op_text.append("✅ Active task completed successfully!\n", style="bright_green")
-            op_text.append(
-                "Press Enter to repeat, Esc to clear, or select another task.",
-                style="cyan",
-            )
+            op_text.append("Press Enter to repeat, Esc to clear, or select another task.", style="cyan")
             op_color = "bright_green"
         elif self.state["status"] == "aborted":
             op_text.append("⛔️ Task execution aborted by user.\n", style="bright_red")
-            op_text.append(
-                "Press Enter to repeat, Esc to clear, or select another task.",
-                style="cyan",
-            )
+            op_text.append("Press Enter to repeat, Esc to clear, or select another task.", style="cyan")
             op_color = "bright_red"
         elif self.state["status"] == "error":
             op_text.append("⚠️ Task execution failed with error.\n", style="bright_red")
-            op_text.append(
-                "Press Enter/R to retry, or Esc to return to task selection.",
-                style="white",
-            )
+            op_text.append("Press Enter/R to retry, or Esc to return to task selection.", style="white")
             op_color = "bright_red"
             status_title = "🚨 System Error"
 
@@ -607,14 +572,13 @@ class Coordinator:
             )
         )
 
+        # Right Column middle: MapPanel — real-time chassis location & state.
+        layout["map"].update(self._build_map_panel())
+
         # Right Column bottom: LogsPanel
         logs_text = Text("\n".join(self.logs_stream[-20:]))
         layout["logs"].update(
-            Panel(
-                logs_text,
-                title="[bold magenta]📜 Recent Logs[/bold magenta]",
-                border_style="magenta",
-            )
+            Panel(logs_text, title="[bold magenta]📜 Recent Logs[/bold magenta]", border_style="magenta")
         )
 
         return layout
@@ -705,15 +669,13 @@ class Coordinator:
                 self.log("info", f"Batch: retrying task {self.state['curr_task']['id']}.")
                 with self.state_lock:
                     self.state["status"] = "selecting"
+                    self.state["retry"] = True
                 return
             next_idx = self.state["batch_index"] + 1
             if next_idx < len(self.batch):
                 next_task = next((t for t in self.tasks if t["id"] == self.batch[next_idx]), None)
                 if next_task is None:
-                    self.log(
-                        "error",
-                        f"Batch task id {self.batch[next_idx]} not found; stopping.",
-                    )
+                    self.log("error", f"Batch task id {self.batch[next_idx]} not found; stopping.")
                     with self.state_lock:
                         self.state["batch_index"] = -1
                         self.state["curr_task"] = None
@@ -802,6 +764,104 @@ class Coordinator:
         cursor = self.state["task_cursor"] % len(self.tasks)
         self.select_task_by_key(self.tasks[cursor])
 
+    def _build_map_panel(self) -> Panel:
+        info = self.robot.get_chassis_info() or {}
+        pos = info.get("position") or [0, 0]
+        if hasattr(pos, "x"):
+            x, y = pos.x, pos.y
+        elif isinstance(pos, dict):
+            x, y = pos.get("x", 0.0), pos.get("y", 0.0)
+        else:
+            x, y = (list(pos) + [0, 0])[:2]
+
+        # Permanent trajectory; skip duplicate consecutive points within 5cm
+        # so a stationary robot doesn't bloat the list with noise.
+        last = self.trajectory[-1] if self.trajectory else None
+        if last is None or abs(x - last[0]) > 0.05 or abs(y - last[1]) > 0.05:
+            self.trajectory.append((x, y))
+
+        # Range derived from A/B so A sits at the top row and B at the bottom
+        # row of the grid. x range covers all locations with padding. Cell
+        # size is then derived from this smaller range, so resolution is
+        # higher than the previous fixed (-1.2, 2.9) x (-2.2, 3.1) world box.
+        def _xy(p):
+            if not p:
+                return None
+            try:
+                return p[0], p[1]
+            except (TypeError, IndexError, KeyError):
+                try:
+                    return p.x, p.y
+                except AttributeError:
+                    return None
+
+        a_xy = _xy(self.locations.get("A"))
+        b_xy = _xy(self.locations.get("B"))
+        if a_xy and b_xy and a_xy[1] > b_xy[1]:
+            y_max, y_min = a_xy[1] + 0.1, b_xy[1] - 0.1
+        else:
+            y_min, y_max = -2.2, 3.1  # fallback
+
+        xys = [p for p in (_xy(v) for v in self.locations.values()) if p]
+        if xys:
+            xs = [p[0] for p in xys]
+            x_min, x_max = min(xs) - 0.3, max(xs) + 0.3
+        else:
+            x_min, x_max = -1.2, 2.9
+
+        x_range, y_range = x_max - x_min, y_max - y_min
+        try:
+            w, _ = self.console.size
+        except Exception:
+            w = 120
+        panel_w = max(5, w // 2 - 2)
+        panel_h = max(5, 25 - 3)  # map layout size = 25
+        cell = max(x_range / panel_w, y_range / panel_h)
+        # +1 so the grid covers both endpoints of the range (round() of
+        # x_range / cell is the number of *intervals*, not cells).
+        grid_w = int(round(x_range / cell)) + 1
+        grid_h = int(round(y_range / cell)) + 1
+
+        grid = [[" "] * grid_w for _ in range(grid_h)]
+
+        def to_cell(wx, wy):
+            # Round half up (avoids banker's rounding shifting a point at an
+            # exact midpoint by one cell in either direction).
+            return int((wx - x_min) / cell + 0.5), int((y_max - wy) / cell + 0.5)
+
+        # Trajectory.
+        # for tx, ty in self.trajectory[:-1]:
+        #     i, j = to_cell(tx, ty)
+        #     if 0 <= i < grid_w and 0 <= j < grid_h:
+        #         grid[j][i] = "*"
+
+        # Named locations (overwrite trajectory).
+        for name, loc in self.locations.items():
+            if not name or not loc:
+                continue
+            try:
+                lx, ly = loc[0], loc[1]
+            except Exception:
+                try:
+                    lx, ly = loc.x, loc.y
+                except Exception:
+                    continue
+            i, j = to_cell(lx, ly)
+            if 0 <= i < grid_w and 0 <= j < grid_h:
+                grid[j][i] = name[0].upper()
+
+        # Robot at its projected position (overwrites anything at that cell).
+        ri, rj = to_cell(x, y)
+        if 0 <= ri < grid_w and 0 <= rj < grid_h:
+            grid[rj][ri] = "🤖"
+
+        text = Text()
+        status = info.get("status", "unknown")
+        text.append(f"Position: ({x:.2f}, {y:.2f}) [{status}]\n", style="cyan")
+        for row in grid:
+            text.append("".join(row) + "\n", style="dim")
+        return Panel(text, title="[bold cyan]📍 Robot Location[/bold cyan]", border_style="cyan")
+
     def set_proxy(self, task):
         """Set the proxy policy based on the selected task."""
         policy_addr = get_field(task, "policy")
@@ -824,7 +884,7 @@ class Coordinator:
 
     def set_robot(self, task):
         """Preset the robot based on the task's preset configuration."""
-        location = get_field(task, "location")
+        location = get_field(task, "location").get("name", None)
         torso_height = get_field(task, "torso_height")
         joint_angles = get_field(task, "joint_angles")
         is_rule_based = get_field(task, "policy") == "rule-based"
@@ -833,23 +893,22 @@ class Coordinator:
         # ):
         #     self.log("info", "Robot preset cancelled.")
         #     raise ValueError("Preset cancelled")
+        if joint_angles is not None and not is_rule_based:
+            self.log("info", f"Set joint angles: {len(joint_angles)} waypoints")
+            thread_arm = threading.Thread(target=self.robot.move_arms_by_action, args=(joint_angles, 2.0, 30.0))
+            thread_arm.start()
         if location is not None:
             self.log("info", f"Moving chasis to: {location}")
-            self.robot.move_to_location(location)
+            thread_loc = threading.Thread(target=self.robot.move_to_location, args=(location,))
+            thread_loc.start()
         if torso_height is not None:
             self.log("info", f"Set torso height: {torso_height}m")
             self.robot.set_torso_height(torso_height)
-        if joint_angles is not None and not is_rule_based:
-            self.log("info", f"Set joint angles: {len(joint_angles)} waypoints")
-            # Rule-based policies execute joint_angles through robot.move_arms_by_action
-            # during the executing phase; doing it here would race with that motion.
-            for value in joint_angles:  # each step is a joint angle vector
-                self.robot.set_joint_angles(value)
-            # Alternative: set joint angles by robot.move_arms_by_action
-            # self.robot.move_arms_by_action(joint_angles, timeout_sec=30.0)
-        elif is_rule_based:
-            self.log("info", "Rule-based policy detected, skipping joint angles preset.")
-        # self.log("info", "Robot preset completed.")
+        if not is_rule_based and thread_arm is not None:
+            thread_arm.join()
+        if thread_loc is not None:
+            thread_loc.join()
+        self.log("info", "Robot preset completed.")
 
     def execute_single_task(self, task, fps: int = 30):
         """Execute the main logic of the task using the proxy."""
@@ -863,6 +922,16 @@ class Coordinator:
             self.state["status"] = "selecting"
             self.state["curr_task"] = None
             return
+
+        # Confirm retry if the task is being retried
+        if self.state.get("retry", False):
+            if not self.user_confirm(f"Retry task {task['id']}? prompt='{prompt}' budget={budget}s"):
+                self.log("info", "Task retry cancelled.")
+                self.state["status"] = "selecting"
+                self.state["curr_task"] = None
+                return
+            else:
+                self.state["retry"] = False  # Reset retry flag
 
         # Increment total execution runs counter
         self.history[task["id"]]["runs"] += 1
@@ -993,15 +1062,7 @@ class Coordinator:
             total_runs += runs
             total_aborts += aborts
 
-            table.add_row(
-                str(t_id),
-                t["prompt"],
-                str(runs),
-                str(aborts),
-                rate_str,
-                time_str,
-                stats["policy"],
-            )
+            table.add_row(str(t_id), t["prompt"], str(runs), str(aborts), rate_str, time_str, stats["policy"])
 
             tasks_stats.append(
                 {

@@ -6,76 +6,149 @@ robot:
   enable: bimanual
   cameras:
     head: { type: opencv, camera_index: 4, fps: 60, width: 640, height: 480, fourcc: MJPG }
-    left: { type: opencv, camera_index: 2, fps: 60, width: 640, height: 480, fourcc: MJPG }
-    right: { type: opencv, camera_index: 0, fps: 60, width: 640, height: 480, fourcc: MJPG }
+    left: { type: opencv, camera_index: 0, fps: 60, width: 640, height: 480, fourcc: MJPG }
+    right: { type: opencv, camera_index: 2, fps: 60, width: 640, height: 480, fourcc: MJPG }
 
 # Batch of tasks to execute. Each number corresponds to a task ID defined below.
-batch: [1, 2, 3, 4, 5, 6]  
+batch: [1, 2, 4, 1, 2, 4, 1, 2, 4, 5, 6, 5, 7, 5, 8]
 
 # Task configuration
 tasks:
   - id: 1
     prompt: pick up the yellow bin from the table with the right arm
     policy: tcp://172.20.69.32:9005
-    budget: 60.0  # time budget in seconds
+    budget: 15.0 # time budget in seconds
     preset:
-      location: C
+      location:
+        name: C
+        position: [-0.051, 0.110, 0.000]
+        orientation: [0.0015, 0.0070, 0.9999, 0.0001]
       torso_height: 0.55
       joint_angles:
-        - [0.3,0.0,0.0,2.1,0.0,0.27,0.0,0.0,-0.3,0.0,0.0,-2.1,0.0,-0.27,0.0,0.0]
+        - [0.3, 0.0, 0.0, 2.1, 0.0, 0.27, 0.0, 0.0, -0.3, 0.0, 0.0, -2.1, 0.0, -0.27, 0.0, 0.0]
       # You can set multiple steps to move robot arms sequentially in preset progress.
 
   - id: 2
     prompt: handover the yellow bin from the left arm to the right arm
     policy: tcp://172.20.69.32:9005
-    budget: 10.0
+    budget: 15.0
     preset:
-      location: E
+      location:
+        name: E
+        position: [0.858, -0.080, 0.000]
+        orientation: [0.0059, 0.0074, 0.9999, 0.0045]
       torso_height: 0.55
       joint_angles:
-        - [-0.7026, -0.8920, 0.9053, 1.1186, -1.2761, -0.2629, 1.5338, 0.0, 0.7922, 0.8416, -0.8807, -1.6745,1.1042,-0.0606, -0.4, 0.0]
+        - [-0.35, 0.0, 0.0, 1.97, 0.0, 0.7, 0.0, 1.0, -0.3, 0.0, 0.0, -2.1, 0.0, -0.27, 0.0, 0.0]
+        - [-0.703, -0.892, 0.905, 1.119, -1.276, -0.263, 0.9, 1.0, -0.3, 0.842, 0.0, -1.8, 0.9, -0.17, -0.2, 0.0]
+        - [
+            -0.703,
+            -0.892,
+            0.905,
+            1.119,
+            -1.276,
+            -0.263,
+            1.534,
+            1.0,
+            0.792,
+            0.842,
+            -0.881,
+            -1.674,
+            1.104,
+            -0.061,
+            -0.4,
+            0.0,
+          ]
 
   - id: 3
     prompt: place the yellow bin into the left-side rail
     policy: tcp://172.20.69.32:9005
-    budget: 30.0
+    budget: 15.0
     preset:
-      location: A
+      location:
+        name: A
+        position: [2.109, 1.633, 0.000]
+        orientation: [0.0017, -0.0030, -0.7075, 0.7067]
       torso_height: 0.65
       joint_angles:
-        - [0.3,0.0,0.0,2.1,0.0,0.27,0.0,0.0,-0.3,0.0,0.0,-2.1,0.0,-0.27,0.0,0.0]
+        - [-0.7, -0.9, 0.5, 1.1, -1.3, -0.1, 0.5, 0.0, 0.792, 0.842, -0.881, -1.674, 1.104, -0.061, -0.4, 1.0]
+        - [-0.2, -0.6, 0.2, 1.6, -0.8, -0.1, 0.3, 0.0, -0.3, 0.6, 0.0, -1.9, 0.9, -0.27, 0.0, 1.0]
+        - [0.3, 0.0, 0.0, 2.1, 0.0, 0.27, 0.0, 0.0, -0.3, 0.0, 0.0, -2.1, 0.0, -0.27, 0.0, 1.0]
 
   - id: 4
     prompt: place the yellow bin into the right-side rail
     policy: tcp://172.20.69.32:9005
-    budget: 30.0
+    budget: 15.0
     preset:
-      location: A
+      location:
+        name: A
+        position: [2.109, 1.633, 0.000]
+        orientation: [0.0017, -0.0030, -0.7075, 0.7067]
       torso_height: 0.65
       joint_angles:
-        - [0.3,0.0,0.0,2.1,0.0,0.27,0.0,0.0,-0.3,0.0,0.0,-2.1,0.0,-0.27,0.0,0.0]
+        - [-0.7, -0.9, 0.5, 1.1, -1.3, -0.1, 0.5, 0.0, 0.792, 0.842, -0.881, -1.674, 1.104, -0.061, -0.4, 1.0]
+        - [-0.2, -0.6, 0.2, 1.6, -0.8, -0.1, 0.3, 0.0, -0.3, 0.6, 0.0, -1.9, 0.9, -0.27, 0.0, 1.0]
+        - [0.3, 0.0, 0.0, 2.1, 0.0, 0.27, 0.0, 0.0, -0.3, 0.0, 0.0, -2.1, 0.0, -0.27, 0.0, 1.0]
 
   - id: 5
     prompt: pick the yellow bin from the rack with the right arm
     policy: tcp://172.20.69.32:9005
-    budget: 10.0
+    budget: 12.0
     preset:
-      location: B
+      location:
+        name: B_L
+        position: [1.884, -1.156, 0.000]
+        orientation: [0.0171, -0.0054, 0.7021, 0.7120]
       torso_height: 0.53
       joint_angles:
-        - [0.3,0.0,0.0,2.1,0.0,0.27,0.0,0.0,-0.3,0.0,0.0,-2.1,0.0,-0.27,0.0,0.0]
+        - [0.3, 0.0, 0.0, 2.1, 0.0, 0.27, 0.0, 0.0, -0.3, 0.0, 0.0, -2.1, 0.0, -0.27, 0.0, 0.0]
 
   - id: 6
     prompt: place the box on the left side of the table
     policy: rule-based
     budget: 10.0
     preset:
-      location: D
+      location:
+        name: D
+        position: [-0.043, -0.128, 0.000]
+        orientation: [0.0033, 0.0064, 0.9999, -0.0098]
       torso_height: 0.53
       joint_angles:
-        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, 0.1, 0.0, 0.0, -2.2, 0.0, -0.63, 0.0, 1.0]  # neutral position
-        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, 0.2, -0.27, -0.58, -1.33, -0.13, 0.13, 0.70, 1.0]  # approach
-        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, 0.2, -0.27, -0.58, -1.13, -0.13, 0.13, 0.70, 0.0]  # place
-        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, 0.08, -0.26, -0.62, -1.6, -0.13, -0.21, 0.68, 0.0]  # retract
-        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, 0.1, 0.0, 0.0, -2.2, 0.0, -0.63, 0.0, 0.0]  # neutral position
+        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, 0.1, 0.0, 0.0, -2.2, 0.0, -0.63, 0.0, 1.0] # neutral position
+        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, 0.2, -0.27, -0.58, -1.33, -0.13, 0.13, 0.70, 1.0] # approach
+        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, 0.2, -0.27, -0.58, -1.13, -0.13, 0.13, 0.70, 0.0] # place
+        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, 0.08, -0.26, -0.62, -1.6, -0.13, -0.21, 0.68, 0.0] # retract
+        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, 0.1, 0.0, 0.0, -2.2, 0.0, -0.63, 0.0, 0.0] # neutral position
 
+  - id: 7
+    prompt: place the box on the middle of the table
+    policy: rule-based
+    budget: 10.0
+    preset:
+      location:
+        name: D
+        position: [-0.043, -0.128, 0.000]
+        orientation: [0.0033, 0.0064, 0.9999, -0.0098]
+      torso_height: 0.53
+      joint_angles:
+        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, 0.1, 0.0, 0.0, -2.2, 0.0, -0.63, 0.0, 1.0] # neutral position
+        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, -0.025, -0.01, -0.03, -1.56, 0.0, 0.0, 0.1, 0.0] # place
+        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, -0.05, -0.02, -0.03, -1.89, -0.1, -0.27, 0.1, 0.0] # retract
+        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, 0.1, 0.0, 0.0, -2.2, 0.0, -0.63, 0.0, 0.0] # neutral position
+
+  - id: 8
+    prompt: place the box on the right side of the table
+    policy: rule-based
+    budget: 10.0
+    preset:
+      location:
+        name: D
+        position: [-0.043, -0.128, 0.000]
+        orientation: [0.0033, 0.0064, 0.9999, -0.0098]
+      torso_height: 0.53
+      joint_angles:
+        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, 0.1, 0.0, 0.0, -2.2, 0.0, -0.63, 0.0, 1.0] # neutral position
+        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, 0.04, 0.53, 0.46, -1.96, 0.54, -0.55, -0.19, 1.0] # approach
+        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, 0.025, 0.42, 0.26, -1.20, 0.37, 0.15, -0.37, 0.0] # place
+        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, -0.05, 0.45, 0.40, -1.55, 0.40, -0.05, -0.42, 0.0] # retract
+        - [-0.1, 0.0, 0.0, 2.2, 0.0, 0.63, 0.0, 0.0, 0.1, 0.0, 0.0, -2.2, 0.0, -0.63, 0.0, 0.0] # neutral position
