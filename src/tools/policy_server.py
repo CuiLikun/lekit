@@ -132,9 +132,7 @@ class PolicyServer:
         self.action_dim = 0
         # Make preprocessor and postprocessor
         rename_map = config.rename_map or {
-            str(k).replace("_camera", ""): str(k)
-            for k in self.policy.config.input_features
-            if "camera" in str(k)
+            str(k).replace("_camera", ""): str(k) for k in self.policy.config.input_features if "camera" in str(k)
         }  # In compatibility with older checkpoints used to have "camera" in the observation keys
         print(f"Using rename_map: {rename_map}")
         self.preprocessor, self.postprocessor = make_pre_post_processors(
