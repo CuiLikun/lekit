@@ -1,0 +1,63 @@
+{
+    "timestamp": "2026-06-24 16:04:03",
+    "summary": {
+        "total_runs": 2,
+        "total_aborts": 0
+    },
+    "tasks": [
+        {
+            "task_id": 1,
+            "prompt": "pick up the yellow bin from the table with the right arm",
+            "policy": "sorel/pi05-record_0620_train",
+            "runs": 2,
+            "aborts": 0,
+            "success_rate": 100.0,
+            "average_duration": 31.84
+        },
+        {
+            "task_id": 2,
+            "prompt": "handover the yellow bin from the left arm to the right arm",
+            "policy": "",
+            "runs": 0,
+            "aborts": 0,
+            "success_rate": null,
+            "average_duration": null
+        },
+        {
+            "task_id": 3,
+            "prompt": "place the yellow bin into the left-side rail",
+            "policy": "",
+            "runs": 0,
+            "aborts": 0,
+            "success_rate": null,
+            "average_duration": null
+        },
+        {
+            "task_id": 4,
+            "prompt": "place the yellow bin into the right-side rail",
+            "policy": "",
+            "runs": 0,
+            "aborts": 0,
+            "success_rate": null,
+            "average_duration": null
+        },
+        {
+            "task_id": 5,
+            "prompt": "pick the yellow bin from the rack with the right arm",
+            "policy": "",
+            "runs": 0,
+            "aborts": 0,
+            "success_rate": null,
+            "average_duration": null
+        },
+        {
+            "task_id": 6,
+            "prompt": "place the box on the left side of the table",
+            "policy": "",
+            "runs": 0,
+            "aborts": 0,
+            "success_rate": null,
+            "average_duration": null
+        }
+    ]
+}
