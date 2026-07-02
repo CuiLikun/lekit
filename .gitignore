@@ -12,4 +12,5 @@ wheels/
 # Other files
 data/
 logs/
+outputs/
 tmp/

@@ -1,0 +1,1513 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TUI Coordinator for Robots: Design Philosophies</title>
+    <!-- Web Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;700&family=Inter:wght@300;400;500;600;700&family=Playfair+Display:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
+    <style>
+        /* Base Token System */
+        :root {
+            --bg-base: #fafafa;
+            --bg-slide: #ffffff;
+            --text-main: #111111;
+            --text-sub: #4b5563;
+            --text-dim: #9ca3af;
+            --border-color: #e5e7eb;
+            --accent: #111111;
+            --accent-light: #f3f4f6;
+            --success: #16a34a;
+            --error: #dc2626;
+            --font-title: "Playfair Display", "Georgia", serif;
+            --font-sans: "Inter", -apple-system, sans-serif;
+            --font-mono: "Fira Code", monospace;
+            --shadow-sm: 0 2px 8px rgba(0,0,0,0.01);
+            --shadow-md: 0 10px 40px rgba(0,0,0,0.03);
+            --transition-speed: 0.35s;
+        }
+
+        /* Reset & Layout */
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background-color: var(--bg-base);
+            color: var(--text-main);
+            font-family: var(--font-sans);
+            overflow: hidden;
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            user-select: none;
+        }
+
+        /* 16:9 Presentation Container */
+        #deck-container {
+            width: 1280px;
+            height: 720px;
+            background-color: var(--bg-slide);
+            position: relative;
+            box-shadow: var(--shadow-md);
+            border: 1px solid var(--border-color);
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            transform-origin: center center;
+        }
+
+        /* Chrome Decorations */
+        .deck-header {
+            height: 60px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 50px;
+            font-size: 0.75rem;
+            color: var(--text-dim);
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+        }
+
+        .deck-header .logo {
+            font-weight: 700;
+            color: var(--text-main);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .deck-header .logo::before {
+            content: "";
+            display: inline-block;
+            width: 6px;
+            height: 6px;
+            background-color: var(--text-main);
+            border-radius: 50%;
+        }
+
+        .deck-footer {
+            height: 60px;
+            border-top: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 50px;
+            font-size: 0.75rem;
+            color: var(--text-dim);
+        }
+
+        .progress-bar-container {
+            position: absolute;
+            bottom: 59px;
+            left: 0;
+            width: 100%;
+            height: 2px;
+            background-color: #f3f4f6;
+        }
+
+        #progress-bar {
+            height: 100%;
+            width: 0%;
+            background-color: var(--text-main);
+            transition: width 0.3s ease;
+        }
+
+        /* Slide Container and Active states */
+        #slides-wrapper {
+            flex: 1;
+            position: relative;
+        }
+
+        .slide {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            padding: 50px 80px 60px 80px;
+            display: none;
+            flex-direction: column;
+            justify-content: flex-start;
+        }
+
+        .slide.is-active {
+            display: flex;
+            animation: slideFadeIn var(--transition-speed) cubic-bezier(0.16, 1, 0.3, 1) forwards;
+        }
+
+        @keyframes slideFadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        /* Typography & Custom Styles */
+        h1, h2, h3 {
+            font-family: var(--font-title);
+            font-weight: 400;
+            line-height: 1.15;
+            letter-spacing: -0.01em;
+        }
+
+        h1 {
+            font-size: 3.4rem;
+            margin-bottom: 20px;
+        }
+
+        h2 {
+            font-size: 2rem;
+            margin-bottom: 40px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            color: var(--text-main);
+        }
+
+        h2 span.num {
+            font-family: var(--font-mono);
+            font-size: 0.95rem;
+            color: var(--text-dim);
+            border: 1px solid var(--border-color);
+            padding: 2px 8px;
+            border-radius: 4px;
+        }
+
+        p.quote-lead {
+            font-family: var(--font-title);
+            font-size: 1.5rem;
+            color: var(--text-sub);
+            font-style: italic;
+            line-height: 1.5;
+            margin-bottom: 30px;
+            border-left: 2px solid var(--text-main);
+            padding-left: 20px;
+        }
+
+        /* Minimal Layout Grids */
+        .grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 50px;
+            align-items: center;
+            height: calc(100% - 80px);
+        }
+
+        .grid-3 {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 30px;
+        }
+
+        /* Beautiful Minimal Cards */
+        .pillar-card {
+            border: 1px solid var(--border-color);
+            padding: 30px;
+            border-radius: 4px;
+            background-color: #ffffff;
+            transition: all 0.3s ease;
+            position: relative;
+        }
+
+        .pillar-card:hover {
+            border-color: var(--text-main);
+            box-shadow: var(--shadow-sm);
+        }
+
+        .pillar-card-num {
+            font-family: var(--font-mono);
+            font-size: 0.85rem;
+            color: var(--text-dim);
+            margin-bottom: 20px;
+        }
+
+        .pillar-card-title {
+            font-family: var(--font-title);
+            font-size: 1.4rem;
+            margin-bottom: 12px;
+            color: var(--text-main);
+        }
+
+        .pillar-card-desc {
+            font-size: 0.92rem;
+            color: var(--text-sub);
+            line-height: 1.6;
+        }
+
+        /* SVG Node & Diagram styles */
+        .svg-box {
+            width: 100%;
+            height: 100%;
+            min-height: 340px;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            background-color: #fafafa;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+
+        .diagram-svg {
+            width: 100%;
+            height: 100%;
+            max-height: 340px;
+        }
+
+        /* Simulation Canvas styles */
+        #map-sim-container {
+            width: 100%;
+            height: 100%;
+            min-height: 340px;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            background-color: #ffffff;
+            position: relative;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        #map-sim-header {
+            height: 40px;
+            background-color: #f9fafb;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 20px;
+            font-size: 0.75rem;
+            font-family: var(--font-mono);
+            color: var(--text-sub);
+        }
+
+        #sim-canvas {
+            flex: 1;
+            background-color: #ffffff;
+            width: 100%;
+        }
+
+        .sim-btn-group {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            display: flex;
+            gap: 10px;
+        }
+
+        .sim-btn {
+            background-color: #111111;
+            color: #ffffff;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 2px;
+            font-family: var(--font-sans);
+            font-size: 0.75rem;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+
+        .sim-btn:hover {
+            opacity: 0.8;
+        }
+
+        /* Speaker View (S Panel) Overlays */
+        #presenter-panel {
+            position: fixed;
+            top: 0;
+            right: 0;
+            width: 480px;
+            height: 100vh;
+            background-color: #ffffff;
+            border-left: 2px solid var(--border-color);
+            z-index: 1000;
+            display: none;
+            flex-direction: column;
+            box-shadow: -10px 0 40px rgba(0,0,0,0.03);
+        }
+
+        #presenter-panel.is-visible {
+            display: flex;
+        }
+
+        .presenter-header {
+            padding: 24px;
+            background-color: #fafafa;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .presenter-header h4 {
+            font-family: var(--font-sans);
+            font-size: 0.85rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+        }
+
+        .presenter-timer {
+            font-family: var(--font-mono);
+            font-size: 1.3rem;
+            font-weight: bold;
+            color: var(--text-main);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .presenter-timer-reset {
+            background: none;
+            border: 1px solid var(--border-color);
+            font-size: 0.7rem;
+            padding: 2px 6px;
+            border-radius: 2px;
+            cursor: pointer;
+        }
+
+        .presenter-timer-reset:hover {
+            border-color: var(--text-main);
+        }
+
+        .presenter-preview-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            border-bottom: 1px solid var(--border-color);
+            background-color: #f3f4f6;
+            height: 150px;
+        }
+
+        .preview-box {
+            padding: 12px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            background-color: #ffffff;
+            border-right: 1px solid var(--border-color);
+        }
+
+        .preview-box:last-child {
+            border-right: none;
+        }
+
+        .preview-box .label {
+            font-size: 0.65rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-dim);
+        }
+
+        .preview-frame-wrapper {
+            flex: 1;
+            margin-top: 8px;
+            border: 1px solid var(--border-color);
+            border-radius: 2px;
+            overflow: hidden;
+            background-color: #fafafa;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: var(--font-sans);
+            font-size: 0.8rem;
+            font-weight: 500;
+            color: var(--text-sub);
+            position: relative;
+        }
+
+        .preview-num-badge {
+            position: absolute;
+            top: 5px;
+            right: 5px;
+            background: #111;
+            color: #fff;
+            font-size: 0.6rem;
+            padding: 1px 4px;
+            border-radius: 2px;
+        }
+
+        .presenter-notes-container {
+            flex: 1;
+            padding: 30px;
+            overflow-y: auto;
+            background-color: #fbfbfb;
+        }
+
+        .presenter-notes-title {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-dim);
+            margin-bottom: 15px;
+            font-weight: 600;
+        }
+
+        .presenter-notes-content {
+            font-size: 1.2rem;
+            line-height: 1.8;
+            color: #1f2937;
+        }
+
+        .presenter-notes-content p {
+            margin-bottom: 20px;
+        }
+
+        .presenter-notes-content strong {
+            color: var(--text-main);
+            background-color: #fef08a;
+            padding: 2px 4px;
+            border-radius: 2px;
+        }
+
+        /* Overview Grid Overlay (O Panel) */
+        #overview-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background-color: rgba(250, 250, 250, 0.98);
+            z-index: 2000;
+            display: none;
+            padding: 80px;
+            overflow-y: auto;
+        }
+
+        #overview-overlay.is-visible {
+            display: block;
+        }
+
+        .overview-title {
+            font-family: var(--font-title);
+            font-size: 2.2rem;
+            margin-bottom: 50px;
+            text-align: center;
+        }
+
+        .overview-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+            gap: 30px;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .overview-item {
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            aspect-ratio: 16/9;
+            padding: 20px;
+            cursor: pointer;
+            background-color: #ffffff;
+            transition: all 0.2s ease;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+
+        .overview-item:hover {
+            border-color: var(--text-main);
+            transform: translateY(-2px);
+        }
+
+        .overview-item.is-active {
+            border-color: var(--text-main);
+            box-shadow: 0 0 0 3px rgba(0,0,0,0.05);
+        }
+
+        .overview-item-title {
+            font-family: var(--font-title);
+            font-size: 1rem;
+            color: var(--text-main);
+            line-height: 1.4;
+        }
+
+        .overview-item-num {
+            font-family: var(--font-mono);
+            font-size: 0.7rem;
+            color: var(--text-dim);
+        }
+
+        /* Keyboard Help Overlay */
+        #help-toggle {
+            position: fixed;
+            bottom: 25px;
+            left: 25px;
+            background-color: #ffffff;
+            border: 1px solid var(--border-color);
+            color: var(--text-sub);
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            cursor: pointer;
+            box-shadow: var(--shadow-sm);
+            z-index: 999;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        #help-toggle:hover {
+            color: var(--text-main);
+            border-color: var(--text-main);
+        }
+
+        #help-modal {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: #ffffff;
+            border: 1px solid var(--text-main);
+            padding: 40px;
+            border-radius: 4px;
+            box-shadow: 0 30px 60px rgba(0,0,0,0.05);
+            z-index: 3000;
+            display: none;
+            width: 420px;
+        }
+
+        #help-modal.is-visible {
+            display: block;
+        }
+
+        #help-modal h5 {
+            font-family: var(--font-sans);
+            font-size: 1.1rem;
+            margin-bottom: 20px;
+            font-weight: 600;
+        }
+
+        #help-modal table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.85rem;
+        }
+
+        #help-modal td {
+            padding: 10px 0;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        #help-modal td.key {
+            font-family: var(--font-mono);
+            font-weight: bold;
+            color: var(--text-main);
+            width: 110px;
+        }
+
+        #modal-backdrop {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background: rgba(0,0,0,0.05);
+            z-index: 2999;
+            display: none;
+        }
+
+        #modal-backdrop.is-visible {
+            display: block;
+        }
+
+        /* SVG styles for diagrams */
+        .node-circle {
+            fill: #ffffff;
+            stroke: #111111;
+            stroke-width: 1.5;
+        }
+        .node-circle.filled {
+            fill: #111111;
+        }
+        .conn-line {
+            fill: none;
+            stroke: #111111;
+            stroke-width: 1.5;
+        }
+        .conn-line.dash {
+            stroke-dasharray: 4 4;
+            stroke: #9ca3af;
+        }
+        .diag-text {
+            font-family: var(--font-sans);
+            font-size: 11px;
+            fill: #111111;
+            font-weight: 500;
+        }
+        .diag-text.serif {
+            font-family: var(--font-title);
+            font-size: 13px;
+        }
+        .diag-text.mono {
+            font-family: var(--font-mono);
+            font-size: 10px;
+            fill: #4b5563;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- 16:9 Deck Viewport -->
+    <div id="deck-container">
+        
+        <!-- Header Decor -->
+        <div class="deck-header">
+            <span class="logo">Lekit Engineering</span>
+            <span>TUI Coordinator · Design Philosophies</span>
+        </div>
+
+        <!-- Slides Wrapper -->
+        <div id="slides-wrapper">
+
+            <!-- Slide 1: Cover -->
+            <section class="slide is-active" id="slide-1">
+                <div style="margin-top: 100px; max-width: 900px;">
+                    <p style="text-transform: uppercase; letter-spacing: 0.2em; font-family: var(--font-mono); font-size: 0.8rem; color: var(--text-dim); margin-bottom: 20px;">
+                        Architecture & Engineering Aesthetics
+                    </p>
+                    <h1 style="font-size: 3.8rem; line-height: 1.1; margin-bottom: 30px;">
+                        极简、高吞吐与防御性：<br>
+                        机器人终端协调器的<span style="font-style: italic; font-family: var(--font-title);">设计哲学</span>
+                    </h1>
+                    <p style="font-size: 1.25rem; color: var(--text-sub); line-height: 1.6; max-width: 700px; font-family: var(--font-sans); font-weight: 300; margin-bottom: 50px;">
+                        跳出传统图形 UI 逻辑，解析 <code>dashboard.py</code> 终端交互系统在资源受限与实时物理控制下的高层设计理念。
+                    </p>
+                    <div style="display: flex; gap: 50px; font-size: 0.85rem; border-top: 1px solid var(--border-color); padding-top: 30px;">
+                        <div>
+                            <span style="color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em;">Speaker</span>
+                            <div style="font-weight: 600; margin-top: 4px;">系统架构团队</div>
+                        </div>
+                        <div>
+                            <span style="color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em;">Core Case</span>
+                            <div style="font-weight: 600; margin-top: 4px; font-family: var(--font-mono);">src/scripts/dashboard.py</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Speaker Notes -->
+                <div class="notes">
+                    <p>大家好！今天这篇分享我们不罗列枯燥的业务代码，也不逐字讲解程序细节，而是从<strong>高层设计哲学</strong>的视角，来探讨移动机器人多任务协调系统 <strong><code>dashboard.py</code></strong> 在纯终端环境下的架构美学。</p>
+                    <p>作为工程师，我们往往崇尚复杂的图形界面，但在机器人和边缘物理控制领域，<strong>“重型图形化 UI” 常常带来致命的数据开销和重绘延迟。</strong></p>
+                    <p><code>dashboard.py</code> 走了一条极简主义的技术路线：它在没有 Web 或三维渲染引擎的情况下，仅靠终端字符重投影与双线程异步机制，实现了一个实时、高吞吐、且防御性极强的机器人中枢。今天我们将拆解其<strong>三大设计支柱</strong>、<strong>时序异步模型</strong>和<strong>防御性生命周期</strong>等宏观理念。</p>
+                </div>
+            </section>
+
+            <!-- Slide 2: Architectural Philosophy: Three Pillars -->
+            <section class="slide" id="slide-2">
+                <h2><span class="num">01</span> 设计哲学：机器人控制交互的三大基石</h2>
+                <div class="grid-3" style="margin-top: 40px; height: calc(100% - 100px);">
+                    <div class="pillar-card">
+                        <div class="pillar-card-num">01 / THROUGHPUT</div>
+                        <h3 class="pillar-card-title">极致吞吐能力</h3>
+                        <p class="pillar-card-desc">
+                            <strong>物理控制不为渲染让步</strong>。<br>
+                            核心 Action-Observation 控制环路与 UI 渲染解耦，丢弃无效帧，保障物理周期恒定在 30Hz 以上。
+                        </p>
+                    </div>
+                    <div class="pillar-card">
+                        <div class="pillar-card-num">02 / INTERACTION</div>
+                        <h3 class="pillar-card-title">非阻塞式响应</h3>
+                        <p class="pillar-card-desc">
+                            <strong>交互绝不挂起系统心跳</strong>。<br>
+                            引入非阻塞键盘拦截与微自旋确认机制，弹窗与调试输入期间，机器人遥测与位置投影保持动画更新。
+                        </p>
+                    </div>
+                    <div class="pillar-card">
+                        <div class="pillar-card-num">03 / SAFE EXIT</div>
+                        <h3 class="pillar-card-title">防御性物理兜底</h3>
+                        <p class="pillar-card-desc">
+                            <strong>以防灾为第一要务</strong>。<br>
+                            不论正常退出、Ctrl+C 或严重崩溃，强制触发终端生态还原、机械臂软制动及遥测会话持久化归档。
+                        </p>
+                    </div>
+                </div>
+
+                <!-- Speaker Notes -->
+                <div class="notes">
+                    <p>首先，让我们来看 <code>dashboard.py</code> 最顶层的<strong>三大设计支柱</strong>。这三大支柱几乎奠定了所有高质量边缘和硬件人机交互系统的架构底色。</p>
+                    <p><strong>第一，是“吞吐优先”。</strong>我们有一句核心哲学叫做：物理控制绝不为渲染让步。渲染慢了顶多是屏幕卡顿，但控制慢了机器人就会失速甚至撞击。所以吞吐优先就是要把一切耗时长的界面计算移出主线程。</p>
+                    <p><strong>第二，是“非阻塞响应”。</strong>许多传统的系统，在弹出一个模态提示框，比如“确认运行这个任务吗？”的时候，整个程序都挂起了。这在物理控制里非常危险，因为挂起意味着丢掉了机器人的最新状态。所以我们坚持任何弹窗阶段，机器人的地图和传感器数据依然得实时刷新。</p>
+                    <p><strong>第三，是“防御性物理兜底”。</strong>硬件设备是昂贵的。当程序遭遇严重异常、断网崩溃，甚至操作员按下 Ctrl+C 强退时，软件必须保障在微秒内向关节和电机构建软着陆指令，并清扫终端环境。这三大基石完美指导了 <code>dashboard.py</code> 的全案源码演进。</p>
+                </div>
+            </section>
+
+            <!-- Slide 3: Loop Coexistence: Dual-Thread Time Model -->
+            <section class="slide" id="slide-3">
+                <h2><span class="num">02</span> 时序调和：30Hz 物理循环与 10Hz 终端重绘</h2>
+                <div class="grid-2">
+                    <div>
+                        <p class="quote-lead">
+                            "当高频控制回路与重型 IO 混杂时，延迟即雪崩。"
+                        </p>
+                        <p style="margin-bottom: 20px; font-size: 0.98rem; line-height: 1.6; color: var(--text-sub);">
+                            主控循环每次获取传感、计算模型并发送关节指令，若在同一线程重绘包含 40×50 像素地图的界面，终端重绘耗时（约 15ms-40ms）将彻底摧毁机器人的物理控制精度。
+                        </p>
+                        <p style="font-size: 0.98rem; line-height: 1.6; color: var(--text-sub);">
+                            通过引入<strong>零深度缓冲区线程队列（Queue with Maxsize 1）</strong>，让两者在时间轴上实现非对称并进。
+                        </p>
+                    </div>
+                    <div>
+                        <div class="svg-box">
+                            <svg class="diagram-svg" viewBox="0 0 400 300">
+                                <!-- Baseline time line -->
+                                <line x1="40" y1="50" x2="360" y2="50" class="conn-line" />
+                                <text x="40" y="35" class="diag-text mono">Thread A: Control Loop (30Hz)</text>
+                                
+                                <circle cx="60" cy="50" r="6" class="node-circle filled" />
+                                <line x1="60" y1="50" x2="60" y2="180" class="conn-line dash" />
+                                <text x="60" y="70" text-anchor="middle" class="diag-text mono">Step 1</text>
+                                
+                                <circle cx="160" cy="50" r="6" class="node-circle filled" />
+                                <line x1="160" y1="50" x2="160" y2="180" class="conn-line dash" />
+                                <text x="160" y="70" text-anchor="middle" class="diag-text mono">Step 2</text>
+
+                                <circle cx="260" cy="50" r="6" class="node-circle filled" />
+                                <line x1="260" y1="50" x2="260" y2="180" class="conn-line dash" />
+                                <text x="260" y="70" text-anchor="middle" class="diag-text mono">Step 3</text>
+
+                                <!-- Thread B timeline -->
+                                <line x1="40" y1="180" x2="360" y2="180" class="conn-line" />
+                                <text x="40" y="215" class="diag-text mono">Thread B: TUI Rendering (10Hz)</text>
+
+                                <rect x="50" y="140" width="80" height="30" rx="2" style="fill:none; stroke:#111; stroke-width:1;" />
+                                <text x="90" y="158" text-anchor="middle" class="diag-text" style="font-size: 9px;">Draw Frame 1</text>
+
+                                <rect x="230" y="140" width="80" height="30" rx="2" style="fill:none; stroke:#111; stroke-width:1;" />
+                                <text x="270" y="158" text-anchor="middle" class="diag-text" style="font-size: 9px;">Draw Frame 2</text>
+
+                                <!-- Queue indicator -->
+                                <path d="M 160 50 L 190 90 L 230 140" class="conn-line" style="stroke-dasharray: 2 2; stroke:#9ca3af;" />
+                                <text x="220" y="95" class="diag-text mono" style="fill:var(--error);">Dropped (Frame skip)</text>
+
+                                <circle cx="60" cy="180" r="4" class="node-circle" />
+                                <circle cx="260" cy="180" r="4" class="node-circle" />
+                                
+                                <text x="200" y="270" text-anchor="middle" class="diag-text serif" style="font-size: 11px;">控制高频行进，渲染低频按需“抽样”，防止排队积压延迟</text>
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Speaker Notes -->
+                <div class="notes">
+                    <p>第二页，我们用一张<strong>时序演进图</strong>，来剖析 TUI 交互系统中最核心的难点：高频物理控制与低频视觉呈现的“时序调和”。</p>
+                    <p>机器人底座在行进时，感知、推理、动作的控制频率一般不低于 30Hz（即每秒执行 30 次）。但是，要把几十个字符单元和彩色网格重绘到终端窗口，在性能一般的开发板上，会带来长达 20ms 的 I/O 阻塞。</p>
+                    <p>如果使用单线程，意味着每轮重画，机器人都会“失速”一到两帧，造成控制不连贯。</p>
+                    <p>为了解决这个问题，<code>dashboard.py</code> 构造了一个<strong>极富启发性的双线程非对称流水线</strong>：主控制回路作为“生产者”，以 30Hz 的满频率高速跑，跑完一圈就向重绘队列发送一次信号，随即进入下一圈。而重绘线程作为“消费者”，在获取信号后加锁重绘。重点是，如果渲染线程还没画完上一次，主回路又塞来一个新绘制信号，队列会利用 <code>put_nowait</code> 的满额报错机制<strong>直接丢弃这一帧（Frame Skip）</strong>，从而永远不让渲染队列堆积。这种“高频控制，按需抽样”的时序哲学，堪称边缘计算的典范。</p>
+                </div>
+            </section>
+
+            <!-- Slide 4: Reactive State Mapping -->
+            <section class="slide" id="slide-4">
+                <h2><span class="num">03</span> 反应式终端：单源状态到视图分支映射</h2>
+                <div class="grid-2">
+                    <div>
+                        <p class="quote-lead">
+                            "视图仅仅是状态在某个时间轴切面上的纯函数映射。"
+                        </p>
+                        <p style="margin-bottom: 20px; font-size: 0.98rem; line-height: 1.6; color: var(--text-sub);">
+                            多任务控制涉及选择、预置、执行、暂停、报错等复杂交织的分支逻辑。系统将全部时序控制和界面变化，收拢在唯一的全局反应式状态变量 <code>state</code> 中。
+                        </p>
+                        <p style="font-size: 0.98rem; line-height: 1.6; color: var(--text-sub);">
+                            <code>build_tui_layout</code> 作为纯函数组件，无副作用地根据 <code>state["status"]</code> 的跃迁，动态切换整个界面的排版、交互与心跳动效。
+                        </p>
+                    </div>
+                    <div>
+                        <div class="svg-box">
+                            <svg class="diagram-svg" viewBox="0 0 400 300">
+                                <!-- Central state container -->
+                                <rect x="30" y="110" width="120" height="80" rx="3" style="fill:#ffffff; stroke:#111111; stroke-width:2;" />
+                                <text x="90" y="145" text-anchor="middle" class="diag-text serif" style="font-size:14px; font-weight:bold;">state</text>
+                                <text x="90" y="165" text-anchor="middle" class="diag-text mono" style="font-size:9px;">Single Source of Truth</text>
+
+                                <!-- View Map outputs -->
+                                <rect x="230" y="40" width="140" height="40" rx="2" style="fill:none; stroke:#9ca3af; stroke-width:1;" />
+                                <text x="300" y="65" text-anchor="middle" class="diag-text" style="font-weight: 500;">📋 Task scrolling Panel</text>
+
+                                <rect x="230" y="110" width="140" height="40" rx="2" style="fill:#f3f4f6; stroke:#111111; stroke-width:1.5;" />
+                                <text x="300" y="135" text-anchor="middle" class="diag-text" style="font-weight: bold;">⚡ Operation Console</text>
+
+                                <rect x="230" y="180" width="140" height="40" rx="2" style="fill:none; stroke:#9ca3af; stroke-width:1;" />
+                                <text x="300" y="205" text-anchor="middle" class="diag-text" style="font-weight: 500;">📍 Location Projection Map</text>
+
+                                <rect x="230" y="245" width="140" height="30" rx="2" style="fill:none; stroke:#9ca3af; stroke-width:1;" />
+                                <text x="300" y="264" text-anchor="middle" class="diag-text" style="font-size: 10px;">📜 Telemetry logs</text>
+
+                                <!-- Connectors -->
+                                <path d="M 150 130 L 220 60" class="conn-line dash" marker-end="url(#arrow)" />
+                                <path d="M 150 150 L 220 130" class="conn-line" style="stroke-width:2;" marker-end="url(#arrow)" />
+                                <path d="M 150 170 L 220 200" class="conn-line dash" marker-end="url(#arrow)" />
+                                <path d="M 130 190 L 220 260" class="conn-line dash" marker-end="url(#arrow)" />
+
+                                <text x="180" y="105" text-anchor="middle" class="diag-text mono" style="font-size: 8px;">status==done</text>
+                                <text x="195" y="145" text-anchor="middle" class="diag-text mono" style="font-size: 9px; font-weight: bold;">status==confirming</text>
+                                <text x="180" y="182" text-anchor="middle" class="diag-text mono" style="font-size: 8px;">status==executing</text>
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Speaker Notes -->
+                <div class="notes">
+                    <p>第三页，我们探讨的是现代优秀的前端和客户端系统都极力推崇的概念——<strong>“反应式单源状态（Single Source of Truth）视图映射”</strong>。</p>
+                    <p>机器人是一个极为复杂的异步环境，夹爪可能会报错、底盘可能会中途断开、用户可能突然按下强退。如果我们直接用“分支式面条代码”去手动控制不同情况下的终端输出，程序很快会陷入无法维护的混乱泥潭。</p>
+                    <p><code>dashboard.py</code> 的架构智慧在于，它构建了一个极其纯粹的<strong>单源全局状态变量 <code>self.state</code></strong>。无论是控制环路、按键监听还是通信断连，所有的业务动作在发生变化时，都只改写这一个变量中定义的 <code>status</code> 指示器。</p>
+                    <p>重绘方法 <code>build_tui_layout</code> 在构造终端面板时，就像一个没有副作用的纯函数，根据 <code>status</code> 变化动态切换渲染：如果需要确认，中央控制面板立即重绘成红色呼吸闪烁的心跳弹窗；如果是在空闲，则静默显示任务滚动表。这不仅保证了视图和底层状态的高一致性，更为后期的多任务批量运行（Batch mode）打下了坚实的架构底座。</p>
+                </div>
+            </section>
+
+            <!-- Slide 5: Defensive Programming & Safe Lifecycle -->
+            <section class="slide" id="slide-5">
+                <h2><span class="num">04</span> 防御性物理控制：全生命周期自闭环</h2>
+                <div class="grid-2">
+                    <div>
+                        <p class="quote-lead">
+                            "对现实世界的敬畏，是机器人软件工程的第一准则。"
+                        </p>
+                        <p style="margin-bottom: 20px; font-size: 0.98rem; line-height: 1.6; color: var(--text-sub);">
+                            机器人并非运行在纯虚拟的沙盒中。不正常的退出会导致：关节机械臂依然挂着大扭矩电流悬空、末端夹爪未能复位、或者终端标准输入被永久禁用回显从而破坏当前 shell。
+                        </p>
+                        <p style="font-size: 0.98rem; line-height: 1.6; color: var(--text-sub);">
+                            设计了严密包裹在 <code>try...finally</code> 结构中的<strong>程序自闭环复位回路</strong>。
+                        </p>
+                    </div>
+                    <div>
+                        <div class="svg-box">
+                            <svg class="diagram-svg" viewBox="0 0 400 300">
+                                <!-- Box containing lifecycle -->
+                                <rect x="30" y="20" width="340" height="250" rx="6" style="fill:none; stroke:#e5e7eb; stroke-width:2;" />
+                                
+                                <!-- Step 1 -->
+                                <rect x="50" y="40" width="130" height="35" rx="3" style="fill:#ffffff; stroke:#111111; stroke-width:1;" />
+                                <text x="115" y="62" text-anchor="middle" class="diag-text">Disable Terminal ECHO</text>
+                                
+                                <!-- Step 2 -->
+                                <rect x="220" y="40" width="130" height="35" rx="3" style="fill:#ffffff; stroke:#111111; stroke-width:1;" />
+                                <text x="285" y="62" text-anchor="middle" class="diag-text">Start Sub-Threads</text>
+
+                                <!-- Main execution -->
+                                <rect x="100" y="100" width="200" height="50" rx="4" style="fill:#f9fafb; stroke:#111111; stroke-width:2;" />
+                                <text x="200" y="125" text-anchor="middle" class="diag-text serif" style="font-weight: bold; font-size: 13px;">execute_single_task()</text>
+                                <text x="200" y="142" text-anchor="middle" class="diag-text mono" style="font-size: 8px;">Main Loop running...</text>
+
+                                <!-- Exception branch -->
+                                <path d="M 200 150 L 200 185" class="conn-line" style="stroke:var(--error);" marker-end="url(#arrow)" />
+                                <text x="260" y="172" class="diag-text mono" style="fill:var(--error);">Interrupt / Error / Ctrl+C</text>
+
+                                <!-- Finally block -->
+                                <rect x="70" y="195" width="260" height="60" rx="4" style="fill:#fef08a; stroke:#eab308; stroke-width:1.5;" />
+                                <text x="200" y="215" text-anchor="middle" class="diag-text" style="font-weight: bold; font-size: 12px; fill:#854d0e;">Finally Guard Block</text>
+                                <text x="200" y="232" text-anchor="middle" class="diag-text mono" style="font-size: 8px; fill:#a16207;">1. Restore Echo | 2. Soft-brake arms | 3. Save JSON telemetry</text>
+
+                                <path d="M 115 75 L 115 100" class="conn-line" marker-end="url(#arrow)" />
+                                <path d="M 285 75 L 285 100" class="conn-line" marker-end="url(#arrow)" />
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Speaker Notes -->
+                <div class="notes">
+                    <p>第四页，我们切入机器人安全领域最经典的原则——<strong>“防御性自闭环生命周期”</strong>。</p>
+                    <p>很多纯软件出身的程序员在写代码时，习惯于一旦发生崩溃就直接丢出异常或者调用 <code>sys.exit()</code>。这在软件工程里也许无伤大雅，但在物理控制中，这等同于犯罪。</p>
+                    <p>设想一下：主程序在控制机械臂高高举起时崩溃退出，如果硬件没有制动或者保持力，高扭矩的机械臂会由于重力瞬间直直坠落砸坏底盘；或者是我们的终端拦截了键盘，若不清理终端状态直接退到 Bash，当前命令行控制台将无法输入、光标消失。这就是典型的<strong>“硬件悬挂与终端污染”</strong>故障。</p>
+                    <p><code>dashboard.py</code> 的做法是在底层的 <code>main</code> 接口和 <code>coordinator.stop</code> 中建立极度严密的 <code>finally</code> 兜底防护：只要检测到程序生命周期的终结，不管是因为用户手动按 Q 退出、Ctrl+C 信号、甚至是网络推理超时引发的严重崩溃，它都会雷打不动地执行三件事：一、复原底层终端标准输入的 ECHO 设置，把光标重新还给 Shell；二、非阻塞向 ROS 接口发送刹车和软制动指令，复位末端关节和夹爪；三、将此次运行的数据，无感地持久化保存为标准 JSON，保证事故现场 100% 可回溯。这就是对物理实体怀抱敬畏的设计哲学。</p>
+                </div>
+            </section>
+
+            <!-- Slide 6: Cartesian Projection Visual Map -->
+            <section class="slide" id="slide-6">
+                <h2><span class="num">05</span> 低带宽自适应监控：笛卡尔空间重投影地图</h2>
+                <div class="grid-2">
+                    <div>
+                        <p class="quote-lead">
+                            "最好的可视化是：用最少的带宽承载最核心的可观测性。"
+                        </p>
+                        <p style="margin-bottom: 20px; font-size: 0.98rem; line-height: 1.6; color: var(--text-sub);">
+                            不依赖 WebGL 或是笨重庞大的浏览器引擎。程序巧妙提取关键物理实体边界，自适应进行线性拉伸。
+                        </p>
+                        <p style="font-size: 0.98rem; line-height: 1.6; color: var(--text-sub);">
+                            将获取到的高精笛卡尔双轴连续浮点坐标 <code>(x, y)</code> 极速重投影为离散的终端字符像素点。
+                        </p>
+                    </div>
+                    <div>
+                        <!-- Interactive simulation is back! Because it's an amazing graphic -->
+                        <div id="map-sim-container">
+                            <div id="map-sim-header">
+                                <span>📍 Live TUI Map Projection Simulator</span>
+                                <span id="sim-status" style="color: var(--success); font-weight: bold;">STATUS: CONNECTED</span>
+                            </div>
+                            <canvas id="sim-canvas"></canvas>
+                            <div class="sim-btn-group">
+                                <button class="sim-btn" id="btn-move-a">Move A</button>
+                                <button class="sim-btn" id="btn-move-b">Move B</button>
+                                <button class="sim-btn" id="btn-reset">Reset</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Speaker Notes -->
+                <div class="notes">
+                    <p>第五页，我们继续探讨<strong>低通信开销与核心观测的可视化美学</strong>。也就是大家在右半部分屏幕里看到的<strong>实时笛卡尔坐标投影地图</strong>。</p>
+                    <p>通常情况下，我们要监控机器人的位置和雷达边界，需要引入 ROS 的 Rviz，或者在浏览器里起一个基于 WebGL / Canvas 的 Web 监控页。这需要消耗巨大的 CPU 运算和极高的局部网络带宽，在网络抖动的工业车间里时常发生监控假死。</p>
+                    <p><code>dashboard.py</code> 的高层设计思想是：<strong>用最少的终端数据传输，呈现最直观的空间姿态。</strong></p>
+                    <p>它通过读取机器人当前在世界坐标系下的连续浮点数 <code>x, y</code>，提取出 A、B、Base 等命名坐标的全局极值，从而自适应建立一个极小视口的线性重投影方程。机器人原本细微抖动的物理运动在进行低通平滑消抖后，被干净利索地投射成了终端字符像素。这不仅做到了 50Hz 以上的超轻量渲染，更是用最简约的技术换取了最直观的工业现场态势感知能力。</p>
+                </div>
+            </section>
+
+            <!-- Slide 7: Session Lifecycle & Persistent Telemetry -->
+            <section class="slide" id="slide-7">
+                <h2><span class="num">06</span> 数据即资产：控制环遥测与会话持久化</h2>
+                <div class="grid-2">
+                    <div>
+                        <p class="quote-lead">
+                            "离线会话的结束，是系统诊断和行为分析的起点。"
+                        </p>
+                        <p style="margin-bottom: 20px; font-size: 0.98rem; line-height: 1.6; color: var(--text-sub);">
+                            系统追求双轨遥测体系：运行中通过轻量 Rerun 协议将高维 3D 摄像图源与控制决策同步传输给外部遥测引擎。
+                        </p>
+                        <p style="font-size: 0.98rem; line-height: 1.6; color: var(--text-sub);">
+                            在本地则通过环形缓冲区，将每次运行的决策网络性能（运行用时、单任务成功率、策略分布）做增量聚合，生成闭环报告。
+                        </p>
+                    </div>
+                    <div>
+                        <div class="svg-box">
+                            <svg class="diagram-svg" viewBox="0 0 400 300">
+                                <!-- Infinite telemetry loop -->
+                                <rect x="30" y="30" width="340" height="240" rx="4" style="fill:none; stroke:#e5e7eb; stroke-width:1.5;" />
+                                
+                                <path d="M 120 150 C 120 70, 280 70, 280 150 C 280 230, 120 230, 120 150 Z" class="conn-line" style="stroke-width:2;" />
+                                
+                                <!-- Cycle nodes -->
+                                <circle cx="120" cy="150" r="15" class="node-circle" />
+                                <text x="120" y="180" text-anchor="middle" class="diag-text mono" style="font-size:8px;">Capture Obs</text>
+
+                                <circle cx="200" cy="80" r="15" class="node-circle" />
+                                <text x="200" y="55" text-anchor="middle" class="diag-text mono" style="font-size:8px;">Model Infer</text>
+
+                                <circle cx="280" cy="150" r="15" class="node-circle" />
+                                <text x="280" y="180" text-anchor="middle" class="diag-text mono" style="font-size:8px;">Motor Act</text>
+
+                                <circle cx="200" cy="220" r="15" class="node-circle filled" />
+                                <text x="200" y="248" text-anchor="middle" class="diag-text mono" style="font-size:9px; font-weight:bold;">Local Telemetry & JSON Dump</text>
+
+                                <path d="M 215 220 L 265 150" class="conn-line dash" />
+                                <path d="M 185 220 L 135 150" class="conn-line dash" />
+                                
+                                <text x="200" y="145" text-anchor="middle" class="diag-text serif" style="font-size: 11px; font-style: italic;">增量分析，事后溯源</text>
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Speaker Notes -->
+                <div class="notes">
+                    <p>第六页，我们探讨的是现代机器人乃至一切硬件和 AI 闭环系统的关键思维——<strong>“数据即资产（Telemetry as an Asset）”</strong>。</p>
+                    <p>程序控制不仅要保障此时此刻，更要保障“事后复盘”。在 <code>dashboard.py</code> 的控制环里，系统采用了<strong>“增量聚合与双轨遥测（Dual-Track Telemetry）”</strong>的经典思想。</p>
+                    <p>什么是双轨遥测？首先在在线运行阶段，高维度的多机视频、三维激光雷达数据不经过重绘，直接利用轻量化的 Rerun 等第三方工具接口高速传输到远端监控机。而在终端本地，仅记录任务启动数、中断数、各模型版本被调用的次数。系统退出时，会在底层生成一份标准的、高可读性的结构化运行 JSON 会话归档。</p>
+                    <p>这就完成了从“动作执行”到“离线溯源分析”的高闭环。机器人运行的好不好，哪一个算法版本的成功率高、平均耗时多，都逃不过这张会话总结表的审查。数据在这里，变成了下一次算法迭代和硬件演进最宝贵的资产。</p>
+                </div>
+            </section>
+
+            <!-- Slide 8: Summary of Design Zen -->
+            <section class="slide" id="slide-8">
+                <div style="margin-top: 80px; max-width: 900px;">
+                    <h2 style="font-size: 2.8rem; margin-bottom: 40px; font-style: italic; font-family: var(--font-title);">
+                        "Keep your interface lean, your loops fast, and your recovery defensive."
+                    </h2>
+                    <div class="grid-3" style="margin-top: 40px;">
+                        <div class="pillar-card" style="border: none; padding: 10px;">
+                            <h4 style="font-family: var(--font-sans); font-size: 1.15rem; font-weight: 600; margin-bottom: 12px;">Decouple to Surpass</h4>
+                            <p style="font-size: 0.9rem; line-height: 1.6; color: var(--text-sub);">
+                                将渲染、输入和物理设备操作绝对解耦，在物理频率与交互延迟之间，求取优雅而又安全的技术妥协。
+                            </p>
+                        </div>
+                        <div class="pillar-card" style="border: none; padding: 10px;">
+                            <h4 style="font-family: var(--font-sans); font-size: 1.15rem; font-weight: 600; margin-bottom: 12px;">Respect the Physical</h4>
+                            <p style="font-size: 0.9rem; line-height: 1.6; color: var(--text-sub);">
+                                物理控制器必须具备自恢复的防御机制，在任何崩溃节点兜底，守护昂贵的资产设备不受外部程序异常干扰。
+                            </p>
+                        </div>
+                        <div class="pillar-card" style="border: none; padding: 10px;">
+                            <h4 style="font-family: var(--font-sans); font-size: 1.15rem; font-weight: 600; margin-bottom: 12px;">Zen of Minimal TUI</h4>
+                            <p style="font-size: 0.9rem; line-height: 1.6; color: var(--text-sub);">
+                                终端并不意味着简陋。用最克制的字符、最合理的数学投影变换和极佳的信息密度，建立超高强度的态势感知。
+                            </p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Speaker Notes -->
+                <div class="notes">
+                    <p>最后，让我们用一句话，来为这次基于 <code>dashboard.py</code> 的机器人多任务协调器设计哲学拆解画上圆满的句号。</p>
+                    <p>这句话就是：<strong>保持界面的克制，保持控制环的高吞吐，并对生命周期的异常抱有深厚的防御性。</strong></p>
+                    <p>从这次的案例解析中，我们不难得出三点关于人机交互和物理控制的顶层启示：</p>
+                    <p>一、<strong>极致的解耦不仅为了美观，更为了性能。</strong>让主循环在专属的线程里无后顾之忧地狂奔，不要让沉重的 UI 界面渲染拖慢前进的脚步。</p>
+                    <p>二、<strong>防御性兜底并非可选，而是物理软硬件系统的核心刚需。</strong>我们对现实世界越具有敬畏心，越在 <code>finally</code> 块中规划好复位指令，我们的机器人产品和系统在面临极端恶劣生产车间环境时，就越具备无懈可击的鲁棒性。</p>
+                    <p>三、<strong>精简的技术往往能诞生高强度的感知。</strong>在移动开发、嵌入式开发甚至云原生监控开发中，丢掉厚重而又繁杂的多层嵌套 UI 组件，重构出单源状态和低开销坐标网格，往往能够成就更加卓越而高密度的可观测性。</p>
+                    <p>感谢大家的聆听！现在，我非常乐意解答大家关于系统架构与设计理念上的任何疑问。</p>
+                </div>
+            </section>
+
+        </div>
+
+        <!-- Slide Number & Progress bar -->
+        <div class="progress-bar-container">
+            <div id="progress-bar"></div>
+        </div>
+
+        <!-- Footer Decor -->
+        <div class="deck-footer">
+            <span>← / → Nav · [S] Presenter Mode · [O] Overview Grid · [?] Keymaps</span>
+            <span id="slide-num-indicator">1 / 8</span>
+        </div>
+
+    </div>
+
+    <!-- Help Modal Window -->
+    <div id="modal-backdrop"></div>
+    <div id="help-modal">
+        <h5>⌨️ Control Bindings</h5>
+        <table>
+            <tr><td class="key">→ / Space</td><td>Next Slide</td></tr>
+            <tr><td class="key">←</td><td>Previous Slide</td></tr>
+            <tr><td class="key">S</td><td>Toggle Presenter Panel</td></tr>
+            <tr><td class="key">O</td><td>Toggle Slide Overview</td></tr>
+            <tr><td class="key">F</td><td>Toggle Fullscreen Mode</td></tr>
+            <tr><td class="key">Esc</td><td>Close Overlay</td></tr>
+        </table>
+    </div>
+
+    <!-- Presenter Notes Sidebar Panel -->
+    <div id="presenter-panel">
+        <div class="presenter-header">
+            <h4>🎤 Presenter Console</h4>
+            <div class="presenter-timer">
+                <span id="timer-display">00:00</span>
+                <button class="presenter-timer-reset" id="btn-timer-reset">Reset</button>
+            </div>
+        </div>
+        <div class="presenter-preview-grid">
+            <div class="preview-box">
+                <span class="label">Current Slide</span>
+                <div class="preview-frame-wrapper">
+                    <span id="pview-curr-title" style="text-align: center; padding: 10px;">Slide Title</span>
+                    <span class="preview-num-badge" id="pview-curr-num">1</span>
+                </div>
+            </div>
+            <div class="preview-box">
+                <span class="label">Next Slide</span>
+                <div class="preview-frame-wrapper">
+                    <span id="pview-next-title" style="text-align: center; padding: 10px;">Next Title</span>
+                    <span class="preview-num-badge" id="pview-next-num">2</span>
+                </div>
+            </div>
+        </div>
+        <div class="presenter-notes-container">
+            <div class="presenter-notes-title">Speaker Script (提词器逐字稿)</div>
+            <div class="presenter-notes-content" id="presenter-notes-content">
+                Presenter notes go here...
+            </div>
+        </div>
+    </div>
+
+    <!-- Overview Overlay -->
+    <div id="overview-overlay">
+        <h3 class="overview-title">Slides Map</h3>
+        <div class="overview-grid" id="overview-grid">
+            <!-- Generated dynamically -->
+        </div>
+    </div>
+
+    <!-- Controls & Presenter Logic -->
+    <script>
+        const slides = document.querySelectorAll('.slide');
+        let currentSlideIdx = 0;
+        
+        // Timer Logic
+        let startTime = Date.now();
+        let timerInterval = null;
+
+        function startTimer() {
+            startTime = Date.now();
+            if (timerInterval) clearInterval(timerInterval);
+            timerInterval = setInterval(() => {
+                const elapsed = Date.now() - startTime;
+                const secs = Math.floor((elapsed / 1000) % 60);
+                const mins = Math.floor((elapsed / 60000) % 60);
+                document.getElementById('timer-display').textContent = 
+                    `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+            }, 1000);
+        }
+
+        document.getElementById('btn-timer-reset').addEventListener('click', (e) => {
+            e.stopPropagation();
+            startTimer();
+        });
+
+        // Update presentation state
+        function updatePresentation() {
+            // Active slide toggle
+            slides.forEach((slide, i) => {
+                slide.classList.toggle('is-active', i === currentSlideIdx);
+                // Trigger canvas simulation on slide 5 (now at index 4)
+                if (i === 4 && currentSlideIdx === 4) {
+                    initMapSimulation();
+                }
+            });
+
+            // Indicators
+            document.getElementById('slide-num-indicator').textContent = `${currentSlideIdx + 1} / ${slides.length}`;
+            document.getElementById('progress-bar').style.width = `${(currentSlideIdx / (slides.length - 1)) * 100}%`;
+
+            // Synced hash update
+            window.location.hash = `slide-${currentSlideIdx + 1}`;
+
+            // Sync Presenter notes and preview cards
+            const currentSlide = slides[currentSlideIdx];
+            const nextSlide = slides[currentSlideIdx + 1];
+
+            // Get Current title
+            let currentTitleText = "Cover page";
+            const currentHeaderEl = currentSlide.querySelector('h2');
+            if (currentHeaderEl) {
+                currentTitleText = currentHeaderEl.innerText.replace(/^\d+\s*/, '');
+            } else if (currentSlide.querySelector('h1')) {
+                currentTitleText = "Introduction (哲学封面)";
+            }
+            document.getElementById('pview-curr-title').textContent = currentTitleText;
+            document.getElementById('pview-curr-num').textContent = currentSlideIdx + 1;
+
+            // Get Next title
+            if (nextSlide) {
+                let nextTitleText = "Closing page";
+                const nextHeaderEl = nextSlide.querySelector('h2');
+                if (nextHeaderEl) {
+                    nextTitleText = nextHeaderEl.innerText.replace(/^\d+\s*/, '');
+                }
+                document.getElementById('pview-next-title').textContent = nextTitleText;
+                document.getElementById('pview-next-num').textContent = currentSlideIdx + 2;
+            } else {
+                document.getElementById('pview-next-title').textContent = "(End of Presentation)";
+                document.getElementById('pview-next-num').textContent = "End";
+            }
+
+            // Sync notes
+            const notesEl = currentSlide.querySelector('.notes');
+            const notesContentEl = document.getElementById('presenter-notes-content');
+            if (notesEl) {
+                notesContentEl.innerHTML = notesEl.innerHTML;
+            } else {
+                notesContentEl.innerHTML = "<p style='color: #888;'>No notes prepared for this slide.</p>";
+            }
+        }
+
+        // Navigation
+        function navigate(dir) {
+            if (dir === 'next' && currentSlideIdx < slides.length - 1) {
+                currentSlideIdx++;
+            } else if (dir === 'prev' && currentSlideIdx > 0) {
+                currentSlideIdx--;
+            }
+            updatePresentation();
+        }
+
+        // Keys Dispatcher
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') {
+                e.preventDefault();
+                navigate('next');
+            } else if (e.key === 'ArrowLeft' || e.key === 'PageUp' || e.key === 'Backspace') {
+                e.preventDefault();
+                navigate('prev');
+            } else if (e.key === 's' || e.key === 'S') {
+                const panel = document.getElementById('presenter-panel');
+                panel.classList.toggle('is-visible');
+                if (panel.classList.contains('is-visible')) {
+                    startTimer();
+                }
+            } else if (e.key === 'o' || e.key === 'O') {
+                toggleOverview();
+            } else if (e.key === 'f' || e.key === 'F') {
+                toggleFullscreen();
+            } else if (e.key === '?') {
+                toggleHelpModal();
+            } else if (e.key === 'Escape') {
+                closeAllOverlays();
+            }
+        });
+
+        // Overview Overlay Generator & Control
+        function toggleOverview() {
+            const overview = document.getElementById('overview-overlay');
+            overview.classList.toggle('is-visible');
+            if (overview.classList.contains('is-visible')) {
+                const grid = document.getElementById('overview-grid');
+                grid.innerHTML = ''; // clear
+                slides.forEach((slide, idx) => {
+                    const item = document.createElement('div');
+                    item.className = `overview-item ${idx === currentSlideIdx ? 'is-active' : ''}`;
+                    
+                    let titleStr = "Cover page";
+                    const h2 = slide.querySelector('h2');
+                    if (h2) titleStr = h2.innerText.replace(/^\d+\s*/, '');
+                    else if (slide.querySelector('h1')) titleStr = "Design Philosophies";
+
+                    item.innerHTML = `
+                        <div class="overview-item-title">${titleStr}</div>
+                        <div class="overview-item-num">SLIDE ${idx + 1}</div>
+                    `;
+                    item.addEventListener('click', () => {
+                        currentSlideIdx = idx;
+                        updatePresentation();
+                        overview.classList.remove('is-visible');
+                    });
+                    grid.appendChild(item);
+                });
+            }
+        }
+
+        function toggleFullscreen() {
+            if (!document.fullscreenElement) {
+                document.documentElement.requestFullscreen().catch(err => {
+                    console.error("Failed to enter fullscreen mode", err);
+                });
+            } else {
+                document.exitFullscreen();
+            }
+        }
+
+        function toggleHelpModal() {
+            document.getElementById('help-modal').classList.toggle('is-visible');
+            document.getElementById('modal-backdrop').classList.toggle('is-visible');
+        }
+
+        function closeAllOverlays() {
+            document.getElementById('overview-overlay').classList.remove('is-visible');
+            document.getElementById('help-modal').classList.remove('is-visible');
+            document.getElementById('modal-backdrop').classList.remove('is-visible');
+        }
+
+        // Click handler for backdrop
+        document.getElementById('modal-backdrop').addEventListener('click', closeAllOverlays);
+
+        // Click toggle help
+        const helpBtn = document.createElement('button');
+        helpBtn.id = 'help-toggle';
+        helpBtn.innerHTML = '<span>⌨️</span> Keymaps';
+        document.body.appendChild(helpBtn);
+        helpBtn.addEventListener('click', toggleHelpModal);
+
+        // Responsive Scale to fit
+        function scaleDeck() {
+            const deck = document.getElementById('deck-container');
+            const targetWidth = 1280;
+            const targetHeight = 720;
+            const windowWidth = window.innerWidth;
+            const windowHeight = window.innerHeight;
+
+            const scaleX = windowWidth / targetWidth;
+            const scaleY = windowHeight / targetHeight;
+            const scale = Math.min(scaleX, scaleY) * 0.95; // Give 5% margin padding
+
+            deck.style.transform = `scale(${scale})`;
+        }
+
+        window.addEventListener('resize', scaleDeck);
+
+        // Initialize Hash Router
+        if (window.location.hash) {
+            const matches = window.location.hash.match(/slide-(\d+)/);
+            if (matches && matches[1]) {
+                const idx = parseInt(matches[1]) - 1;
+                if (idx >= 0 && idx < slides.length) {
+                    currentSlideIdx = idx;
+                }
+            }
+        }
+
+        updatePresentation();
+        scaleDeck();
+
+        /* ==================== Interactive Robot Map Simulation ==================== */
+        let simCanvas = null;
+        let simCtx = null;
+        let robotX = 140;
+        let robotY = 160;
+        let targetX = 140;
+        let targetY = 160;
+        let locations = {
+            'A': { x: 70, y: 70, name: "Location A" },
+            'B': { x: 280, y: 150, name: "Location B" },
+            'C': { x: 140, y: 220, name: "Home Base" }
+        };
+        let animFrameId = null;
+        let pathTrajectory = [];
+
+        function initMapSimulation() {
+            simCanvas = document.getElementById('sim-canvas');
+            if (!simCanvas) return;
+            simCtx = simCanvas.getContext('2d');
+            
+            // Fix canvas resolutions
+            const dpr = window.devicePixelRatio || 1;
+            const rect = simCanvas.getBoundingClientRect();
+            simCanvas.width = rect.width * dpr;
+            simCanvas.height = rect.height * dpr;
+            simCtx.scale(dpr, dpr);
+
+            if (animFrameId) cancelAnimationFrame(animFrameId);
+            simLoop();
+        }
+
+        function drawMapGrid() {
+            const w = simCanvas.width / (window.devicePixelRatio || 1);
+            const h = simCanvas.height / (window.devicePixelRatio || 1);
+            
+            simCtx.clearRect(0, 0, w, h);
+            
+            // 1. Grid background
+            simCtx.strokeStyle = "#f3f4f6";
+            simCtx.lineWidth = 1;
+            const step = 20;
+            for(let x=0; x<w; x+=step) {
+                simCtx.beginPath();
+                simCtx.moveTo(x, 0);
+                simCtx.lineTo(x, h);
+                simCtx.stroke();
+            }
+            for(let y=0; y<h; y+=step) {
+                simCtx.beginPath();
+                simCtx.moveTo(0, y);
+                simCtx.lineTo(w, y);
+                simCtx.stroke();
+            }
+
+            // 2. Trajectory trace
+            if (pathTrajectory.length > 1) {
+                simCtx.beginPath();
+                simCtx.strokeStyle = "#d1d5db";
+                simCtx.lineWidth = 1.5;
+                simCtx.setLineDash([3, 3]);
+                simCtx.moveTo(pathTrajectory[0].x, pathTrajectory[0].y);
+                for(let i=1; i<pathTrajectory.length; i++) {
+                    simCtx.lineTo(pathTrajectory[i].x, pathTrajectory[i].y);
+                }
+                simCtx.stroke();
+                simCtx.setLineDash([]);
+            }
+
+            // 3. Named Locations (A, B, Base)
+            for (let name in locations) {
+                const loc = locations[name];
+                const isTarget = Math.abs(targetX - loc.x) < 2 && Math.abs(targetY - loc.y) < 2;
+                
+                // Outer circle
+                simCtx.beginPath();
+                simCtx.arc(loc.x, loc.y, 14, 0, 2*Math.PI);
+                simCtx.fillStyle = isTarget ? "#f3f4f6" : "#ffffff";
+                simCtx.strokeStyle = isTarget ? "#111111" : "#9ca3af";
+                simCtx.lineWidth = isTarget ? 2 : 1;
+                simCtx.fill();
+                simCtx.stroke();
+
+                // Name label
+                simCtx.font = "bold 11px system-ui";
+                simCtx.fillStyle = "#111111";
+                simCtx.textAlign = "center";
+                simCtx.textBaseline = "middle";
+                simCtx.fillText(name, loc.x, loc.y);
+
+                // Subtitle desc
+                simCtx.font = "9px var(--font-mono)";
+                simCtx.fillStyle = "#6b7280";
+                simCtx.fillText(`(${loc.x}, ${loc.y})`, loc.x, loc.y + 24);
+            }
+
+            // 4. Robot Drawing
+            // Interpolation movement
+            const dx = targetX - robotX;
+            const dy = targetY - robotY;
+            const dist = Math.sqrt(dx*dx + dy*dy);
+            
+            if (dist > 1.5) {
+                robotX += (dx / dist) * 1.5;
+                robotY += (dy / dist) * 1.5;
+                
+                // Add trajectory
+                const lastPoint = pathTrajectory[pathTrajectory.length - 1];
+                if (!lastPoint || Math.sqrt(Math.pow(robotX - lastPoint.x, 2) + Math.pow(robotY - lastPoint.y, 2)) > 5) {
+                    pathTrajectory.push({ x: robotX, y: robotY });
+                }
+                document.getElementById('sim-status').textContent = "STATUS: EXECUTING PRESET";
+                document.getElementById('sim-status').style.color = "#111111";
+            } else {
+                robotX = targetX;
+                robotY = targetY;
+                document.getElementById('sim-status').textContent = "STATUS: REACHED / IDLE";
+                document.getElementById('sim-status').style.color = "var(--success)";
+            }
+
+            // Draw Robot Icon
+            simCtx.beginPath();
+            simCtx.arc(robotX, robotY, 10, 0, 2*Math.PI);
+            simCtx.fillStyle = "#111111";
+            simCtx.fill();
+
+            // Draw Inner scanner wedge
+            simCtx.beginPath();
+            simCtx.arc(robotX, robotY, 5, 0, 2*Math.PI);
+            simCtx.fillStyle = "#9ca3af";
+            simCtx.fill();
+            
+            // Robot label
+            simCtx.font = "bold 9px var(--font-mono)";
+            simCtx.fillStyle = "#ffffff";
+            simCtx.textAlign = "center";
+            simCtx.textBaseline = "middle";
+            simCtx.fillText("🤖", robotX, robotY);
+        }
+
+        function simLoop() {
+            drawMapGrid();
+            animFrameId = requestAnimationFrame(simLoop);
+        }
+
+        // Button control hooks
+        document.getElementById('btn-move-a').addEventListener('click', (e) => {
+            e.stopPropagation();
+            targetX = locations['A'].x;
+            targetY = locations['A'].y;
+        });
+        document.getElementById('btn-move-b').addEventListener('click', (e) => {
+            e.stopPropagation();
+            targetX = locations['B'].x;
+            targetY = locations['B'].y;
+        });
+        document.getElementById('btn-reset').addEventListener('click', (e) => {
+            e.stopPropagation();
+            targetX = locations['C'].x;
+            targetY = locations['C'].y;
+            robotX = locations['C'].x;
+            robotY = locations['C'].y;
+            pathTrajectory = [];
+        });
+
+    </script>
+</body>
+</html>
