@@ -15,7 +15,7 @@ if __name__ == "__main__":
 
     # Use the RerunLogger to visualize the dataset
     rerun = RerunLogger()
-    ep_id = dataset.episodes[0]["episode_index"]
+    ep_id = -1
     for frame in dataset:
         if frame["episode_index"] != ep_id:
             rerun.switch_record()
