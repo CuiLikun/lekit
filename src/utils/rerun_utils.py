@@ -28,7 +28,12 @@ class RerunLogger:
     _CMD_STOP = 3
     _CMD_NEW_RECORDING = 4
 
-    def __init__(self, url: str, max_queue_size: int = 10, y_range: tuple[float, float] | None = None):
+    def __init__(
+        self,
+        url: str = "rerun+http://127.0.0.1:9876/proxy",
+        max_queue_size: int = 10,
+        y_range: tuple[float, float] | None = None,
+    ):
         self._url = url
         self._y_range = y_range  # None means auto-scale
         self._joint_count: int | None = None

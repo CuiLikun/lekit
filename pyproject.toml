@@ -10,6 +10,11 @@ dependencies = [
     "textual>=8.2.8",
 ]
 
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv]
+package = true
 
 [tool.ruff]
 line-length = 120
