@@ -20,5 +20,6 @@ if __name__ == "__main__":
         if frame["episode_index"] != ep_id:
             rerun.switch_record()
             ep_id = frame["episode_index"]
+            print(f"Switch to episode {ep_id}")
         rerun.log(frame)
         time.sleep(0.033)  # Simulate real-time playback at ~30 FPS
