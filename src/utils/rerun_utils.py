@@ -67,7 +67,12 @@ class RerunLogger:
 
     def _build_blueprint(self) -> rr.blueprint.Blueprint:
         camera_views = [
-            rr.blueprint.Spatial2DView(origin="/", contents=[slot], name=slot) for slot in self._camera_slots
+            rr.blueprint.Spatial2DView(
+                origin="/",
+                contents=[slot, f"overlays/{slot}/task_label"],
+                name=slot,
+            )
+            for slot in self._camera_slots
         ]
         joint_views = [
             rr.blueprint.TimeSeriesView(
@@ -118,6 +123,7 @@ class RerunLogger:
         -------------
         ``observation.images.*``           : np.ndarray HWC uint8, dynamic camera count (1..3)
         ``observation.state``              : array-like, used to infer joint count
+        ``task``                           : str, task instruction; overlaid on each camera image as a Rerun-native 2D label (optional)
         ``teleop``                         : array-like (optional)
         ``policy``                         : array-like (optional)
         ``framestep``                      : int (optional). If missing, an internal increasing sequence is used.
@@ -250,11 +256,28 @@ class RerunLogger:
         rr.set_time("frame", sequence=frame_seq, recording=self._rec)
         self._next_frame_seq = frame_seq + 1
 
+        task = data.get("task")
         for name in self._image_keys:
             img = data.get(name)
             if img is None:
                 continue
-            rr.log(name, rr.Image(self._to_hwc_uint8_numpy(img)).compress(), recording=self._rec)
+            arr = self._to_hwc_uint8_numpy(img)
+            rr.log(name, rr.Image(arr).compress(), recording=self._rec)
+            # Overlay the task string at the bottom-center of the image via a
+            # Rerun-native 2D archetype. The Spatial2DView pulls this entity
+            # into the same panel, so the label floats over the image.
+            if task:
+                h, w = arr.shape[:2]
+                rr.log(
+                    f"overlays/{name}/task_label",
+                    rr.Points2D(
+                        [(w / 2.0, h - 24)],
+                        labels=[task],
+                        show_labels=True,
+                        radii=[0.0],
+                    ),
+                    recording=self._rec,
+                )
 
         for i in range(self._joint_count):
             rr.log(f"states/{i + 1}", rr.Scalars(float(data["observation.state"][i])), recording=self._rec)
