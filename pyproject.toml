@@ -3,9 +3,9 @@ name = "lekit"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
-    "lerobot>=0.5.1",
+    "lerobot>=0.6.0",
     "pyzmq>=27.1.0",
     "textual>=8.2.8",
 ]
@@ -18,9 +18,5 @@ package = true
 
 [tool.ruff]
 line-length = 120
-target-version = "py313"
+target-version = "py312"
 exclude = ["tests/artifacts/**/*.safetensors"]
-
-[[tool.uv.index]]
-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
-default = true
