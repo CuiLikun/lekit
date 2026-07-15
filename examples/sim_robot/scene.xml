@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mujoco model="sim_robot_demo">
+  <!-- A small three-link arm with two MuJoCo cameras: a fixed overhead view
+       and an "eye-in-hand" camera on the wrist. ``position`` actuators with
+       modest kp/kv give us a critically-damped position servo -- stable at
+       any timestep, no integral wind-up, matches how SO-100/101 follower
+       arms behave in real life. -->
+
+  <worldbody>
+    <light pos="0 0 1.5" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
+
+    <!-- Fixed overhead camera -->
+    <camera name="overhead" pos="0.45 0.0 0.45" mode="fixed"
+            euler="-1.57 0 0" fovy="60"/>
+
+    <body name="base" pos="0 0 0">
+      <joint name="shoulder" type="hinge" axis="0 0 1"
+             range="-3.14 3.14" damping="2.0"/>
+      <geom type="box" size="0.04 0.04 0.04" mass="0.5" rgba="0.6 0.6 0.6 1"/>
+
+      <body name="link1" pos="0.12 0 0">
+        <joint name="elbow" type="hinge" axis="0 1 0"
+               range="-1.57 1.57" damping="2.0"/>
+        <geom type="capsule" size="0.02" fromto="0 0 0 0.10 0 0"
+              mass="0.2" rgba="0.8 0.2 0.2 1"/>
+
+        <body name="link2" pos="0.10 0 0">
+          <joint name="wrist" type="hinge" axis="0 1 0"
+                 range="-1.57 1.57" damping="1.0"/>
+          <geom type="capsule" size="0.015" fromto="0 0 0 0.06 0 0"
+                mass="0.1" rgba="0.2 0.8 0.2 1"/>
+
+          <body name="hand" pos="0.06 0 0">
+            <geom type="box" size="0.02 0.01 0.005" mass="0.05"
+                  rgba="0.2 0.2 0.8 1"/>
+            <!-- Eye-in-hand camera, looks forward along +x -->
+            <camera name="wrist_cam" pos="0.0 0 0.02" mode="fixed"
+                    euler="0 -1.57 0" fovy="75"/>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <!-- Position servos with moderate gains. With dt=0.002, kp=40, kv=12 is
+         well within the stability envelope and gives a smooth response. -->
+    <position name="motor_shoulder" joint="shoulder" ctrlrange="-3.14 3.14"
+              kp="40" kv="12" gear="1"/>
+    <position name="motor_elbow"    joint="elbow"    ctrlrange="-1.57 1.57"
+              kp="40" kv="12" gear="1"/>
+    <position name="motor_wrist"    joint="wrist"    ctrlrange="-1.57 1.57"
+              kp="30" kv="10" gear="1"/>
+  </actuator>
+</mujoco>
