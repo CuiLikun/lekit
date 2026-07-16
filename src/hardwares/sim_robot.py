@@ -121,10 +121,8 @@ import numpy as np
 from lerobot.robots.config import RobotConfig
 from lerobot.robots.robot import Robot
 from lerobot.robots.utils import ensure_safe_goal_position
-from lerobot.utils.decorators import (
-    check_if_already_connected,
-    check_if_not_connected,
-)
+from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
+
 # LeRobot backend visualization (rerun / foxglove) — lazy-imported so the
 # optional ``viz`` extras don't become a hard requirement for SimRobot.
 from lerobot.utils.visualization_utils import (
@@ -153,8 +151,7 @@ def _require_mujoco():
             import mujoco as _m
         except ImportError as e:
             raise ImportError(
-                "mujoco is required to use SimRobot. Install it with "
-                "`pip install mujoco` or `uv pip install mujoco`."
+                "mujoco is required to use SimRobot. Install it with `pip install mujoco` or `uv pip install mujoco`."
             ) from e
         _MUJOCO = _m
     return _MUJOCO
@@ -302,8 +299,7 @@ class SimRobotConfig(RobotConfig):
             unknown = set(self.default_joint_positions) - set(self.motors)
             if unknown:
                 raise ValueError(
-                    f"default_joint_positions contains motor names not declared in "
-                    f"motors: {sorted(unknown)}."
+                    f"default_joint_positions contains motor names not declared in motors: {sorted(unknown)}."
                 )
         if self.display_lerobot_backend not in ("off", "rerun", "foxglove"):
             raise ValueError(
@@ -440,8 +436,7 @@ class SimRobot(Robot):
             jid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, spec.joint)
             if jid < 0:
                 raise ValueError(
-                    f"SimRobot: motor '{motor_name}' refers to joint '{spec.joint}' "
-                    f"which was not found in {path}."
+                    f"SimRobot: motor '{motor_name}' refers to joint '{spec.joint}' which was not found in {path}."
                 )
             motor_joint_id[motor_name] = jid
             if spec.actuator is not None:
@@ -453,12 +448,8 @@ class SimRobot(Robot):
                     )
                 motor_actuator_id[motor_name] = aid
                 lo, hi = model.actuator_ctrlrange[aid].tolist()
-                motor_ctrl_low[motor_name] = (
-                    float(spec.ctrl_low) if spec.ctrl_low is not None else float(lo)
-                )
-                motor_ctrl_high[motor_name] = (
-                    float(spec.ctrl_high) if spec.ctrl_high is not None else float(hi)
-                )
+                motor_ctrl_low[motor_name] = float(spec.ctrl_low) if spec.ctrl_low is not None else float(lo)
+                motor_ctrl_high[motor_name] = float(spec.ctrl_high) if spec.ctrl_high is not None else float(hi)
 
         # Convert generic ``<motor>`` actuators into critically-damped position
         # servos by rewriting ``gainprm[0]=kp`` and ``biasprm[2]=-kv`` on the
@@ -650,7 +641,6 @@ class SimRobot(Robot):
         return float(np.rad2deg(value)) if self.config.use_degrees else float(value)
 
 
-
 # ── Live visualisation ────────────────────────────────────────────────────
 # A thin companion to ``SimRobot`` that mirrors ``lerobot.record``'s
 # visualisation plumbing:
@@ -724,6 +714,7 @@ class SimRobotVisualizer:
                 "visualiser is constructed. Call ``robot.connect()`` first."
             )
         cfg = getattr(robot, "config", None)
+
         # Resolve display flags: explicit arg > `display` object > robot.config.
         def _resolve(name: str, default):
             if display is not None and hasattr(display, name):
@@ -739,16 +730,10 @@ class SimRobotVisualizer:
             camera_windows if camera_windows is not None else _resolve("display_camera_windows", False)
         )
         self._lerobot_backend = (
-            lerobot_backend
-            if lerobot_backend is not None
-            else _resolve("display_lerobot_backend", "off")
+            lerobot_backend if lerobot_backend is not None else _resolve("display_lerobot_backend", "off")
         )
-        self._lerobot_ip = (
-            lerobot_ip if lerobot_ip is not None else _resolve("display_lerobot_ip", None)
-        )
-        self._lerobot_port = (
-            lerobot_port if lerobot_port is not None else _resolve("display_lerobot_port", None)
-        )
+        self._lerobot_ip = lerobot_ip if lerobot_ip is not None else _resolve("display_lerobot_ip", None)
+        self._lerobot_port = lerobot_port if lerobot_port is not None else _resolve("display_lerobot_port", None)
         self._lerobot_session_name = (
             lerobot_session_name
             if lerobot_session_name is not None
@@ -806,7 +791,8 @@ class SimRobotVisualizer:
                     "Failed to initialise %s visualizer (%s); continuing without it. "
                     "On a headless host, use --display_lerobot_backend foxglove or "
                     "set --display_lerobot_ip/--display_lerobot_port to a remote Rerun server.",
-                    self._lerobot_backend, exc,
+                    self._lerobot_backend,
+                    exc,
                 )
                 self._lerobot_backend = "off"
 
@@ -816,9 +802,7 @@ class SimRobotVisualizer:
             # when no display server is reachable -- which would tear the
             # process down before our ``except`` ever runs. Guard up-front so
             # headless hosts (CI, sandboxes, WSL) degrade cleanly.
-            has_display = bool(os.environ.get("DISPLAY")) or bool(
-                os.environ.get("WAYLAND_DISPLAY")
-            )
+            has_display = bool(os.environ.get("DISPLAY")) or bool(os.environ.get("WAYLAND_DISPLAY"))
             if not has_display and sys.platform.startswith("linux"):
                 logger.warning(
                     "No DISPLAY/WAYLAND_DISPLAY set; skipping the MuJoCo 3D live "
@@ -837,14 +821,13 @@ class SimRobotVisualizer:
                     self._mujoco_viewer_enabled = False
                 else:
                     try:
-                        self._mujoco_handle = mj_viewer.launch_passive(
-                            self._robot.model, self._robot.data
-                        )
+                        self._mujoco_handle = mj_viewer.launch_passive(self._robot.model, self._robot.data)
                     except Exception as exc:  # noqa: BLE001 -- backend raises broadly
                         logger.warning(
                             "MuJoCo passive viewer could not start (%s: %s); skipping "
                             "the 3D live GUI. Other display channels continue.",
-                            type(exc).__name__, exc,
+                            type(exc).__name__,
+                            exc,
                         )
                         self._mujoco_handle = None
                         self._mujoco_viewer_enabled = False
@@ -863,6 +846,7 @@ class SimRobotVisualizer:
                 for cam_name in self._robot.config.cameras:
                     window_name = f"SimRobot :: {cam_name}"
                     import cv2
+
                     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
                     self._cv2_windows.add(window_name)
                 logger.info("Opened %d cv2 camera window(s).", len(self._cv2_windows))
@@ -956,6 +940,7 @@ class SimRobotVisualizer:
         if self._cv2_windows:
             try:
                 import cv2
+
                 for window_name in list(self._cv2_windows):
                     try:
                         cv2.destroyWindow(window_name)
@@ -987,7 +972,6 @@ class SimRobotVisualizer:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
-
 
 
 __all__ = [
