@@ -981,3 +981,11 @@ __all__ = [
     "SimRobot",
     "SimRobotVisualizer",
 ]
+
+
+if __name__ == "__main__":
+    cfg = SimRobotConfig(xml_path="/home/sorel/workspace/avatar/assets/SO101/so101.xml", motors={})
+    robot = SimRobot(cfg)
+    with robot:
+        obs = robot.get_observation()
+        print("Observation keys:", list(obs.keys()))
