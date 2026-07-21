@@ -84,6 +84,7 @@ def _resolve_xml(xml_path: Path, _seen: set | None = None) -> str:
     _seen.add(real)
     text = xml_path.read_text()
     import re
+
     chunks = [text]
     for match in re.finditer(r'<include\s+file="([^"]+)"\s*/>', text):
         chunks.append(_resolve_xml(xml_path.parent / match.group(1), _seen))
@@ -167,9 +168,7 @@ def _introspect_scene(xml_path: Path) -> dict:
     # PD-already-encoded actuators alone.
     resolved = _resolve_xml(xml_path)
     plain_motor_count = resolved.count("<motor ") + resolved.count("<motor>")
-    position_servo_count = (
-        resolved.count("<position ") + resolved.count("<position>")
-    )
+    position_servo_count = resolved.count("<position ") + resolved.count("<position>")
     has_plain_motors = plain_motor_count > 0 and position_servo_count == 0
 
     return {
@@ -208,7 +207,8 @@ def build_config(args: argparse.Namespace) -> SimRobotConfig:
     if not has_cameras and args.display_camera_windows:
         print(
             "[viz] scene has no <camera> elements; disabling --display_camera_windows.",
-            file=sys.stderr, flush=True,
+            file=sys.stderr,
+            flush=True,
         )
         args.display_camera_windows = False
 
@@ -240,10 +240,7 @@ def build_config(args: argparse.Namespace) -> SimRobotConfig:
 
 def scripted_action(t: float, motor_names: list[str]) -> dict[str, float]:
     """Smooth sine targets scaled by motor index for obvious 3D motion."""
-    return {
-        name: 0.25 * math.sin(0.5 * t + 0.4 * i)
-        for i, name in enumerate(motor_names)
-    }
+    return {name: 0.25 * math.sin(0.5 * t + 0.4 * i) for i, name in enumerate(motor_names)}
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
@@ -251,29 +248,44 @@ def scripted_action(t: float, motor_names: list[str]) -> dict[str, float]:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scene", type=Path, default=None,
-                        help="Path to an MJCF/XML scene. Overrides --scene-name.")
-    parser.add_argument("--scene-name", choices=("demo", "so101"), default="demo",
-                        help="Bundled scene to load when --scene is unset. "
-                             "Default 'demo' = scene.xml next to this script.")
+    parser.add_argument("--scene", type=Path, default=None, help="Path to an MJCF/XML scene. Overrides --scene-name.")
+    parser.add_argument(
+        "--scene-name",
+        choices=("demo", "so101"),
+        default="demo",
+        help="Bundled scene to load when --scene is unset. Default 'demo' = scene.xml next to this script.",
+    )
     parser.add_argument("--dataset-root", type=Path, default=Path("/tmp/sim_robot_dataset"))
-    parser.add_argument("--steps", type=int, default=200,
-                        help="Loop length. Ignored if a UI is open and the user closes it first.")
+    parser.add_argument(
+        "--steps", type=int, default=200, help="Loop length. Ignored if a UI is open and the user closes it first."
+    )
 
     # ── Display flags (mirror ``lerobot.record --display_data=...``) ───────
-    parser.add_argument("--display_mujoco_viewer", action="store_true",
-                        help="Open the MuJoCo 3D passive viewer (needs a display, glfw).")
-    parser.add_argument("--display_camera_windows", action="store_true",
-                        help="Open one cv2 window per configured camera.")
-    parser.add_argument("--display_lerobot_backend", default="off",
-                        choices=("off", "rerun", "foxglove"),
-                        help="LeRobot visualisation backend (rerun / foxglove).")
-    parser.add_argument("--display_lerobot_ip", default=None,
-                        help="For rerun: IP of the remote Rerun server. "
-                             "For foxglove: bind interface.")
-    parser.add_argument("--display_lerobot_port", type=int, default=None,
-                        help="For rerun: port of the remote Rerun server. "
-                             "For foxglove: WebSocket port.")
+    parser.add_argument(
+        "--display_mujoco_viewer",
+        action="store_true",
+        help="Open the MuJoCo 3D passive viewer (needs a display, glfw).",
+    )
+    parser.add_argument(
+        "--display_camera_windows", action="store_true", help="Open one cv2 window per configured camera."
+    )
+    parser.add_argument(
+        "--display_lerobot_backend",
+        default="off",
+        choices=("off", "rerun", "foxglove"),
+        help="LeRobot visualisation backend (rerun / foxglove).",
+    )
+    parser.add_argument(
+        "--display_lerobot_ip",
+        default=None,
+        help="For rerun: IP of the remote Rerun server. For foxglove: bind interface.",
+    )
+    parser.add_argument(
+        "--display_lerobot_port",
+        type=int,
+        default=None,
+        help="For rerun: port of the remote Rerun server. For foxglove: WebSocket port.",
+    )
     parser.add_argument("--display_lerobot_session_name", default="sim_robot_visualize")
     parser.add_argument("--display_lerobot_compress_images", action="store_true")
     args = parser.parse_args()
@@ -284,14 +296,16 @@ def main():
     print(
         f"[viz] motors={list(cfg.motors)} cameras={list(cfg.cameras)} "
         f"enable_position_servos={cfg.enable_position_servos}",
-        file=sys.stderr, flush=True,
+        file=sys.stderr,
+        flush=True,
     )
     robot = SimRobot(cfg)
     robot.connect()
     print(
         f"[viz] connected. mujoco_gui={cfg.display_mujoco_viewer} "
         f"cv2_cams={cfg.display_camera_windows} backend={cfg.display_lerobot_backend}",
-        file=sys.stderr, flush=True,
+        file=sys.stderr,
+        flush=True,
     )
     try:
         motor_names = list(cfg.motors)

@@ -162,53 +162,18 @@ def _require_mujoco():
 
 @dataclass
 class SimMotorSpec:
-    """Specification for a single actuated joint.
-
-    Attributes:
-        joint: Name of the ``<joint>`` element in the MJCF.
-        actuator: Optional name of the ``<actuator>`` element driving the
-            joint. If ``None``, the simulator falls back to setting the joint
-            position directly on ``data.qpos`` (kinematic, no dynamics).
-        initial_position: Optional initial value for the joint. Overrides
-            ``default_joint_positions`` for this single motor when supplied.
-        ctrl_low: Optional lower bound applied to ``data.ctrl`` before stepping.
-            If ``None``, the actuator's own ``ctrlrange`` is used.
-        ctrl_high: Optional upper bound applied to ``data.ctrl`` before stepping.
-            If ``None``, the actuator's own ``ctrlrange`` is used.
-        kp: Optional proportional gain for the position-servo override. When
-            ``enable_position_servos`` is ``True`` on the parent config, this
-            ``kp`` (with ``kv``) is applied via the actuator's ``gainprm`` /
-            ``biasprm`` slots, converting a generic ``<motor>`` actuator into a
-            position servo at connect-time. ``None`` falls back to a sensible
-            default.
-        kv: Optional derivative gain for the position-servo override (see
-            ``kp``).
-    """
-
-    joint: str
-    actuator: str | None = None
-    initial_position: float | None = None
-    ctrl_low: float | None = None
-    ctrl_high: float | None = None
-    kp: float | None = None
-    kv: float | None = None
+    id: int = -1
+    name: str = "Motor X"
+    gear: float = 1.0  # Gear ratio
+    gain: float = 1.0  # Proportional gain for position servo
+    bias: float = 0.0  # Bias for position servo
+    ctrl: tuple[float, float] | None = None  # (low, high) control range
 
 
 @dataclass
 class SimCameraConfig:
-    """Specification for a simulated camera.
-
-    Camera frames are rendered offscreen from MuJoCo's ``<camera>`` elements
-    via ``mujoco.Renderer``.
-
-    Attributes:
-        name: Name of the ``<camera>`` element in the MJCF.
-        width: Frame width in pixels.
-        height: Frame height in pixels.
-        fps: Informational; not enforced by SimRobot itself.
-    """
-
-    name: str
+    id: int = -1
+    name: str = "Camera X"
     width: int = 640
     height: int = 480
     fps: int = 30
@@ -278,13 +243,8 @@ class SimRobotConfig(RobotConfig):
     def __post_init__(self):
         # Run parent validation (ensures cameras declare width/height/fps).
         super().__post_init__()
-        if not self.xml_path:
-            raise ValueError("SimRobotConfig.xml_path must point to a MJCF file.")
-        if not self.motors:
-            raise ValueError(
-                "SimRobotConfig.motors must declare at least one motor so the "
-                "policy observation/action space is well-defined."
-            )
+        if not Path(self.xml_path).exists():
+            raise ValueError(f"SimRobotConfig.xml_path ({self.xml_path}) does not exist.")
         if self.n_substeps < 1:
             raise ValueError("SimRobotConfig.n_substeps must be >= 1.")
         if self.max_relative_target is not None and not (
@@ -306,6 +266,46 @@ class SimRobotConfig(RobotConfig):
                 f"SimRobotConfig.display_lerobot_backend must be one of "
                 f"'off', 'rerun', 'foxglove' (got '{self.display_lerobot_backend}')."
             )
+        self.introspect_scene()
+
+    def introspect_scene(self) -> dict:
+        """Load the MJCF and return auto-derived motor/actuator/camera specs."""
+        mj = _require_mujoco()
+        model = mj.MjModel.from_xml_path(self.xml_path)
+        self.n_joints = model.njnt
+        self.n_motors = model.nu
+        # Auto-derive motor specs and camera specs.
+        self.motors = {}
+        for i in range(model.nu):
+            actuator = model.actuator(i)
+            # Exclude non-joint actuators
+            if actuator.trntype != 0 or actuator.trnid[0] == -1:
+                continue
+            joint_name = mj.mj_id2name(model, mj.mjtObj.mjOBJ_JOINT, actuator.trnid[0])
+            # Exclude actuators with different joint names
+            if joint_name is None or joint_name != actuator.name:
+                continue
+            # Construct a SimMotorSpec for this actuator.
+            self.motors[actuator.name] = SimMotorSpec(
+                id=i,
+                name=actuator.name,
+                gear=actuator.gear,
+                gain=actuator.gainprm,
+                bias=actuator.biasprm,
+                ctrl=actuator.ctrlrange,
+            )
+        self.cameras.update(
+            {
+                (item := model.cam(i)).name: SimCameraConfig(
+                    id=i,
+                    name=item.name,
+                    width=640,
+                    height=480,
+                    fps=30,
+                )
+                for i in range(model.ncam)
+            }
+        )
 
 
 # ── Robot implementation ───────────────────────────────────────────────────
@@ -334,75 +334,44 @@ class SimRobot(Robot):
     # ── Construction ────────────────────────────────────────────────────────
 
     def __init__(self, config: SimRobotConfig):
-        # Sim robots have no per-motor calibration, so we intentionally do
-        # NOT call ``super().__init__`` (which would mkdir the default
-        # ``~/.cache/huggingface/lerobot/calibration`` tree). Instead, we
-        # replicate the small bookkeeping it does and default the directory
-        # to a writable tmp location. Users can still opt into the standard
-        # cache path via ``calibration_dir=...`` on the config.
-        from lerobot.motors import MotorCalibration  # only used by _load_calibration fallback
-
-        self.robot_type = self.name
-        self.id = config.id
-        if config.calibration_dir is not None:
-            self.calibration_dir: Path = Path(config.calibration_dir)
-        else:
-            tmp_root = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
-            self.calibration_dir = tmp_root / "lerobot" / "calibration" / "robots" / self.name
-        try:
-            self.calibration_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise OSError(
-                f"SimRobot: cannot create calibration dir {self.calibration_dir}: {exc}. "
-                "Set ``calibration_dir`` on the config to a writable path."
-            ) from exc
-        self.calibration_fpath = self.calibration_dir / f"{self.id}.json"
-        self.calibration: dict[str, MotorCalibration] = {}
-        if self.calibration_fpath.is_file():
-            self._load_calibration()
         self.config = config
+        self.motors = config.motors
+        self.cameras = config.cameras
         # MuJoCo handles -- populated on ``connect``.
-        self._mj_model: Any | None = None
-        self._mj_data: Any | None = None
-        # Cached lookups.
-        self._motor_joint_id: dict[str, int] = {}
-        self._motor_actuator_id: dict[str, int] = {}
-        self._motor_ctrl_low: dict[str, float] = {}
-        self._motor_ctrl_high: dict[str, float] = {}
-        self._camera_id: dict[str, int] = {}
+        self.mj_model: Any | None = None
+        self.mj_data: Any | None = None
         # Offscreen renderers, keyed by (width, height). Public for visualization.
-        self._renderers: dict[tuple[int, int], Any] = {}
-        self.renderers = self._renderers  # exposed for visualizer read-only access
+        self.renderers: dict[tuple[int, int], Any] = {}
 
     # ── Feature schemas ──────────────────────────────────────────────────────
 
     @cached_property
     def observation_features(self) -> dict[str, Any]:
-        features: dict[str, Any] = {f"{m}.pos": float for m in self.config.motors}
-        for cam_name, cam_cfg in self.config.cameras.items():
+        features: dict[str, Any] = {f"{m.name}.pos": float for m in self.motors.values()}
+        for cam_name, cam_cfg in self.cameras.items():
             features[cam_name] = (cam_cfg.height, cam_cfg.width, 3)
         return features
 
     @cached_property
     def action_features(self) -> dict[str, Any]:
-        return {f"{m}.pos": float for m in self.config.motors}
+        return {f"{m.name}.pos": float for m in self.motors.values()}
 
     # ── Connection state ────────────────────────────────────────────────────
 
     @property
     def is_connected(self) -> bool:
-        return self._mj_model is not None and self._mj_data is not None
+        return self.mj_model is not None and self.mj_data is not None
 
     # Public read-only handles for visualization tooling (e.g. MuJoCo's
     # passive viewer). The returned objects are live; the GUI thread must
-    # hold a read/write lock when accessing ``self._mj_data``.
+    # hold a read/write lock when accessing ``self.mj_data``.
     @property
     def model(self) -> Any:
-        return self._mj_model
+        return self.mj_model
 
     @property
     def data(self) -> Any:
-        return self._mj_data
+        return self.mj_data
 
     @property
     def is_calibrated(self) -> bool:
@@ -410,84 +379,25 @@ class SimRobot(Robot):
         return True
 
     @check_if_already_connected
-    def connect(self, calibrate: bool = True) -> None:
-        """Load the MJCF and prepare the MuJoCo simulation.
-
-        Args:
-            calibrate: Accepted for API compatibility with the base class;
-                simulation robots are always considered calibrated.
-        """
+    def connect(self) -> None:
+        """Load the MJCF and prepare the MuJoCo simulation."""
         mj = _require_mujoco()
         path = Path(self.config.xml_path)
         if not path.is_file():
             raise FileNotFoundError(f"SimRobot: MJCF model not found at {path}")
         try:
-            model = mj.MjModel.from_xml_path(str(path))
+            self.mj_model = mj.MjModel.from_xml_path(str(path))
         except Exception as e:
             raise RuntimeError(f"SimRobot: failed to load MuJoCo model {path}: {e}") from e
-        data = mj.MjData(model)
-
-        # Resolve motor -> joint/actuator ids.
-        motor_joint_id: dict[str, int] = {}
-        motor_actuator_id: dict[str, int] = {}
-        motor_ctrl_low: dict[str, float] = {}
-        motor_ctrl_high: dict[str, float] = {}
-        for motor_name, spec in self.config.motors.items():
-            jid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, spec.joint)
-            if jid < 0:
-                raise ValueError(
-                    f"SimRobot: motor '{motor_name}' refers to joint '{spec.joint}' which was not found in {path}."
-                )
-            motor_joint_id[motor_name] = jid
-            if spec.actuator is not None:
-                aid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_ACTUATOR, spec.actuator)
-                if aid < 0:
-                    raise ValueError(
-                        f"SimRobot: motor '{motor_name}' refers to actuator "
-                        f"'{spec.actuator}' which was not found in {path}."
-                    )
-                motor_actuator_id[motor_name] = aid
-                lo, hi = model.actuator_ctrlrange[aid].tolist()
-                motor_ctrl_low[motor_name] = float(spec.ctrl_low) if spec.ctrl_low is not None else float(lo)
-                motor_ctrl_high[motor_name] = float(spec.ctrl_high) if spec.ctrl_high is not None else float(hi)
-
-        # Convert generic ``<motor>`` actuators into critically-damped position
-        # servos by rewriting ``gainprm[0]=kp`` and ``biasprm[2]=-kv`` on the
-        # model in-place. This mirrors what
-        # ``assets/SO101/interactive_viewer.py`` does and lets ``SimRobot``
-        # drive any plain motor-actuator MJCF without forcing the user to
-        # edit the scene by hand. Opt-in via ``SimRobotConfig.enable_position_servos``.
-        if self.config.enable_position_servos:
-            for motor_name, aid in motor_actuator_id.items():
-                spec = self.config.motors[motor_name]
-                kp = spec.kp if spec.kp is not None else self.config.position_kp
-                kv = spec.kv if spec.kv is not None else self.config.position_kv
-                model.actuator_gainprm[aid, 0] = float(kp)
-                model.actuator_biasprm[aid, 2] = float(-kv)
-
-        # Resolve camera names.
-        camera_id: dict[str, int] = {}
-        for cam_name, cam_cfg in self.config.cameras.items():
-            cid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_CAMERA, cam_cfg.name)
-            if cid < 0:
-                raise ValueError(
-                    f"SimRobot: camera '{cam_name}' refers to MuJoCo camera "
-                    f"'{cam_cfg.name}' which was not found in {path}."
-                )
-            camera_id[cam_name] = cid
-
-        self._mj_model = model
-        self._mj_data = data
-        self._motor_joint_id = motor_joint_id
-        self._motor_actuator_id = motor_actuator_id
-        self._motor_ctrl_low = motor_ctrl_low
-        self._motor_ctrl_high = motor_ctrl_high
-        self._camera_id = camera_id
-        self._renderers = {}
+        self.mj_data = mj.MjData(self.mj_model)
+        self.motors = self.config.motors
+        self.cameras = self.config.cameras
 
         # Apply initial state via configure().
         self.configure()
-        logger.info("%s connected (nq=%d, nv=%d, nu=%d).", self, model.nq, model.nv, model.nu)
+        logger.info(
+            "%s connected (nq=%d, nv=%d, nu=%d).", self.name, self.mj_model.nq, self.mj_model.nv, self.mj_model.nu
+        )
 
     def configure(self) -> None:
         """Reset the simulator and apply the configured initial state.
@@ -498,16 +408,16 @@ class SimRobot(Robot):
         if not self.is_connected:
             return
         mj = _require_mujoco()
-        mj.mj_resetData(self._mj_model, self._mj_data)
+        mj.mj_resetData(self.mj_model, self.mj_data)
         if self.config.init_qpos is not None:
-            n = min(len(self.config.init_qpos), self._mj_model.nq)
-            self._mj_data.qpos[:n] = np.asarray(self.config.init_qpos, dtype=np.float64)
+            n = min(len(self.config.init_qpos), self.mj_model.nq)
+            self.mj_data.qpos[:n] = np.asarray(self.config.init_qpos, dtype=np.float64)
         if self.config.default_joint_positions:
             for motor_name, target in self.config.default_joint_positions.items():
                 spec = self.config.motors[motor_name]
                 value = spec.initial_position if spec.initial_position is not None else target
                 self._set_joint_position(motor_name, self._to_sim_units(float(value)))
-        mj.mj_forward(self._mj_model, self._mj_data)
+        mj.mj_forward(self.mj_model, self.mj_data)
 
     def calibrate(self) -> None:
         """No-op for simulation; the API requires it to be defined."""
@@ -520,13 +430,11 @@ class SimRobot(Robot):
         """Read the current proprioception and render configured camera frames."""
         _require_mujoco()  # ensure the dependency is imported before first use
         obs: dict[str, Any] = {}
-        for motor_name, jid in self._motor_joint_id.items():
-            qpos_adr = int(self._mj_model.jnt_qposadr[jid])
-            value = float(self._mj_data.qpos[qpos_adr])
-            obs[f"{motor_name}.pos"] = self._from_sim_units(value)
-        for cam_name, cid in self._camera_id.items():
-            cam_cfg = self.config.cameras[cam_name]
-            obs[cam_name] = self._render_camera(cam_name, cam_cfg, cid)
+        for name in self.motors:
+            obs[f"{name}.pos"] = self.mj_data.joint(name).qpos
+        for camera in self.cameras.values():
+            obs[camera.name] = self._render_camera(camera.name, camera, camera.id)
+
         return obs
 
     @check_if_not_connected
@@ -564,7 +472,7 @@ class SimRobot(Robot):
         for motor_name, target in targets.items():
             self._set_ctrl_or_pos(motor_name, float(target))
         for _ in range(self.config.n_substeps):
-            mj.mj_step(self._mj_model, self._mj_data)
+            mj.mj_step(self.mj_model, self.mj_data)
 
         # Build the response: commanded values where present, current otherwise.
         sent: dict[str, Any] = {}
@@ -579,14 +487,14 @@ class SimRobot(Robot):
     @check_if_not_connected
     def disconnect(self) -> None:
         """Release renderers and drop the model/data references."""
-        for renderer in self._renderers.values():
+        for renderer in self.renderers.values():
             try:
                 renderer.close()
             except Exception:  # nosec B110 -- renderer cleanup is best-effort
                 pass
-        self._renderers.clear()
-        self._mj_model = None
-        self._mj_data = None
+        self.renderers.clear()
+        self.mj_model = None
+        self.mj_data = None
         self._motor_joint_id = {}
         self._motor_actuator_id = {}
         self._motor_ctrl_low = {}
@@ -602,7 +510,7 @@ class SimRobot(Robot):
             aid = self._motor_actuator_id[motor_name]
             lo = self._motor_ctrl_low[motor_name]
             hi = self._motor_ctrl_high[motor_name]
-            self._mj_data.ctrl[aid] = float(np.clip(value_rad, lo, hi))
+            self.mj_data.ctrl[aid] = float(np.clip(value_rad, lo, hi))
             return
         self._set_joint_position(motor_name, value_rad)
 
@@ -610,25 +518,25 @@ class SimRobot(Robot):
         """Set a joint's position directly via ``data.qpos`` (kinematic)."""
         mj = _require_mujoco()
         jid = self._motor_joint_id[motor_name]
-        qpos_adr = int(self._mj_model.jnt_qposadr[jid])
-        self._mj_data.qpos[qpos_adr] = float(value_rad)
+        qpos_adr = int(self.mj_model.jnt_qposadr[jid])
+        self.mj_data.qpos[qpos_adr] = float(value_rad)
         # Rebuild derived quantities so subsequent renders reflect the change.
-        mj.mj_forward(self._mj_model, self._mj_data)
+        mj.mj_forward(self.mj_model, self.mj_data)
 
     def _read_joint_position(self, motor_name: str) -> float:
         jid = self._motor_joint_id[motor_name]
-        qpos_adr = int(self._mj_model.jnt_qposadr[jid])
-        return float(self._mj_data.qpos[qpos_adr])
+        qpos_adr = int(self.mj_model.jnt_qposadr[jid])
+        return float(self.mj_data.qpos[qpos_adr])
 
     def _render_camera(self, cam_name: str, cam_cfg: SimCameraConfig, cam_id: int) -> np.ndarray:
         mj = _require_mujoco()
         key = (cam_cfg.width, cam_cfg.height)
-        renderer = self._renderers.get(key)
+        renderer = self.renderers.get(key)
         if renderer is None:
-            renderer = mj.Renderer(self._mj_model, height=cam_cfg.height, width=cam_cfg.width)
-            self._renderers[key] = renderer
+            renderer = mj.Renderer(self.mj_model, height=cam_cfg.height, width=cam_cfg.width)
+            self.renderers[key] = renderer
         # mujoco 3.x accepts either an int id or a camera name string.
-        renderer.update_scene(self._mj_data, camera=cam_id)
+        renderer.update_scene(self.mj_data, camera=cam_id)
         img = renderer.render()  # ndarray (H, W, 3) uint8 RGB
         if not img.flags["C_CONTIGUOUS"]:
             img = np.ascontiguousarray(img)
@@ -984,8 +892,16 @@ __all__ = [
 
 
 if __name__ == "__main__":
-    cfg = SimRobotConfig(xml_path="/home/sorel/workspace/avatar/assets/SO101/so101.xml", motors={})
+    import matplotlib.pyplot as plt
+
+    cfg = SimRobotConfig(xml_path="/home/sorel/workspace/avatar/assets/SO101/scene.xml")
     robot = SimRobot(cfg)
+
     with robot:
         obs = robot.get_observation()
-        print("Observation keys:", list(obs.keys()))
+        n_cam = len(robot.config.cameras)
+        for i, cam in enumerate(robot.cameras.values()):
+            plt.subplot(1, n_cam, i + 1)
+            plt.imshow(obs[cam.name])
+            plt.title(cam.name)
+        plt.show()
