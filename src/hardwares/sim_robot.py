@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
@@ -36,6 +37,31 @@ def _require_mujoco():
             ) from e
         _MUJOCO = _m
     return _MUJOCO
+
+
+def _ensure_mujoco_gl_backend() -> None:
+    """Auto-pick ``MUJOCO_GL=egl`` on headless hosts.
+
+    MuJoCo's offscreen ``Renderer`` requires an OpenGL platform library to
+    be loaded at process start. The Linux default (``glfw``) needs an X11 /
+    Wayland display, so a headless SSH session will crash with
+    ``"an OpenGL platform library has not been loaded into this process"``
+    the first time a ``Renderer`` is constructed.
+
+    This helper picks EGL — a display-less GL backend — when no display is
+    reachable and the user hasn't already set ``MUJOCO_GL``. It's a no-op
+    otherwise, and it's idempotent.
+
+    Important: this MUST run *before* the first ``import mujoco`` because
+    the backend is bound at import time. ``SimRobotConfig.__post_init__``
+    is the earliest hook in the SimRobot lifecycle, so it calls this
+    helper before anything else.
+    """
+    if "MUJOCO_GL" in os.environ:
+        return
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        return
+    os.environ["MUJOCO_GL"] = "egl"
 
 
 # ── Configs ─────────────────────────────────────────────────────────────────
@@ -90,10 +116,13 @@ class SimRobotConfig(RobotConfig):
     # differs from its current position by more than this magnitude is
     # capped. ``None`` disables clamping.
     max_relative_target: float | dict[str, float] | None = 0.05
-    # Treat policy observations/actions as degrees instead of radians.
+    # Treat policy observations/actions as degreres instead of radians.
     use_degrees: bool = False
 
     def __post_init__(self):
+        # Pick a headless OpenGL backend *before* ``import mujoco`` so the
+        # GL platform is bound at load time. See ``_ensure_mujoco_gl_backend``.
+        _ensure_mujoco_gl_backend()
         # Run parent validation (ensures cameras declare width/height/fps).
         super().__post_init__()
         if not Path(self.xml_path).exists():
