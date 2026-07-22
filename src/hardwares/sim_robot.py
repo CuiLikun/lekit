@@ -1,136 +1,17 @@
-"""SimRobot -- a MuJoCo-backed, LeRobot-compatible robot.
-
-This module implements the LeRobot v0.6 ``Robot`` interface on top of an MJCF
-model so a simulated arm can be used anywhere a physical robot would:
-dataset recording (``lerobot.record``), evaluation (``lerobot.evaluate``),
-policy rollout, teleoperation, etc.
-
-It follows the *bring-your-own-hardware* integration guide
-(https://huggingface.co/docs/lerobot/v0.6.0/en/integrate_hardware):
-
-1. A ``RobotConfig`` subclass registered with draccus so ``type: sim_robot``
-   resolves through the LeRobot factory.
-2. A ``Robot`` subclass that implements the abstract methods.
-3. Optional integration through ``lerobot.robots.utils.make_robot_from_config``
-   once the module has been imported.
-
-Quickstart
-----------
-
-.. code-block:: python
-
-    from pathlib import Path
-    from lerobot.robots.utils import make_robot_from_config
-
-    from hardwares.sim_robot import (
-        SimCameraConfig,
-        SimMotorSpec,
-        SimRobotConfig,
-    )
-
-    cfg = SimRobotConfig(
-        id="so101_sim",
-        xml_path=Path("/path/to/so101_scene.xml"),
-        motors={
-            "shoulder_pan":  SimMotorSpec(joint="joint1"),
-            "shoulder_lift": SimMotorSpec(joint="joint2"),
-            "elbow_flex":    SimMotorSpec(joint="joint3"),
-            "wrist_flex":    SimMotorSpec(joint="joint4"),
-            "wrist_roll":    SimMotorSpec(joint="joint5"),
-            "gripper":       SimMotorSpec(joint="joint6"),
-        },
-        cameras={
-            "top": SimCameraConfig(name="top_cam", width=640, height=480, fps=30),
-            "wrist": SimCameraConfig(name="wrist_cam", width=480, height=640, fps=30),
-        },
-        default_joint_positions={
-            "shoulder_pan":  0.0,
-            "shoulder_lift": -1.57,
-            "elbow_flex":    1.57,
-            "wrist_flex":    0.0,
-            "wrist_roll":    0.0,
-            "gripper":       0.5,
-        },
-        max_relative_target=0.05,  # ~3 deg per step safety clamp
-        n_substeps=4,
-    )
-
-    robot = make_robot_from_config(cfg)  # or: SimRobot(cfg)
-    with robot:
-        obs = robot.get_observation()
-        # obs["shoulder_pan.pos"] -> float (radians)
-        # obs["top"] -> np.ndarray[H, W, 3] uint8 RGB
-        robot.send_action({
-            "shoulder_pan.pos":  0.1,
-            "shoulder_lift.pos": -1.4,
-            ...
-        })
-
-Headless rendering
-------------------
-
-MuJoCo's offscreen renderer needs an OpenGL backend. Set
-``MUJOCO_GL=egl`` (or ``osmesa``) before importing this module on a
-headless Linux machine::
-
-    export MUJOCO_GL=egl
-
-On desktops the default ``glfw`` backend works as long as a display is
-available.
-
-Joint semantics
----------------
-
-Each entry in ``motors`` maps a *motor name* (used in observation/action
-dictionaries as ``"{motor}.pos"``) to a MuJoCo *joint*. If the model's MJCF
-also defines an actuator for that joint, the actuator's id is resolved
-automatically; otherwise the joint position is set kinematically via
-``data.qpos``. Each motor is assumed to be a 1-DOF (hinge/slide) joint --
-the value used for that joint is ``data.qpos[jnt_qposadr[jid]]``. Mobile-base
-free joints are not currently supported.
-
-Camera semantics
-----------------
-
-``cameras`` maps a *camera name* (used as the image key in
-``get_observation``) to a MuJoCo ``<camera>`` element. Frames are rendered
-offscreen through ``mujoco.Renderer`` at the requested ``width``/``height``
-and returned as ``uint8`` ``(H, W, 3)`` RGB arrays.
-
-Units
------
-
-Joint positions and actions are exchanged in radians by default (matching
-MuJoCo's internal representation). Set ``use_degrees=True`` to convert at the
-API boundary.
-"""
-
 from __future__ import annotations
 
 import logging
-import os
-import sys
-import tempfile
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-
 from lerobot.robots.config import RobotConfig
 from lerobot.robots.robot import Robot
 from lerobot.robots.utils import ensure_safe_goal_position
+from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
-
-# LeRobot backend visualization (rerun / foxglove) — lazy-imported so the
-# optional ``viz`` extras don't become a hard requirement for SimRobot.
-from lerobot.utils.visualization_utils import (
-    VISUALIZATION_MODES,
-    init_visualization,
-    log_visualization_data,
-    shutdown_visualization,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -205,40 +86,12 @@ class SimRobotConfig(RobotConfig):
     # Number of ``mj_step`` calls per ``send_action`` invocation. Higher
     # values produce faster-than-real-time virtual dynamics.
     n_substeps: int = 1
-    # When True, ``SimRobot.connect`` rewrites each motor's ``gainprm`` /
-    # ``biasprm`` to behave as a critically-damped position servo. Useful for
-    # generic MJCFs that ship plain ``<motor>`` actuators (e.g. the SO-101
-    # assets in this repo). The ``SimMotorSpec.kp``/``kv`` per-motor values
-    # override the parent ``position_kp``/``position_kv`` defaults.
-    enable_position_servos: bool = False
-    position_kp: float = 40.0
-    position_kv: float = 12.0
     # Safety clamp applied to every ``send_action``: any joint whose target
     # differs from its current position by more than this magnitude is
     # capped. ``None`` disables clamping.
     max_relative_target: float | dict[str, float] | None = 0.05
     # Treat policy observations/actions as degrees instead of radians.
     use_degrees: bool = False
-
-    # ── Optional live visualization (mirrors ``lerobot.record``'s
-    # ``--display_data``/``--display_mode`` flags) ─────────────────────────
-    # When any of these are enabled, a :class:`SimRobotVisualizer` will open
-    # the corresponding viewer(s) on construction. Set everything to ``False``
-    # / ``"off"`` to disable live visualization entirely.
-    display_mujoco_viewer: bool = False
-    display_camera_windows: bool = False
-    # ``"off"``, ``"rerun"`` or ``"foxglove"`` — selects the backend from
-    # ``lerobot.utils.visualization_utils`` (rerun spawns a viewer, foxglove
-    # starts a WebSocket server on ``display_lerobot_host:display_lerobot_port``).
-    display_lerobot_backend: str = "off"
-    # For ``"rerun"`` the IP/port point at an optional remote Rerun server.
-    # For ``"foxglove"`` the IP is the interface to bind and the port is the
-    # WebSocket port.
-    display_lerobot_ip: str | None = None
-    display_lerobot_port: int | None = None
-    display_lerobot_session_name: str = "sim_robot"
-    # JPEG-compress images before logging to save bandwidth/CPU.
-    display_lerobot_compress_images: bool = False
 
     def __post_init__(self):
         # Run parent validation (ensures cameras declare width/height/fps).
@@ -261,19 +114,12 @@ class SimRobotConfig(RobotConfig):
                 raise ValueError(
                     f"default_joint_positions contains motor names not declared in motors: {sorted(unknown)}."
                 )
-        if self.display_lerobot_backend not in ("off", "rerun", "foxglove"):
-            raise ValueError(
-                f"SimRobotConfig.display_lerobot_backend must be one of "
-                f"'off', 'rerun', 'foxglove' (got '{self.display_lerobot_backend}')."
-            )
         self.introspect_scene()
 
     def introspect_scene(self) -> dict:
         """Load the MJCF and return auto-derived motor/actuator/camera specs."""
         mj = _require_mujoco()
         model = mj.MjModel.from_xml_path(self.xml_path)
-        self.n_joints = model.njnt
-        self.n_motors = model.nu
         # Auto-derive motor specs and camera specs.
         self.motors = {}
         for i in range(model.nu):
@@ -340,16 +186,19 @@ class SimRobot(Robot):
         # MuJoCo handles -- populated on ``connect``.
         self.mj_model: Any | None = None
         self.mj_data: Any | None = None
-        # Offscreen renderers, keyed by (width, height). Public for visualization.
+        # Offscreen renderers, keyed by (width, height); populated on ``connect``.
         self.renderers: dict[tuple[int, int], Any] = {}
+        # ``mujoco`` module handle; populated in ``connect()`` via the
+        # lazy-import helper so methods can call ``self.mj.X(...)`` directly.
+        self.mj: Any | None = None
 
     # ── Feature schemas ──────────────────────────────────────────────────────
 
     @cached_property
     def observation_features(self) -> dict[str, Any]:
         features: dict[str, Any] = {f"{m.name}.pos": float for m in self.motors.values()}
-        for cam_name, cam_cfg in self.cameras.items():
-            features[cam_name] = (cam_cfg.height, cam_cfg.width, 3)
+        for name, cam in self.cameras.items():
+            features[name] = (cam.height, cam.width, 3)
         return features
 
     @cached_property
@@ -362,9 +211,8 @@ class SimRobot(Robot):
     def is_connected(self) -> bool:
         return self.mj_model is not None and self.mj_data is not None
 
-    # Public read-only handles for visualization tooling (e.g. MuJoCo's
-    # passive viewer). The returned objects are live; the GUI thread must
-    # hold a read/write lock when accessing ``self.mj_data``.
+    # Public read-only handles for the live MuJoCo model/data. The returned
+    # objects are live and may be mutated by the simulation step.
     @property
     def model(self) -> Any:
         return self.mj_model
@@ -381,20 +229,28 @@ class SimRobot(Robot):
     @check_if_already_connected
     def connect(self) -> None:
         """Load the MJCF and prepare the MuJoCo simulation."""
-        mj = _require_mujoco()
+        self.mj = _require_mujoco()
         path = Path(self.config.xml_path)
         if not path.is_file():
             raise FileNotFoundError(f"SimRobot: MJCF model not found at {path}")
         try:
-            self.mj_model = mj.MjModel.from_xml_path(str(path))
+            self.mj_model = self.mj.MjModel.from_xml_path(str(path))
         except Exception as e:
             raise RuntimeError(f"SimRobot: failed to load MuJoCo model {path}: {e}") from e
-        self.mj_data = mj.MjData(self.mj_model)
-        self.motors = self.config.motors
-        self.cameras = self.config.cameras
+        self.mj_data = self.mj.MjData(self.mj_model)
 
         # Apply initial state via configure().
         self.configure()
+
+        # Pre-initialize an offscreen renderer for each configured camera so
+        # the first ``get_observation`` doesn't pay the allocation cost. The
+        # cache is keyed by (width, height); cameras sharing dimensions reuse
+        # the same renderer.
+        for cam in self.cameras.values():
+            key = (cam.width, cam.height)
+            if key not in self.renderers:
+                self.renderers[key] = self.mj.Renderer(self.mj_model, height=cam.height, width=cam.width)
+
         logger.info(
             "%s connected (nq=%d, nv=%d, nu=%d).", self.name, self.mj_model.nq, self.mj_model.nv, self.mj_model.nu
         )
@@ -407,8 +263,7 @@ class SimRobot(Robot):
         """
         if not self.is_connected:
             return
-        mj = _require_mujoco()
-        mj.mj_resetData(self.mj_model, self.mj_data)
+        self.mj.mj_resetData(self.mj_model, self.mj_data)
         if self.config.init_qpos is not None:
             n = min(len(self.config.init_qpos), self.mj_model.nq)
             self.mj_data.qpos[:n] = np.asarray(self.config.init_qpos, dtype=np.float64)
@@ -416,8 +271,8 @@ class SimRobot(Robot):
             for motor_name, target in self.config.default_joint_positions.items():
                 spec = self.config.motors[motor_name]
                 value = spec.initial_position if spec.initial_position is not None else target
-                self._set_joint_position(motor_name, self._to_sim_units(float(value)))
-        mj.mj_forward(self.mj_model, self.mj_data)
+                self._apply_motor_target(motor_name, self._to_sim_units(float(value)))
+        self.mj.mj_forward(self.mj_model, self.mj_data)
 
     def calibrate(self) -> None:
         """No-op for simulation; the API requires it to be defined."""
@@ -426,19 +281,22 @@ class SimRobot(Robot):
     # ── Per-step observation and action ─────────────────────────────────────
 
     @check_if_not_connected
-    def get_observation(self) -> dict[str, Any]:
+    def get_observation(self) -> RobotObservation:
         """Read the current proprioception and render configured camera frames."""
-        _require_mujoco()  # ensure the dependency is imported before first use
         obs: dict[str, Any] = {}
         for name in self.motors:
             obs[f"{name}.pos"] = self.mj_data.joint(name).qpos
-        for camera in self.cameras.values():
-            obs[camera.name] = self._render_camera(camera.name, camera, camera.id)
-
+        for name, cam in self.cameras.items():
+            renderer = self.renderers[(cam.width, cam.height)]
+            renderer.update_scene(self.mj_data, camera=cam.id)
+            img = renderer.render()  # (H, W, 3) uint8 RGB
+            if not img.flags["C_CONTIGUOUS"]:
+                img = np.ascontiguousarray(img)
+            obs[name] = img
         return obs
 
     @check_if_not_connected
-    def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
+    def send_action(self, action: RobotAction) -> RobotAction:
         """Apply a position target to each named motor and step the simulation.
 
         Args:
@@ -450,29 +308,26 @@ class SimRobot(Robot):
             The action actually applied, in user units (after safety clamping
             and actuator range clipping).
         """
-        mj = _require_mujoco()
         # Resolve which motors are being commanded this step.
         targets: dict[str, float] = {}
         for motor_name in self.config.motors:
-            key = f"{motor_name}.pos"
-            if key in action:
-                raw = action[key]
-                if raw is None:
-                    continue
-                targets[motor_name] = self._to_sim_units(float(raw))
+            raw = action.get(f"{motor_name}.pos")
+            if raw is None:
+                continue
+            targets[motor_name] = self._to_sim_units(float(raw))
 
         # Safety clamp: cap per-step magnitude relative to current position.
         if targets and self.config.max_relative_target is not None:
-            present = {m: self._read_joint_position(m) for m in targets}
+            present = {m: self._read_motor_position(m) for m in targets}
             goal_present = {m: (g, present[m]) for m, g in targets.items()}
             clamped = ensure_safe_goal_position(goal_present, self.config.max_relative_target)
             targets = {m: float(v) for m, v in clamped.items()}
 
         # Apply and step.
         for motor_name, target in targets.items():
-            self._set_ctrl_or_pos(motor_name, float(target))
+            self._apply_motor_target(motor_name, float(target))
         for _ in range(self.config.n_substeps):
-            mj.mj_step(self.mj_model, self.mj_data)
+            self.mj.mj_step(self.mj_model, self.mj_data)
 
         # Build the response: commanded values where present, current otherwise.
         sent: dict[str, Any] = {}
@@ -480,7 +335,7 @@ class SimRobot(Robot):
             if motor_name in targets:
                 value = float(targets[motor_name])
             else:
-                value = self._read_joint_position(motor_name)
+                value = self._read_motor_position(motor_name)
             sent[f"{motor_name}.pos"] = self._from_sim_units(value)
         return sent
 
@@ -495,52 +350,31 @@ class SimRobot(Robot):
         self.renderers.clear()
         self.mj_model = None
         self.mj_data = None
-        self._motor_joint_id = {}
-        self._motor_actuator_id = {}
-        self._motor_ctrl_low = {}
-        self._motor_ctrl_high = {}
-        self._camera_id = {}
         logger.info("%s disconnected.", self)
 
     # ── Internal helpers ────────────────────────────────────────────────────
 
-    def _set_ctrl_or_pos(self, motor_name: str, value_rad: float) -> None:
-        """Drive the motor: through its actuator when available, else via qpos."""
-        if motor_name in self._motor_actuator_id:
-            aid = self._motor_actuator_id[motor_name]
-            lo = self._motor_ctrl_low[motor_name]
-            hi = self._motor_ctrl_high[motor_name]
+    def _apply_motor_target(self, motor_name: str, value_rad: float) -> None:
+        """Drive ``motor_name`` to ``value_rad`` — through its actuator when one
+        exists, else by writing ``data.qpos`` directly. Both lookups are by
+        name and resolved on each call, so they tolerate joint/actuator ids
+        changing between connect/reconnect cycles.
+        """
+        aid = self.mj.mj_name2id(self.mj_model, self.mj.mjtObj.mjOBJ_ACTUATOR, motor_name)
+        if aid >= 0:
+            lo, hi = self.mj_model.actuator_ctrlrange[aid]
             self.mj_data.ctrl[aid] = float(np.clip(value_rad, lo, hi))
             return
-        self._set_joint_position(motor_name, value_rad)
-
-    def _set_joint_position(self, motor_name: str, value_rad: float) -> None:
-        """Set a joint's position directly via ``data.qpos`` (kinematic)."""
-        mj = _require_mujoco()
-        jid = self._motor_joint_id[motor_name]
+        jid = self.mj.mj_name2id(self.mj_model, self.mj.mjtObj.mjOBJ_JOINT, motor_name)
         qpos_adr = int(self.mj_model.jnt_qposadr[jid])
         self.mj_data.qpos[qpos_adr] = float(value_rad)
         # Rebuild derived quantities so subsequent renders reflect the change.
-        mj.mj_forward(self.mj_model, self.mj_data)
+        self.mj.mj_forward(self.mj_model, self.mj_data)
 
-    def _read_joint_position(self, motor_name: str) -> float:
-        jid = self._motor_joint_id[motor_name]
+    def _read_motor_position(self, motor_name: str) -> float:
+        jid = self.mj.mj_name2id(self.mj_model, self.mj.mjtObj.mjOBJ_JOINT, motor_name)
         qpos_adr = int(self.mj_model.jnt_qposadr[jid])
         return float(self.mj_data.qpos[qpos_adr])
-
-    def _render_camera(self, cam_name: str, cam_cfg: SimCameraConfig, cam_id: int) -> np.ndarray:
-        mj = _require_mujoco()
-        key = (cam_cfg.width, cam_cfg.height)
-        renderer = self.renderers.get(key)
-        if renderer is None:
-            renderer = mj.Renderer(self.mj_model, height=cam_cfg.height, width=cam_cfg.width)
-            self.renderers[key] = renderer
-        # mujoco 3.x accepts either an int id or a camera name string.
-        renderer.update_scene(self.mj_data, camera=cam_id)
-        img = renderer.render()  # ndarray (H, W, 3) uint8 RGB
-        if not img.flags["C_CONTIGUOUS"]:
-            img = np.ascontiguousarray(img)
-        return img
 
     def _to_sim_units(self, value: float) -> float:
         return float(np.deg2rad(value)) if self.config.use_degrees else float(value)
@@ -549,359 +383,17 @@ class SimRobot(Robot):
         return float(np.rad2deg(value)) if self.config.use_degrees else float(value)
 
 
-# ── Live visualisation ────────────────────────────────────────────────────
-# A thin companion to ``SimRobot`` that mirrors ``lerobot.record``'s
-# visualisation plumbing:
-#   * ``mujoco.viewer.launch_passive`` for an interactive 3D scene,
-#   * ``cv2.imshow`` windows for each MuJoCo camera (rendered by the same
-#     offscreen renderers ``SimRobot.get_observation`` uses),
-#   * ``lerobot.utils.visualization_utils`` for rerun / foxglove streaming.
-#
-# Construction:
-#
-#     robot = SimRobot(cfg)
-#     with SimRobotVisualizer(robot) as viz:        # auto-wires from cfg.display_*
-#         ...
-#         obs = robot.get_observation()
-#         viz.render(observation=obs)               # repaints windows + logs
-#         ...
-#
-# Or construct explicitly with a different ``display_*`` config than the
-# ``SimRobotConfig`` carries, e.g. when running the same sim across viewers.
-
-
-class SimRobotVisualizer:
-    """Live visualisation helper for :class:`SimRobot`.
-
-    Three orthogonal channels can be enabled independently; the constructor
-    inspects :attr:`SimRobot.config` (mirroring ``lerobot.record``'s
-    ``--display_data``/``--display_mode`` flags) by default and can also be
-    driven explicitly:
-
-    =============  ===========================================
-    Channel        Triggered when
-    =============  ===========================================
-    MuJoCo 3D GUI  ``mujoco_viewer=True``  (uses ``mujoco.viewer.launch_passive``)
-    Camera windows ``camera_windows=True`` (one ``cv2.namedWindow`` per SimCameraConfig)
-    LeRobot stream ``lerobot_backend in {"rerun", "foxglove"}``
-    =============  ===========================================
-
-    The LeRobot stream re-uses ``lerobot.utils.visualization_utils`` so its
-    wiring is identical to ``lerobot.record --display_data=true
-    --display_mode=<mode>``.
-
-    Args:
-        robot: A *connected* :class:`SimRobot`. The visualizer reads
-            ``robot.model`` and ``robot.data`` for the MuJoCo GUI, and
-            ``robot.config.cameras`` to lay out cv2 windows.
-        display: Either a :class:`SimRobotConfig` slice (with the same
-            ``display_*`` fields) or ``None`` to use ``robot.config`` directly.
-            This split lets users reuse the same robot with a different
-            visualisation config.
-
-    Raises:
-        RuntimeError: if ``robot.is_connected`` is False at construction.
-    """
-
-    def __init__(
-        self,
-        robot: "SimRobot",
-        *,
-        mujoco_viewer: bool | None = None,
-        camera_windows: bool | None = None,
-        lerobot_backend: str | None = None,
-        lerobot_ip: str | None = None,
-        lerobot_port: int | None = None,
-        lerobot_session_name: str | None = None,
-        lerobot_compress_images: bool | None = None,
-        display: Any | None = None,
-    ) -> None:
-        if not robot.is_connected:
-            raise RuntimeError(
-                f"{type(self).__name__}: the robot must be connected before a "
-                "visualiser is constructed. Call ``robot.connect()`` first."
-            )
-        cfg = getattr(robot, "config", None)
-
-        # Resolve display flags: explicit arg > `display` object > robot.config.
-        def _resolve(name: str, default):
-            if display is not None and hasattr(display, name):
-                return getattr(display, name)
-            if cfg is not None and hasattr(cfg, name):
-                return getattr(cfg, name)
-            return default
-
-        self._mujoco_viewer_enabled = bool(
-            mujoco_viewer if mujoco_viewer is not None else _resolve("display_mujoco_viewer", False)
-        )
-        self._camera_windows_enabled = bool(
-            camera_windows if camera_windows is not None else _resolve("display_camera_windows", False)
-        )
-        self._lerobot_backend = (
-            lerobot_backend if lerobot_backend is not None else _resolve("display_lerobot_backend", "off")
-        )
-        self._lerobot_ip = lerobot_ip if lerobot_ip is not None else _resolve("display_lerobot_ip", None)
-        self._lerobot_port = lerobot_port if lerobot_port is not None else _resolve("display_lerobot_port", None)
-        self._lerobot_session_name = (
-            lerobot_session_name
-            if lerobot_session_name is not None
-            else _resolve("display_lerobot_session_name", "sim_robot")
-        )
-        self._lerobot_compress_images = bool(
-            lerobot_compress_images
-            if lerobot_compress_images is not None
-            else _resolve("display_lerobot_compress_images", False)
-        )
-
-        if self._lerobot_backend not in ("off",) + tuple(VISUALIZATION_MODES):
-            raise ValueError(
-                f"Unknown display_lerobot_backend '{self._lerobot_backend}'. "
-                f"Expected one of {{'off', *{VISUALIZATION_MODES}}}."
-            )
-
-        self._robot = robot
-        self._mujoco_handle: Any | None = None
-        self._cv2_windows: set[str] = set()
-        self._cv2_available = False
-        self._started = False
-        self._running = True
-
-        # Lazily check cv2 availability even when only the camera windows
-        # aren't requested (avoids a hard dep when callers don't use them).
-        self._init_visualizers()
-
-    # ── Backend wiring ──────────────────────────────────────────────────────
-
-    def _init_visualizers(self) -> None:
-        """Open every enabled backend. Idempotent — safe to call again."""
-        if self._started:
-            return
-        # 1. LeRobot (rerun / foxglove).
-        if self._lerobot_backend != "off":
-            logger.info(
-                "Initialising LeRobot %s visualizer (session=%s, ip=%s, port=%s)",
-                self._lerobot_backend,
-                self._lerobot_session_name,
-                self._lerobot_ip,
-                self._lerobot_port,
-            )
-            # ``init_visualization`` keeps its own static state and is idempotent
-            # across visualizer instances -- safer to call only once globally.
-            try:
-                init_visualization(
-                    self._lerobot_backend,
-                    session_name=self._lerobot_session_name,
-                    ip=self._lerobot_ip,
-                    port=self._lerobot_port,
-                )
-            except Exception as exc:  # nosec B110 - rerun's spawn() needs a display
-                logger.warning(
-                    "Failed to initialise %s visualizer (%s); continuing without it. "
-                    "On a headless host, use --display_lerobot_backend foxglove or "
-                    "set --display_lerobot_ip/--display_lerobot_port to a remote Rerun server.",
-                    self._lerobot_backend,
-                    exc,
-                )
-                self._lerobot_backend = "off"
-
-        # 2. MuJoCo passive viewer (requires a display server, uses glfw).
-        if self._mujoco_viewer_enabled:
-            # Glfw's ``__init__`` prints to stderr and calls ``sys.exit(1)``
-            # when no display server is reachable -- which would tear the
-            # process down before our ``except`` ever runs. Guard up-front so
-            # headless hosts (CI, sandboxes, WSL) degrade cleanly.
-            has_display = bool(os.environ.get("DISPLAY")) or bool(os.environ.get("WAYLAND_DISPLAY"))
-            if not has_display and sys.platform.startswith("linux"):
-                logger.warning(
-                    "No DISPLAY/WAYLAND_DISPLAY set; skipping the MuJoCo 3D live "
-                    "GUI on this headless host. Other display channels continue."
-                )
-                self._mujoco_viewer_enabled = False
-                self._mujoco_handle = None
-            else:
-                try:
-                    import mujoco.viewer as mj_viewer  # local import to keep deps lean
-                except (ImportError, RuntimeError) as exc:
-                    logger.warning(
-                        "mujoco.viewer unavailable (%s); skipping the 3D live GUI.",
-                        exc,
-                    )
-                    self._mujoco_viewer_enabled = False
-                else:
-                    try:
-                        self._mujoco_handle = mj_viewer.launch_passive(self._robot.model, self._robot.data)
-                    except Exception as exc:  # noqa: BLE001 -- backend raises broadly
-                        logger.warning(
-                            "MuJoCo passive viewer could not start (%s: %s); skipping "
-                            "the 3D live GUI. Other display channels continue.",
-                            type(exc).__name__,
-                            exc,
-                        )
-                        self._mujoco_handle = None
-                        self._mujoco_viewer_enabled = False
-                    else:
-                        logger.info("MuJoCo passive viewer opened (close the window to stop the loop).")
-
-        # 3. cv2 camera windows.
-        if self._camera_windows_enabled:
-            try:
-                import cv2 as _cv2_probe  # noqa: F401
-            except ImportError as exc:
-                logger.warning("opencv-python not available (%s); skipping camera windows.", exc)
-                self._camera_windows_enabled = False
-            else:
-                self._cv2_available = True
-                for cam_name in self._robot.config.cameras:
-                    window_name = f"SimRobot :: {cam_name}"
-                    import cv2
-
-                    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-                    self._cv2_windows.add(window_name)
-                logger.info("Opened %d cv2 camera window(s).", len(self._cv2_windows))
-
-        self._started = True
-
-    # ── Per-step API ───────────────────────────────────────────────────────
-
-    def render(
-        self,
-        *,
-        observation: dict[str, Any] | None = None,
-        action: dict[str, Any] | None = None,
-    ) -> None:
-        """Push the latest observation and/or action through every enabled backend.
-
-        Call this once per control step *after* ``robot.get_observation`` and
-        ``robot.send_action``. Designed to be cheap: nothing is sent if a
-        backend was not enabled in the config.
-        """
-        if not self._started:
-            self._init_visualizers()
-
-        # --- MuJoCo 3D viewer -------------------------------------------------
-        if self._mujoco_viewer_enabled and self._mujoco_handle is not None:
-            if not self._mujoco_handle.is_running():
-                # User closed the window -- ask the caller's loop to exit.
-                self._running = False
-            else:
-                self._mujoco_handle.sync()
-
-        # --- cv2 camera windows ----------------------------------------------
-        if self._camera_windows_enabled and self._cv2_available and observation:
-            try:
-                import cv2
-            except ImportError:  # already gated above, defensive
-                return
-            for cam_name, window_name in zip(self._robot.config.cameras, self._cv2_windows):
-                if cam_name not in observation:
-                    continue
-                frame = observation[cam_name]
-                if frame is None:
-                    continue
-                # ``mujoco.Renderer.render`` returns RGB; cv2 expects BGR.
-                bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) if frame.ndim == 3 else frame
-                cv2.imshow(window_name, bgr)
-            # ``waitKey`` is required for cv2 to actually paint the windows
-            # and to keep the window manager responsive (drag, close, ...).
-            cv2.waitKey(1)
-
-        # --- LeRobot stream (rerun / foxglove) --------------------------------
-        if self._lerobot_backend != "off":
-            log_visualization_data(
-                self._lerobot_backend,
-                observation=observation,
-                action=action,
-                compress_images=self._lerobot_compress_images,
-            )
-
-    @property
-    def is_running(self) -> bool:
-        """:data:`True` until the user closes the MuJoCo viewer or :meth:`close` is called.
-
-        Use this as the loop predicate in scripts that drive the sim, so closing
-        the 3D viewer cleanly stops the simulation.
-        """
-        if not self._started:
-            return True
-        if not self._running:
-            return False
-        if self._mujoco_viewer_enabled and self._mujoco_handle is not None:
-            return self._mujoco_handle.is_running()
-        return True
-
-    def close(self) -> None:
-        """Tear down every backend opened by the constructor.
-
-        Safe to call more than once. ``cv2.destroyAllWindows()`` is gated so it
-        runs even if the windows were never created (cv2.destroyAllWindows is
-        itself a no-op then, but importing cv2 only when we know it is present
-        keeps the dep optional).
-        """
-        if self._mujoco_handle is not None:
-            try:
-                self._mujoco_handle.close()
-            except Exception:  # nosec B110
-                pass
-            self._mujoco_handle = None
-            self._mujoco_viewer_enabled = False
-
-        if self._cv2_windows:
-            try:
-                import cv2
-
-                for window_name in list(self._cv2_windows):
-                    try:
-                        cv2.destroyWindow(window_name)
-                    except Exception:  # nosec B110
-                        pass
-                cv2.waitKey(1)
-            except ImportError:
-                pass
-            self._cv2_windows.clear()
-            self._camera_windows_enabled = False
-            self._cv2_available = False
-
-        if self._lerobot_backend != "off":
-            try:
-                shutdown_visualization(self._lerobot_backend)
-            except Exception:  # nosec B110
-                pass
-            self._lerobot_backend = "off"
-
-        self._running = False
-        self._started = False
-
-    # ── Context-manager helpers ─────────────────────────────────────────────
-
-    def __enter__(self) -> "SimRobotVisualizer":
-        if not self._started:
-            self._init_visualizers()
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.close()
-
-
 __all__ = [
     "SimMotorSpec",
     "SimCameraConfig",
     "SimRobotConfig",
     "SimRobot",
-    "SimRobotVisualizer",
 ]
 
-
 if __name__ == "__main__":
-    import matplotlib.pyplot as plt
-
     cfg = SimRobotConfig(xml_path="/home/sorel/workspace/avatar/assets/SO101/scene.xml")
     robot = SimRobot(cfg)
 
     with robot:
         obs = robot.get_observation()
-        n_cam = len(robot.config.cameras)
-        for i, cam in enumerate(robot.cameras.values()):
-            plt.subplot(1, n_cam, i + 1)
-            plt.imshow(obs[cam.name])
-            plt.title(cam.name)
-        plt.show()
+        print(obs.keys())
