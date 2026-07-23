@@ -120,8 +120,6 @@ class SimRobotConfig(RobotConfig):
         super().__post_init__()
         if not Path(self.xml_path).exists():
             raise ValueError(f"SimRobotConfig.xml_path ({self.xml_path}) does not exist.")
-        if self.n_substeps < 1:
-            raise ValueError("SimRobotConfig.n_substeps must be >= 1.")
         if self.max_relative_target is not None and not (
             (isinstance(self.max_relative_target, (int, float)) and self.max_relative_target > 0)
             or isinstance(self.max_relative_target, dict)
@@ -130,12 +128,6 @@ class SimRobotConfig(RobotConfig):
                 "SimRobotConfig.max_relative_target must be a positive scalar or a "
                 "dict of motor_name -> positive scalar, or None to disable."
             )
-        if self.default_joint_positions is not None:
-            unknown = set(self.default_joint_positions) - set(self.motors)
-            if unknown:
-                raise ValueError(
-                    f"default_joint_positions contains motor names not declared in motors: {sorted(unknown)}."
-                )
         self.introspect_scene()
 
     def introspect_scene(self) -> dict:
@@ -208,6 +200,10 @@ class SimRobot(Robot):
         # MuJoCo handles -- populated on ``connect``.
         self.mj_model: Any | None = None
         self.mj_data: Any | None = None
+        # Physics steps per ``send_action``; auto-derived from
+        # ``model.opt.timestep`` in ``connect()`` so each call advances
+        # simulation time by ~1/30 s (LeRobot's standard control rate).
+        self._n_substeps: int = 1
         # Offscreen renderers, keyed by (width, height); populated on ``connect``.
         self.renderers: dict[tuple[int, int], Any] = {}
         # ``mujoco`` module handle; populated in ``connect()`` via the
@@ -260,6 +256,13 @@ class SimRobot(Robot):
         except Exception as e:
             raise RuntimeError(f"SimRobot: failed to load MuJoCo model {path}: {e}") from e
         self.mj_data = self.mj.MjData(self.mj_model)
+
+        # Auto-pick a substep count so each ``send_action`` advances sim time
+        # by ~1/30 s (LeRobot's standard 30 Hz control rate). With the
+        # default MuJoCo timestep of 0.002 s that's 17 physics steps per
+        # call; a finer timestep in the MJCF yields proportionally more.
+        target_period = 1.0 / 30.0  # seconds
+        self._n_substeps = max(1, round(target_period / self.mj_model.opt.timestep))
 
         # Apply initial state via configure().
         self.configure()
@@ -318,19 +321,10 @@ class SimRobot(Robot):
         for key, val in action.items():
             self.mj_data.ctrl[self.motors[key].id] = float(val)
 
-        for _ in range(self.config.n_substeps):
+        for _ in range(50):
             self.mj.mj_step(self.mj_model, self.mj_data)
 
-        # # Build the response: commanded values where present, current otherwise.
-        # sent: dict[str, Any] = {}
-        # for motor_name in self.config.motors:
-        #     if motor_name in targets:
-        #         value = float(targets[motor_name])
-        #     else:
-        #         jid = self.mj.mj_name2id(self.mj_model, self.mj.mjtObj.mjOBJ_JOINT, motor_name)
-        #         value = float(self.mj_data.qpos[int(self.mj_model.jnt_qposadr[jid])])
-        #     sent[f"{motor_name}.pos"] = float(np.rad2deg(value)) if self.config.use_degrees else value
-        # return sent
+        return action
 
     @check_if_not_connected
     def disconnect(self) -> None:
@@ -358,12 +352,12 @@ if __name__ == "__main__":
     robot = SimRobot(cfg)
 
     with robot:
-        obs = robot.get_observation()
-        states = np.array([obs[f"{name}.pos"] for name in robot.config.motors]).flatten()
-        print(f"states: {states}")
-        robot.send_action({name: 0.1 for name in robot.config.motors})
-        for _ in range(10):
+        for i in range(10):
             time.sleep(0.033)  # 30Hz
+            action = robot.send_action({name: 0.1 + i * 0.1 for name in robot.config.motors})
+            action = np.array(list(action.values()))
+            print(f"action: {action}")
+
             obs = robot.get_observation()
             states = np.array([obs[f"{name}.pos"] for name in robot.config.motors]).flatten()
             print(f"states: {states}")
