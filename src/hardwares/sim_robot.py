@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
@@ -68,17 +69,17 @@ def _ensure_mujoco_gl_backend() -> None:
 
 
 @dataclass
-class SimMotorSpec:
+class SimMotor:
     id: int = -1
     name: str = "Motor X"
     gear: float = 1.0  # Gear ratio
     gain: float = 1.0  # Proportional gain for position servo
     bias: float = 0.0  # Bias for position servo
-    ctrl: tuple[float, float] | None = None  # (low, high) control range
+    ctrl: tuple[float, float] | None = None  # (low, high) control range\
 
 
 @dataclass
-class SimCameraConfig:
+class SimCamera:
     id: int = -1
     name: str = "Camera X"
     width: int = 640
@@ -97,27 +98,19 @@ class SimRobotConfig(RobotConfig):
 
     # Path to the MuJoCo scene (XML/MJCF).
     xml_path: str = ""
-    # motor_name -> SimMotorSpec. The motor name appears as ``"{motor}.pos"``
+    # motor_name -> SimMotor. The motor name appears as ``"{motor}.pos"``
     # in observation and action dictionaries.
-    motors: dict[str, SimMotorSpec] = field(default_factory=dict)
-    # camera_name -> SimCameraConfig. The camera name appears as an image key
+    motors: dict[str, SimMotor] = field(default_factory=dict)
+    # camera_name -> SimCamera. The camera name appears as an image key
     # in ``get_observation``. Frames are rendered offscreen from MJCF cameras.
-    cameras: dict[str, SimCameraConfig] = field(default_factory=dict)
-    # Default starting joint positions keyed by *motor* name. Applied on every
-    # ``configure()`` / ``connect()`` call. Units depend on ``use_degrees``.
-    default_joint_positions: dict[str, float] | None = None
+    cameras: dict[str, SimCamera] = field(default_factory=dict)
     # Optional initial ``data.qpos`` (overrides ``default_joint_positions``
     # when set). Must follow MuJoCo's ``qpos`` layout for the model.
     init_qpos: list[float] | None = None
-    # Number of ``mj_step`` calls per ``send_action`` invocation. Higher
-    # values produce faster-than-real-time virtual dynamics.
-    n_substeps: int = 1
     # Safety clamp applied to every ``send_action``: any joint whose target
     # differs from its current position by more than this magnitude is
     # capped. ``None`` disables clamping.
     max_relative_target: float | dict[str, float] | None = 0.05
-    # Treat policy observations/actions as degreres instead of radians.
-    use_degrees: bool = False
 
     def __post_init__(self):
         # Pick a headless OpenGL backend *before* ``import mujoco`` so the
@@ -160,8 +153,8 @@ class SimRobotConfig(RobotConfig):
             # Exclude actuators with different joint names
             if joint_name is None or joint_name != actuator.name:
                 continue
-            # Construct a SimMotorSpec for this actuator.
-            self.motors[actuator.name] = SimMotorSpec(
+            # Construct a SimMotor for this actuator.
+            self.motors[actuator.name] = SimMotor(
                 id=i,
                 name=actuator.name,
                 gear=actuator.gear,
@@ -171,7 +164,7 @@ class SimRobotConfig(RobotConfig):
             )
         self.cameras.update(
             {
-                (item := model.cam(i)).name: SimCameraConfig(
+                (item := model.cam(i)).name: SimCamera(
                     id=i,
                     name=item.name,
                     width=640,
@@ -296,11 +289,6 @@ class SimRobot(Robot):
         if self.config.init_qpos is not None:
             n = min(len(self.config.init_qpos), self.mj_model.nq)
             self.mj_data.qpos[:n] = np.asarray(self.config.init_qpos, dtype=np.float64)
-        if self.config.default_joint_positions:
-            for motor_name, target in self.config.default_joint_positions.items():
-                spec = self.config.motors[motor_name]
-                value = spec.initial_position if spec.initial_position is not None else target
-                self._apply_motor_target(motor_name, self._to_sim_units(float(value)))
         self.mj.mj_forward(self.mj_model, self.mj_data)
 
     def calibrate(self) -> None:
@@ -326,47 +314,23 @@ class SimRobot(Robot):
 
     @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:
-        """Apply a position target to each named motor and step the simulation.
+        """Apply a position target to each named motor and step the simulation."""
+        for key, val in action.items():
+            self.mj_data.ctrl[self.motors[key].id] = float(val)
 
-        Args:
-            action: Mapping of ``"{motor}.pos"`` -> target position. Motors
-                omitted from the dict are not commanded (their previous target
-                is held) so partial control works naturally.
-
-        Returns:
-            The action actually applied, in user units (after safety clamping
-            and actuator range clipping).
-        """
-        # Resolve which motors are being commanded this step.
-        targets: dict[str, float] = {}
-        for motor_name in self.config.motors:
-            raw = action.get(f"{motor_name}.pos")
-            if raw is None:
-                continue
-            targets[motor_name] = self._to_sim_units(float(raw))
-
-        # Safety clamp: cap per-step magnitude relative to current position.
-        if targets and self.config.max_relative_target is not None:
-            present = {m: self._read_motor_position(m) for m in targets}
-            goal_present = {m: (g, present[m]) for m, g in targets.items()}
-            clamped = ensure_safe_goal_position(goal_present, self.config.max_relative_target)
-            targets = {m: float(v) for m, v in clamped.items()}
-
-        # Apply and step.
-        for motor_name, target in targets.items():
-            self._apply_motor_target(motor_name, float(target))
         for _ in range(self.config.n_substeps):
             self.mj.mj_step(self.mj_model, self.mj_data)
 
-        # Build the response: commanded values where present, current otherwise.
-        sent: dict[str, Any] = {}
-        for motor_name in self.config.motors:
-            if motor_name in targets:
-                value = float(targets[motor_name])
-            else:
-                value = self._read_motor_position(motor_name)
-            sent[f"{motor_name}.pos"] = self._from_sim_units(value)
-        return sent
+        # # Build the response: commanded values where present, current otherwise.
+        # sent: dict[str, Any] = {}
+        # for motor_name in self.config.motors:
+        #     if motor_name in targets:
+        #         value = float(targets[motor_name])
+        #     else:
+        #         jid = self.mj.mj_name2id(self.mj_model, self.mj.mjtObj.mjOBJ_JOINT, motor_name)
+        #         value = float(self.mj_data.qpos[int(self.mj_model.jnt_qposadr[jid])])
+        #     sent[f"{motor_name}.pos"] = float(np.rad2deg(value)) if self.config.use_degrees else value
+        # return sent
 
     @check_if_not_connected
     def disconnect(self) -> None:
@@ -381,40 +345,10 @@ class SimRobot(Robot):
         self.mj_data = None
         logger.info("%s disconnected.", self)
 
-    # ── Internal helpers ────────────────────────────────────────────────────
-
-    def _apply_motor_target(self, motor_name: str, value_rad: float) -> None:
-        """Drive ``motor_name`` to ``value_rad`` — through its actuator when one
-        exists, else by writing ``data.qpos`` directly. Both lookups are by
-        name and resolved on each call, so they tolerate joint/actuator ids
-        changing between connect/reconnect cycles.
-        """
-        aid = self.mj.mj_name2id(self.mj_model, self.mj.mjtObj.mjOBJ_ACTUATOR, motor_name)
-        if aid >= 0:
-            lo, hi = self.mj_model.actuator_ctrlrange[aid]
-            self.mj_data.ctrl[aid] = float(np.clip(value_rad, lo, hi))
-            return
-        jid = self.mj.mj_name2id(self.mj_model, self.mj.mjtObj.mjOBJ_JOINT, motor_name)
-        qpos_adr = int(self.mj_model.jnt_qposadr[jid])
-        self.mj_data.qpos[qpos_adr] = float(value_rad)
-        # Rebuild derived quantities so subsequent renders reflect the change.
-        self.mj.mj_forward(self.mj_model, self.mj_data)
-
-    def _read_motor_position(self, motor_name: str) -> float:
-        jid = self.mj.mj_name2id(self.mj_model, self.mj.mjtObj.mjOBJ_JOINT, motor_name)
-        qpos_adr = int(self.mj_model.jnt_qposadr[jid])
-        return float(self.mj_data.qpos[qpos_adr])
-
-    def _to_sim_units(self, value: float) -> float:
-        return float(np.deg2rad(value)) if self.config.use_degrees else float(value)
-
-    def _from_sim_units(self, value: float) -> float:
-        return float(np.rad2deg(value)) if self.config.use_degrees else float(value)
-
 
 __all__ = [
-    "SimMotorSpec",
-    "SimCameraConfig",
+    "SimMotor",
+    "SimCamera",
     "SimRobotConfig",
     "SimRobot",
 ]
@@ -425,4 +359,11 @@ if __name__ == "__main__":
 
     with robot:
         obs = robot.get_observation()
-        print(obs.keys())
+        states = np.array([obs[f"{name}.pos"] for name in robot.config.motors]).flatten()
+        print(f"states: {states}")
+        robot.send_action({name: 0.1 for name in robot.config.motors})
+        for _ in range(10):
+            time.sleep(0.033)  # 30Hz
+            obs = robot.get_observation()
+            states = np.array([obs[f"{name}.pos"] for name in robot.config.motors]).flatten()
+            print(f"states: {states}")
