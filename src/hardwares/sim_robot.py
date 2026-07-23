@@ -257,6 +257,18 @@ class SimRobot(Robot):
             raise RuntimeError(f"SimRobot: failed to load MuJoCo model {path}: {e}") from e
         self.mj_data = self.mj.MjData(self.mj_model)
 
+        # Auto-tighten PD gains on <position> actuators whose MJCF leaves
+        # them at MuJoCo's default kp=1, kv=0 — too soft to overcome the
+        # ~1.5 Nm gravity torque on a 6-DOF arm, so gravity-loaded joints
+        # settle with ~1 rad of steady-state error. We only touch gains
+        # that are still at the default, so an MJCF that explicitly
+        # specifies kp>1 keeps its tuned values.
+        for i in range(self.mj_model.nu):
+            if self.mj_model.actuator_gainprm[i, 0] <= 1.0:
+                self.mj_model.actuator_gainprm[i, 0] = 20.0  # kp
+            if self.mj_model.actuator_gainprm[i, 2] <= 0.0:
+                self.mj_model.actuator_gainprm[i, 2] = 6.0  # kv
+
         # Auto-pick a substep count so each ``send_action`` advances sim time
         # by ~1/30 s (LeRobot's standard 30 Hz control rate). With the
         # default MuJoCo timestep of 0.002 s that's 17 physics steps per
@@ -321,7 +333,7 @@ class SimRobot(Robot):
         for key, val in action.items():
             self.mj_data.ctrl[self.motors[key].id] = float(val)
 
-        for _ in range(50):
+        for _ in range(30):
             self.mj.mj_step(self.mj_model, self.mj_data)
 
         return action
