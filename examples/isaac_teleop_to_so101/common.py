@@ -572,12 +572,15 @@ def build_device(cfg: LoopConfig) -> tuple:
     if cfg.teleop.cloudxr_env_file is None:
         cfg.teleop.cloudxr_env_file = CLOUDXR_ENV_FILE
 
-    # SO-101/SO-100 only (both share the SO-101 URDF), reject other followers.
-    supported_robots = {"so101_follower", "so100_follower"}
+    # SO-101/SO-100 (IK pipeline) or mock_robot (headless smoke test of the
+    # CloudXR + Isaac Teleop stack with no follower). The IK is SO-101-specific,
+    # so mock_robot is accepted only when it declares no motors -- otherwise the
+    # joint targets have nowhere to land.
+    supported_robots = {"so101_follower", "so100_follower", "mock_robot"}
     if cfg.robot.type not in supported_robots:
         raise ValueError(
-            f"This example only supports SO-101/SO-100 followers ({sorted(supported_robots)}), "
-            f"but got --robot.type={cfg.robot.type}."
+            f"This example only supports SO-101/SO-100 followers or mock_robot "
+            f"({sorted(supported_robots)}), but got --robot.type={cfg.robot.type}."
         )
 
     # The degree-based pipeline relies on --robot.use_degrees (default True).

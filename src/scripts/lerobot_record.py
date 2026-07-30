@@ -129,8 +129,6 @@ from lerobot.robots import (  # noqa: F401
     reachy2,
     rebot_b601_follower,
     so_follower,
-)
-from lerobot.robots import (
     unitree_g1 as unitree_g1_robot,  # noqa: F401
 )
 from lerobot.teleoperators import (  # noqa: F401
@@ -166,7 +164,6 @@ from lerobot.utils.visualization_utils import (
     log_visualization_data,
     shutdown_visualization,
 )
-
 from src.hardwares import mock_robot  # noqa: F401
 from src.hardwares.utils import make_robot_from_config
 
