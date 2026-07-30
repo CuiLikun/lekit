@@ -1,9 +1,6 @@
 from .sim_robot import (
-    SimCameraConfig,
-    SimMotorSpec,
     SimRobot,
     SimRobotConfig,
-    SimRobotVisualizer,
 )
 
 __all__ = [

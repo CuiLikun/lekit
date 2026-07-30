@@ -14,8 +14,8 @@ task="${2:-"pick the tape and place it on the pad."}"
 cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}, \
     wrist: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30}}"
 
-lerobot-record \
-    --robot.type=so101_follower \
+python -m src.scripts.lerobot_record \
+    --robot.type="mock_robot" \
     --robot.port=/dev/ttyACM1 \
     --robot.id=my_awesome_follower_arm \
     --robot.cameras="$cameras" \
