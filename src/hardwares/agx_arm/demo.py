@@ -29,25 +29,108 @@ cfg = create_agx_arm_config(
 robot = AgxArmFactory.create_arm(cfg)
 end_effector = robot.init_effector(robot.OPTIONS.EFFECTOR.AGX_GRIPPER)
 
-robot.connect()
 
-print("robotic arm fps =", robot.get_fps(), "Hz")
-# 1. 获取 firmware 的版本
-fw = robot.get_firmware()
-if fw is not None:
-    print(fw)
+def wait_until_enabled(max_wait_s: float = 5.0) -> bool:
+    """Try enabling all joints until success or timeout."""
+    start_t = time.monotonic()
+    while time.monotonic() - start_t < max_wait_s:
+        if robot.enable():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def wait_gripper_status(max_wait_s: float = 2.0):
+    """Wait for one fresh gripper status message."""
+    start_t = time.monotonic()
+    while time.monotonic() - start_t < max_wait_s:
+        gs = end_effector.get_gripper_status()
+        if gs is not None:
+            return gs
+        time.sleep(0.05)
+    return None
+
+
+def move_gripper_and_print(value: float, force: float) -> None:
+    before = wait_gripper_status()
+    end_effector.move_gripper_m(value=value, force=force)
+    time.sleep(0.8)
+    after = wait_gripper_status()
+    ctrl = end_effector.get_gripper_ctrl_states()
+    print(f"gripper_cmd value={value}, force={force}")
+    print(f"before={before.msg if before else None}")
+    print(f"after={after.msg if after else None}")
+    print(f"ctrl_feedback={ctrl.msg if ctrl else None}")
+
+
+def ensure_gripper_ready() -> bool:
+    # Follower/standby mode avoids teaching-mode interference for tool commands.
+    robot.set_follower_mode()
+    time.sleep(0.2)
+
+    gs = wait_gripper_status()
+    print(f"gripper_status_before_prepare={gs.msg if gs else None}")
+    if gs is None:
+        return False
+
+    # If homing is false, gripper commands may be accepted but have no physical effect.
+    if not getattr(gs.msg.foc_status, "homing_status", False):
+        print("gripper homing is false, trying reset+calibrate")
+        _ = end_effector.reset_gripper()  # Return value is not reliable in current SDK.
+        end_effector.disable_gripper()
+        time.sleep(0.3)
+        input("Please move gripper to ZERO position manually, then press Enter...")
+        calib_ok = end_effector.calibrate_gripper(timeout=3.0)
+        print(f"calibrate_gripper={calib_ok}")
+        time.sleep(0.8)
+
+    gs2 = wait_gripper_status(max_wait_s=3.0)
+    print(f"gripper_status_after_prepare={gs2.msg if gs2 else None}")
+    if gs2 is None:
+        return False
+    return bool(getattr(gs2.msg.foc_status, "homing_status", False))
+
+
+robot.connect()
+print(f"comm_error={robot.has_comm_error()}, comm_error_detail={robot.get_comm_error()}")
+
+# A common reason for "command has no effect" is not enabled or in joint-error state.
+clear_ok = robot.clear_joint_error()
+print(f"clear_joint_error={clear_ok}")
+enable_ok = wait_until_enabled()
+print(f"enable_ok={enable_ok}, all_joint_enabled={robot.get_joint_enable_status(255)}")
+
+# move eef
+print(f"{robot.get_firmware()=}")
+print(f"{robot.get_arm_status().msg=}")
+print(f"{robot.get_fps()=}")
+print(f"{robot.joint_nums=}")
+
+print(f"{end_effector.is_ok()=}")
+first_gs = wait_gripper_status()
+print(f"first_gripper_status={first_gs.msg if first_gs else None}")
+gripper_ready = ensure_gripper_ready()
+print(f"gripper_ready={gripper_ready}")
+if not gripper_ready:
+    raise RuntimeError(
+        "Gripper homing_status is still False after calibration. "
+        "Control commands are likely ignored by gripper firmware/hardware."
+    )
+
+move_gripper_and_print(value=0.05, force=10.0)
+# end_effector.move_gripper_m(value=0.0, force=1.0)
 
 # a = robot.clear_joint_error()
 # print(a)
 
 # print(robot.enable())
 # 2. 获取关节角度
-while True:
-    ja = robot.get_joint_angles()
-    if ja is not None:
-        print(ja.msg)
-        print(ja.hz, ja.timestamp)
-    time.sleep(0.005)
+# while True:
+#     ja = robot.get_joint_angles()
+#     if ja is not None:
+#         print(ja.msg)
+#         print(ja.hz, ja.timestamp)
+#     time.sleep(0.005)
 
 # 3. 获取法兰盘位姿
 # while True:
@@ -82,11 +165,20 @@ while True:
 ## 8. 关节运动
 # robot.set_speed_percent(5)  # 以 100% 速度运行
 
-# tensor([-0.4161,  0.6676, -0.9647,  1.2113,  0.0496, -0.0581,  0.0508,  0.6713,
-#          0.7686, -1.1062,  1.1863,  0.0268,  0.2221,  0.0472],
-# robot.move_j([-0.03508111796508603, 0.443523069516799, -0.40029126394489944, 0.508798383541387, 0.1866455102082736, 0.14529866022852791])
+# # tensor([-0.4161,  0.6676, -0.9647,  1.2113,  0.0496, -0.0581,  0.0508,  0.6713,
+# #          0.7686, -1.1062,  1.1863,  0.0268,  0.2221,  0.0472],
+# robot.move_j(
+#     [
+#         -0.03508111796508603,
+#         0.443523069516799,
+#         -0.40029126394489944,
+#         0.508798383541387,
+#         0.1866455102082736,
+#         0.14529866022852791,
+#     ]
+# )
 
-# robot.move_j([0.6713,0.7686, -1.1062,  1.1863,  0.0268,  0.2221])
+# # robot.move_j([0.6713,0.7686, -1.1062,  1.1863,  0.0268,  0.2221])
 
 
 ## 9. 点到点运动
@@ -111,21 +203,25 @@ while True:
 # time.sleep(5)
 
 # 12.获取夹爪的状态
-# while True:
-#     gs = end_effector.get_gripper_status()
-#     if gs is not None:
-#         print("value=", gs.msg.value, "mode=", gs.msg.mode, "force(N)=", gs.msg.force)
-#         print("hz=", gs.hz, "timestamp=", gs.timestamp)
-#         break
-#     time.sleep(0.05)
+gs = wait_gripper_status()
+if gs is not None:
+    print("value=", gs.msg.value, "mode=", gs.msg.mode, "force(N)=", gs.msg.force)
+    print("hz=", gs.hz, "timestamp=", gs.timestamp)
+else:
+    print("gripper status timeout")
 
 # 13. 控制夹爪
 # 张开到 5cm，力 1N
-# end_effector.move_gripper_m(value=0.05, force=1.0)
-# time.sleep(1.0)
+move_gripper_and_print(value=0.05, force=10.0)
 
 # 闭合（行程 0）
-# end_effector.move_gripper_m(value=0.0, force=1.0)
+move_gripper_and_print(value=0.0, force=10.0)
+gs = wait_gripper_status()
+if gs is not None:
+    print("value=", gs.msg.value, "mode=", gs.msg.mode, "force(N)=", gs.msg.force)
+    print("hz=", gs.hz, "timestamp=", gs.timestamp)
+else:
+    print("gripper status timeout")
 
 # # 14. 设置遥操时夹爪的柔软程度
 # end_effector.set_gripper_teaching_pendant_param(
