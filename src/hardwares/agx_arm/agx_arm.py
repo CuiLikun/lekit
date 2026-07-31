@@ -434,31 +434,9 @@ class AgxArm(Robot):
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
         """Read joint angles (rad), gripper width (m), and any camera frames."""
-        arm = self.arm
-        assert arm is not None  # guaranteed by ``check_if_not_connected``
-
         obs: dict[str, Any] = {}
-
-        # Arm joints. The SDK can return None before the first joint-states
-        # frame arrives; fall back to a zero vector so the schema is honoured.
-        ja = arm.get_joint_angles()
-        angles = [0.0] * self.N_JOINTS if ja is None else [float(v) for v in ja.msg]
-        for i in range(self.N_JOINTS):
-            obs[f"joint_{i + 1}.pos"] = float(angles[i])
-
-        # Gripper width. The Agx gripper reports value in metres in width
-        # mode (``status_code.mode == "width"``), with firmware preset of
-        # ``gripper_max_range``. Normalize to [0, 1] so callers see a
-        # SDK-independent scalar.
-        if self.effector is not None:
-            gs = self.effector.get_gripper_status()
-            if gs is not None:
-                raw = float(gs.msg.value)
-                obs["gripper.pos"] = float(np.clip(raw / self.config.gripper_max_range, 0.0, 1.0))
-            else:
-                obs["gripper.pos"] = 0.0
-        else:
-            obs["gripper.pos"] = 0.0
+        obs.update(self.get_joint_angles())
+        obs.update(self.get_gripper_position())
 
         # Cameras.
         for cam_key, cam in self.cameras.items():
@@ -468,6 +446,29 @@ class AgxArm(Robot):
                 obs[f"{cam_key}_depth"] = cam.read_latest_depth()
 
         return obs
+
+    @check_if_not_connected
+    def get_joint_angles(self) -> dict[str, float]:
+        """Read current 6-DOF joint angles in radians as ``joint_i.pos`` fields."""
+        arm = self.arm
+        assert arm is not None  # guaranteed by ``check_if_not_connected``
+
+        # The SDK can return None before the first joint-state frame arrives.
+        ja = arm.get_joint_angles()
+        angles = [0.0] * self.N_JOINTS if ja is None else [float(v) for v in ja.msg]
+        return {f"joint_{i + 1}.pos": float(angles[i]) for i in range(self.N_JOINTS)}
+
+    @check_if_not_connected
+    def get_gripper_position(self) -> dict[str, float]:
+        """Read normalized gripper position in [0, 1] as ``gripper.pos`` field."""
+        # The Agx gripper reports width in metres; normalize by configured range.
+        value = 0.0
+        if self.effector is not None and self.effector.get_gripper_status() is not None:
+            gs = self.effector.get_gripper_status()
+            value = float(gs.msg.value) if gs is not None else 0.0
+            value = np.clip(value / self.config.gripper_max_range, 0.0, 1.0)
+
+        return {"gripper.pos": float(value)}
 
     @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:
@@ -490,9 +491,8 @@ class AgxArm(Robot):
         arm = self.arm
         assert arm is not None  # guaranteed by ``check_if_not_connected``
 
-        ja = arm.get_joint_angles()
-        present = [float(v) for v in ja.msg] if ja is not None else [0.0] * self.N_JOINTS
-        present_dict = {f"joint_{i + 1}.pos": float(present[i]) for i in range(self.N_JOINTS)}
+        present_dict = self.get_joint_angles()
+        present = [present_dict[f"joint_{i + 1}.pos"] for i in range(self.N_JOINTS)]
 
         # Filter down to the joints the caller is actually driving. Unknown
         # keys are ignored so the caller can pass arbitrary telemetry fields
