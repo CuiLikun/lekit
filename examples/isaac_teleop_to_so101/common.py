@@ -39,6 +39,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from importlib.resources import files
+from logging import getLogger
 from pathlib import Path
 from typing import Protocol
 
@@ -69,9 +70,12 @@ from .isaac_teleop import (
     SO101LeaderArmConfig,
     XRController,
 )
+from .isaac_teleop.xr_controller_processor import MapEEPoseRotVecToAgxArmRPY
 
 # Fixed rate [Hz] for the teleoperate loop and the pre-loop slews / connect-wait poll sleeps.
 FPS = 30
+
+logger = getLogger(__name__)
 
 # CloudXR device-profile env file passed to the launcher (see default.env in this package).
 CLOUDXR_ENV_FILE = str(files(__package__) / "default.env")
@@ -102,9 +106,41 @@ class Device:
     cleanup: Callable[[], None]
 
 
-def hold_action(obs: RobotObservation, motor_names: list[str]) -> dict[str, float]:
-    """Re-send the measured joints — the explicit hold when a device is idle."""
-    return {f"{name}.pos": float(obs[f"{name}.pos"]) for name in motor_names}
+def hold_action(obs: RobotObservation, action_keys: list[str]) -> dict[str, float]:
+    """Re-send the measured state for the given action keys — the explicit hold when a device is idle.
+
+    ``action_keys`` is the robot's full action schema (e.g. ``["joint_1.pos", ..., "gripper.pos"]``
+    in joint mode, or ``["ee.x", ..., "gripper.pos"]`` in AgxArm ee-pose mode). Keys missing
+    from ``obs`` (e.g. an ee.x key the robot hasn't observed yet) are silently dropped, so a
+    freshly-connected robot whose EE pose hasn't been read once doesn't crash the hold path.
+    """
+    return {key: float(obs[key]) for key in action_keys if key in obs}
+
+
+def _pose6_to_t(pose: tuple[float, float, float, float, float, float]) -> np.ndarray:
+    """Convert an AgxArm flange ``(x, y, z, roll, pitch, yaw)`` pose to a 4x4 base_T_ee matrix.
+
+    Used to seed the XR pipeline's clutch home when the follower is an
+    AgxArm in ``control_mode="ee_pose"`` (no URDF available, so FK is not
+    possible). RPY follows the AgileX SDK convention: XYZ-Euler radians.
+    """
+    x, y, z, roll, pitch, yaw = (float(v) for v in pose)
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    # XYZ intrinsic: rot = Rz(yaw) @ Ry(pitch) @ Rx(roll)
+    rot = np.array(
+        [
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr],
+        ],
+        dtype=float,
+    )
+    out = np.eye(4, dtype=float)
+    out[:3, :3] = rot
+    out[:3, 3] = np.array([x, y, z], dtype=float)
+    return out
 
 
 class HoldLatch:
@@ -114,10 +150,14 @@ class HoldLatch:
     downward: under gravity the P-only servo settles below its goal by a steady-state
     error, so each re-command of the measurement lowers the goal by that error again.
     Latching the target once on the active->idle transition holds a fixed pose instead.
+
+    ``action_keys`` is the robot's full action schema (so the held dict has the same
+    shape as ``send_action`` expects — joints + gripper in joint mode, ee.{x,y,z,...} +
+    gripper in AgxArm ee-pose mode).
     """
 
-    def __init__(self, motor_names: list[str]):
-        self._motor_names = motor_names
+    def __init__(self, action_keys: list[str]):
+        self._action_keys = action_keys
         self._held: dict[str, float] | None = None
 
     def resolve(self, action: RobotAction | None, obs: RobotObservation) -> RobotAction:
@@ -126,7 +166,7 @@ class HoldLatch:
             self._held = None
             return action
         if self._held is None:
-            self._held = hold_action(obs, self._motor_names)
+            self._held = hold_action(obs, self._action_keys)
         return self._held
 
 
@@ -301,41 +341,98 @@ def _wait_for_xr_controller(teleop_device: XRController) -> None:
 
 
 def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
-    """Build the XR controller device bundle (clutch + soft-orientation IK pipeline)."""
-    kinematics_solver = RobotKinematics(
-        urdf_path=_ensure_so101_urdf(),
-        target_frame_name="gripper_frame_link",
-        joint_names=motor_names,
-    )
+    """Build the XR controller device bundle (clutch + IK-or-move_p pipeline).
 
+    Dispatches on the follower's control backend:
+
+    * ``AgxArm`` — the AgileX firmware does IK internally via ``move_p``, so we
+      drop the URDF + host IK step and just rename ``ee.{wx,wy,wz}`` (rotvec)
+      to ``ee.{roll,pitch,yaw}`` (RPY) plus remap ``ee.gripper_pos``
+      (RANGE_0_100) → ``gripper.pos`` (∈ [0, 1]). No Piper X URDF ships with
+      this example, so even ``control_mode="joints"`` cannot run with the IK
+      pipeline (the URDF joint names would mismatch the AgxArm joint names).
+    * Otherwise (SO-101/SO-100/mocK_robot) — original IK pipeline:
+      URDF + soft-orientation IK back to joint targets.
+    """
     teleop_config = cfg.teleop  # XRControllerConfig (selected via --teleop.type=xr_controller)
     teleop_device = XRController(teleop_config)
 
-    # The clutch (below) turns the raw grip pose into an absolute base-frame ee_pose; this
-    # pipeline maps it to joint targets: rename -> bounds/rate-limit -> IK.
-    xr_to_robot_joints_processor = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
-        steps=[
-            MapXRControllerActionToRobotAction(),
-            # raise_on_jump=False: an over-limit step (e.g. a tracking glitch) is clamped +
-            # warned instead of raised, since a crash mid-loop would leave the arm uncontrolled.
-            # z floor 0.0 keeps a stray target above the table; x/y stay at a loose [-1,1]m box.
-            EEBoundsAndSafety(
-                end_effector_bounds={"min": [-1.0, -1.0, 0.0], "max": [1.0, 1.0, 1.0]},
-                max_ee_step_m=MAX_EE_STEP_M,
-                raise_on_jump=False,
-            ),
-            # initial_guess_current_joints=False: warm-start from the previous IK solution so
-            # the joint trajectory stays continuous frame-to-frame.
-            InverseKinematicsEEToJoints(
-                kinematics=kinematics_solver,
-                motor_names=motor_names,
-                initial_guess_current_joints=False,
-                orientation_weight=IK_ORIENTATION_WEIGHT,
-            ),
-        ],
-        to_transition=robot_action_observation_to_transition,
-        to_output=transition_to_robot_action,
-    )
+    # Detect the AgxArm backend. We always run the XR pipeline in EE-pose mode
+    # for AgxArm because no Piper X URDF is shipped — host-side IK would fail
+    # on the AgxArm's ``joint_1..joint_6`` names. To keep the dataset feature
+    # spec (built from ``robot.action_features``) consistent with the pipeline
+    # output, we force the config to ``control_mode="ee_pose"`` here and
+    # invalidate the cached action/observation feature dicts. This also makes
+    # ``send_action`` dispatch to ``move_p`` — exactly what we want for XR.
+    from src.hardwares.agx_arm import AgxArm
+
+    if isinstance(robot, AgxArm):
+        if robot.config.control_mode != "ee_pose":
+            logger.warning(
+                "AgxArm + XR pipeline: forcing control_mode='ee_pose' "
+                "(AgileX firmware handles IK internally via move_p; this "
+                "example ships no Piper X URDF for host-side IK)."
+            )
+            robot.config.control_mode = "ee_pose"
+        # Drop any already-computed action/observation feature dicts so they are
+        # recomputed under the new ``control_mode``. ``functools.cached_property``
+        # stores the value in the instance __dict__; ``cache_clear()`` must be
+        # called on the DESCRIPTOR (not the returned value), so popping the key
+        # from ``robot.__dict__`` is the reliable way to invalidate it.
+        for cached in ("action_features", "observation_features"):
+            robot.__dict__.pop(cached, None)
+
+    use_ee_pose = isinstance(robot, AgxArm)
+
+    if use_ee_pose:
+        # No URDF, no host-side IK: just rename the rotvec EE pose into the
+        # RPY + normalised gripper schema that AgxArm.send_action expects.
+        pipeline = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
+            steps=[
+                MapXRControllerActionToRobotAction(),
+                # Same bounds/rate-limit as the joint pipeline — defence in depth,
+                # even though the AgxArm driver applies its own ee_max_step_m.
+                EEBoundsAndSafety(
+                    end_effector_bounds={"min": [-1.0, -1.0, 0.0], "max": [1.0, 1.0, 1.0]},
+                    max_ee_step_m=MAX_EE_STEP_M,
+                    raise_on_jump=False,
+                ),
+                MapEEPoseRotVecToAgxArmRPY(),
+            ],
+            to_transition=robot_action_observation_to_transition,
+            to_output=transition_to_robot_action,
+        )
+    else:
+        kinematics_solver = RobotKinematics(
+            urdf_path=_ensure_so101_urdf(),
+            target_frame_name="gripper_frame_link",
+            joint_names=motor_names,
+        )
+        # The clutch (below) turns the raw grip pose into an absolute base-frame ee_pose; this
+        # pipeline maps it to joint targets: rename -> bounds/rate-limit -> IK.
+        pipeline = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
+            steps=[
+                MapXRControllerActionToRobotAction(),
+                # raise_on_jump=False: an over-limit step (e.g. a tracking glitch) is clamped +
+                # warned instead of raised, since a crash mid-loop would leave the arm uncontrolled.
+                # z floor 0.0 keeps a stray target above the table; x/y stay at a loose [-1,1]m box.
+                EEBoundsAndSafety(
+                    end_effector_bounds={"min": [-1.0, -1.0, 0.0], "max": [1.0, 1.0, 1.0]},
+                    max_ee_step_m=MAX_EE_STEP_M,
+                    raise_on_jump=False,
+                ),
+                # initial_guess_current_joints=False: warm-start from the previous IK solution so
+                # the joint trajectory stays continuous frame-to-frame.
+                InverseKinematicsEEToJoints(
+                    kinematics=kinematics_solver,
+                    motor_names=motor_names,
+                    initial_guess_current_joints=False,
+                    orientation_weight=IK_ORIENTATION_WEIGHT,
+                ),
+            ],
+            to_transition=robot_action_observation_to_transition,
+            to_output=transition_to_robot_action,
+        )
 
     # The clutch is built in startup() (after the optional reset slew, seeded from the
     # post-slew MEASURED pose) and shared with compute() via nonlocal.
@@ -352,19 +449,31 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
         _wait_for_xr_controller(teleop_device)
 
         if cfg.reset_to_origin:
-            reset_pose_file = Path(RESET_POSE_FILE.format(robot_name=robot.name, robot_id=robot.id))
-            target = _load_reset_target(reset_pose_file, motor_names)
-            source = str(reset_pose_file) if reset_pose_file.exists() else "hardcoded defaults"
-            print(f"Reset target source: {source}")
-            print(f"Resetting to origin over {cfg.reset_duration:.1f} s…")
-            slew(robot, motor_names, lambda: target, cfg.reset_duration)
-            print("Reset complete.")
+            if use_ee_pose:
+                # No joint-named reset targets for EE-pose mode; park at the
+                # current pose (no movement) so the user can manually pose the
+                # arm if they want a non-default start.
+                print(
+                    "Reset-to-origin is a no-op for AgxArm in ee_pose mode "
+                    "(park the arm manually before the first episode)."
+                )
+            else:
+                reset_pose_file = Path(RESET_POSE_FILE.format(robot_name=robot.name, robot_id=robot.id))
+                target = _load_reset_target(reset_pose_file, motor_names)
+                source = str(reset_pose_file) if reset_pose_file.exists() else "hardcoded defaults"
+                print(f"Reset target source: {source}")
+                print(f"Resetting to origin over {cfg.reset_duration:.1f} s…")
+                slew(robot, motor_names, lambda: target, cfg.reset_duration)
+                print("Reset complete.")
 
-        # Seed the clutch home from the arm's measured pose (FK of the current joints) so the
-        # first engage is jump-free, whether or not a reset slew ran.
+        # Seed the clutch home from the arm's measured pose so the first engage
+        # is jump-free, whether or not a reset slew ran.
         obs0 = robot.get_observation()
-        q_measured_deg = np.array([float(obs0[f"{name}.pos"]) for name in motor_names], dtype=float)
-        home_base_T_ee = kinematics_solver.forward_kinematics(q_measured_deg)  # noqa: N806
+        if use_ee_pose:
+            home_base_T_ee = _pose6_to_t(robot.get_flange_pose())  # noqa: N806
+        else:
+            q_measured_deg = np.array([float(obs0[f"{name}.pos"]) for name in motor_names], dtype=float)
+            home_base_T_ee = kinematics_solver.forward_kinematics(q_measured_deg)  # noqa: N806
         clutch = Clutch(home_base_T_ee)
 
         print("Starting teleop loop. Squeeze and move the controller to teleoperate the robot...")
@@ -380,19 +489,22 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
         trigger = float(xr_action["trigger"])
         enabled = squeeze > teleop_config.clutch_threshold
 
-        # On the engage edge, latch the clutch home at the arm's MEASURED EE pose (FK of
-        # the live joints) and the controller origin so the per-frame delta starts at zero.
-        # Latching the last commanded pose instead would snap the arm back to it at full
-        # servo speed if the arm moved while disengaged (gravity sag, external contact).
+        # On the engage edge, latch the clutch home at the arm's MEASURED EE pose and the
+        # controller origin so the per-frame delta starts at zero. Latching the last
+        # commanded pose instead would snap the arm back to it at full servo speed if the
+        # arm moved while disengaged (gravity sag, external contact).
         is_engage_frame = enabled and not prev_enabled
         if is_engage_frame:
-            q_measured = np.array([float(robot_obs[f"{name}.pos"]) for name in motor_names], dtype=float)
-            measured_base_T_ee = kinematics_solver.forward_kinematics(q_measured)  # noqa: N806
+            if use_ee_pose:
+                measured_base_T_ee = _pose6_to_t(robot.get_flange_pose())  # noqa: N806
+            else:
+                q_measured = np.array([float(robot_obs[f"{name}.pos"]) for name in motor_names], dtype=float)
+                measured_base_T_ee = kinematics_solver.forward_kinematics(q_measured)  # noqa: N806
             clutch.engage(grip_pos, grip_quat, measured_base_T_ee=measured_base_T_ee)
             # Re-anchor the pipeline state at the measured pose as well: EEBoundsAndSafety's
-            # rate limiter and the IK warm start otherwise still reference the stale
-            # pre-disengage command and would fight the fresh home for several frames.
-            xr_to_robot_joints_processor.reset()
+            # rate limiter (and the IK warm start, when used) otherwise still reference the
+            # stale pre-disengage command and would fight the fresh home for several frames.
+            pipeline.reset()
         prev_enabled = enabled
 
         # SAFETY GATE: command the robot ONLY while the clutch is engaged; otherwise return
@@ -406,7 +518,7 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
             "ee_pose": np.concatenate([ee_pos, ee_quat]).astype(np.float32),
             "closedness": trigger,
         }
-        return xr_to_robot_joints_processor((ee_action, robot_obs))
+        return pipeline((ee_action, robot_obs))
 
     return Device(compute=compute, startup=startup, cleanup=teleop_device.disconnect)
 

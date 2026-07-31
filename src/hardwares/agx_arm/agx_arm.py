@@ -176,8 +176,27 @@ class AgxArmConfig(RobotConfig):
 
     # Per-joint ``move_j`` relative-position safety clamp (radians). ``None``
     # disables the clamp. Defaults to ~2.86° which is conservative for a
-    # 30 Hz control loop on a Piper X.
+    # 30 Hz control loop on a Piper X. Only applies in ``joints`` mode; in
+    # ``ee_pose`` mode the EE pose is rate-limited by ``ee_max_step_m``.
     max_relative_target: float | dict[str, float] | None = 0.05
+
+    # Action schema / control backend:
+    #   "joints"  — action is ``joint_1.pos..joint_6.pos + gripper.pos``; sent via
+    #               ``move_j`` + ``move_gripper_m``. Use this when you want the host
+    #               to do IK, or when the policy is trained in joint space.
+    #   "ee_pose" — action is ``ee.{x,y,z,roll,pitch,yaw} + gripper.pos``; sent via
+    #               ``move_p`` + ``move_gripper_m``. The AgileX firmware handles IK
+    #               internally, so the XR / leader pipeline can skip the URDF-based
+    #               IK step entirely.
+    # Type is ``str`` (not ``Literal[...]``) because draccus's CLI decoder
+    # does not understand ``typing.Literal``; ``__post_init__`` validates.
+    control_mode: str = "joints"
+
+    # Per-frame Cartesian step clamp [m]. Only meaningful in ``ee_pose`` mode;
+    # the lerobot ``EEBoundsAndSafety`` step in the XR pipeline applies its
+    # own per-frame limit, so this is a defence-in-depth clamp that survives
+    # even when the caller bypasses that step.
+    ee_max_step_m: float = 0.1
 
     # Agx gripper configuration. ``max_range`` is the firmware-reported
     # full-open width in metres (0.07 m or 0.1 m depending on the gripper
@@ -226,6 +245,13 @@ class AgxArmConfig(RobotConfig):
                 "AgxArmConfig.max_relative_target must be a positive scalar or a "
                 "dict of motor_name -> positive scalar, or None to disable."
             )
+        if self.control_mode not in ("joints", "ee_pose"):
+            raise ValueError(
+                f"AgxArmConfig.control_mode={self.control_mode!r} is not supported. "
+                "Expected 'joints' or 'ee_pose'."
+            )
+        if self.ee_max_step_m <= 0:
+            raise ValueError("AgxArmConfig.ee_max_step_m must be positive.")
 
 
 # ── Robot implementation ────────────────────────────────────────────────────
@@ -272,9 +298,19 @@ class AgxArm(Robot):
 
     @cached_property
     def observation_features(self) -> dict[str, Any]:
-        """Schema for everything ``get_observation`` emits."""
+        """Schema for everything ``get_observation`` emits.
+
+        Joints + gripper are always emitted (useful for diagnostics and
+        for joint-mode policies). The current measured EE pose is emitted
+        as ``ee.{x,y,z,roll,pitch,yaw}`` whenever ``control_mode == "ee_pose"``
+        so that downstream consumers (e.g. a recording pipeline) can log
+        the EE target without re-reading the SDK.
+        """
         features: dict[str, Any] = {f"joint_{i + 1}.pos": float for i in range(self.N_JOINTS)}
         features["gripper.pos"] = float
+        if self.config.control_mode == "ee_pose":
+            for axis in ("x", "y", "z", "roll", "pitch", "yaw"):
+                features[f"ee.{axis}"] = float
         for cam_key, cam in self.cameras.items():
             if getattr(cam, "use_rgb", True):
                 features[cam_key] = (cam.height, cam.width, 3)
@@ -284,7 +320,21 @@ class AgxArm(Robot):
 
     @cached_property
     def action_features(self) -> dict[str, Any]:
-        """Schema for the action dict ``send_action`` expects."""
+        """Schema for the action dict ``send_action`` expects.
+
+        ``control_mode == "joints"`` (default):
+            ``joint_1.pos..joint_6.pos`` (radians) + ``gripper.pos`` (∈ [0, 1]).
+            Dispatched to ``move_j`` + ``move_gripper_m``.
+
+        ``control_mode == "ee_pose"``:
+            ``ee.{x,y,z}`` (m, base frame) + ``ee.{roll,pitch,yaw}`` (radians,
+            base frame) + ``gripper.pos`` (∈ [0, 1]). Dispatched to
+            ``move_p`` + ``move_gripper_m``.
+        """
+        if self.config.control_mode == "ee_pose":
+            return {f"ee.{axis}": float for axis in ("x", "y", "z", "roll", "pitch", "yaw")} | {
+                "gripper.pos": float,
+            }
         return {f"joint_{i + 1}.pos": float for i in range(self.N_JOINTS)} | {"gripper.pos": float}
 
     # ── Connection state ──
@@ -436,10 +486,17 @@ class AgxArm(Robot):
 
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
-        """Read joint angles (rad), gripper width (m), and any camera frames."""
+        """Read joint angles (rad), gripper width (m), and any camera frames.
+
+        When ``control_mode == "ee_pose"`` the current measured flange pose
+        is included as ``ee.{x,y,z,roll,pitch,yaw}`` so downstream consumers
+        can log the EE state without re-querying the SDK.
+        """
         obs: dict[str, Any] = {}
         obs.update(self.get_joint_angles())
         obs.update(self.get_gripper_position())
+        if self.config.control_mode == "ee_pose":
+            obs.update(self.get_ee_pose())
 
         # Cameras.
         for cam_key, cam in self.cameras.items():
@@ -488,18 +545,40 @@ class AgxArm(Robot):
         return tuple(float(v) for v in fp.msg)
 
     @check_if_not_connected
-    def send_action(self, action: RobotAction) -> RobotAction:
-        """Drive each named joint toward ``action[m]`` via ``move_j``.
+    def get_ee_pose(self) -> dict[str, float]:
+        """Read the current flange pose as ``ee.{x,y,z,roll,pitch,yaw}`` fields.
 
-        Steps:
-            1. Snapshot the measured joint angles from the controller.
-            2. For every ``joint_N.pos`` key present in ``action``, clip the
-               goal against ``config.max_relative_target`` (radians, per
-               joint). Keys absent from ``action`` are left untouched (zero
-               delta).
-            3. Issue a non-blocking ``move_j`` with the clamped target.
-            4. Drive the gripper via ``move_gripper_m`` (lerobot
-               ``gripper.pos`` ∈ [0, 1] is scaled to metres).
+        Used as the observation when ``control_mode == "ee_pose"`` so the
+        recorded dataset captures the EE state (matching the EE-pose action
+        schema).
+        """
+        pose = self.get_flange_pose()
+        return {
+            "ee.x": float(pose[0]),
+            "ee.y": float(pose[1]),
+            "ee.z": float(pose[2]),
+            "ee.roll": float(pose[3]),
+            "ee.pitch": float(pose[4]),
+            "ee.yaw": float(pose[5]),
+        }
+
+    @check_if_not_connected
+    def send_action(self, action: RobotAction) -> RobotAction:
+        """Dispatch ``action`` to ``move_j`` or ``move_p`` based on its keys.
+
+        Dispatch rules:
+
+        * ``ee.x`` in ``action`` (and ``control_mode == "ee_pose"``) → EE
+          pose path. ``ee.{x,y,z}`` (m, base frame) + ``ee.{roll,pitch,yaw}``
+          (radians) are forwarded to ``move_p``; ``gripper.pos`` ∈ [0, 1]
+          is scaled to ``gripper_max_range`` metres and sent via
+          ``move_gripper_m``.
+        * ``joint_N.pos`` in ``action`` → joint path. Per-joint targets are
+          clamped against ``config.max_relative_target`` (radians) and
+          issued via a non-blocking ``move_j``.
+        * Otherwise, the controller's measured state is echoed back and
+          nothing is commanded — useful for the idle frames of a record
+          loop.
 
         Returns the (clamped) action that was actually sent to the
         controller so the caller can log or compare it against the raw
@@ -507,6 +586,85 @@ class AgxArm(Robot):
         """
         arm = self.arm
         assert arm is not None  # guaranteed by ``check_if_not_connected``
+
+        if self.config.control_mode == "ee_pose" and "ee.x" in action:
+            return self._send_ee_pose_action(action)
+        if "joint_1.pos" in action:
+            return self._send_joint_action(action)
+
+        # No recognised control keys → idle frame, echo joints.
+        applied = self.get_joint_angles()
+        applied.update(self.get_gripper_position())
+        if self.config.control_gripper and self.effector is not None and "gripper.pos" in action:
+            try:
+                width_m = (
+                    float(np.clip(float(action["gripper.pos"]), 0.0, 1.0)) * self.config.gripper_max_range
+                )
+                self.effector.move_gripper_m(value=width_m, force=self.config.gripper_force)
+                applied["gripper.pos"] = float(action["gripper.pos"])
+            except Exception as e:
+                logger.warning("AgxArm.send_action: idle-frame gripper command failed: %s", e)
+        return applied
+
+    # ── Internal send-action helpers ──
+
+    def _send_ee_pose_action(self, action: RobotAction) -> RobotAction:
+        """Forward ``ee.{x,y,z,roll,pitch,yaw} + gripper.pos`` to ``move_p`` + gripper."""
+        arm = self.arm
+        assert arm is not None
+
+        try:
+            pose = (
+                float(action["ee.x"]),
+                float(action["ee.y"]),
+                float(action["ee.z"]),
+                float(action["ee.roll"]),
+                float(action["ee.pitch"]),
+                float(action["ee.yaw"]),
+            )
+        except (KeyError, TypeError, ValueError) as e:
+            raise TypeError(f"AgxArm._send_ee_pose_action: malformed ee pose action: {e}") from e
+
+        # Defence-in-depth per-frame rate limit. The XR pipeline already
+        # rate-limits via EEBoundsAndSafety; this protects callers that
+        # bypass that step (e.g. direct ``send_action`` from a policy).
+        present_pose = self.get_flange_pose()
+        dpos = np.array(pose[:3]) - np.array(present_pose[:3])
+        step_m = float(np.linalg.norm(dpos))
+        max_step = self.config.ee_max_step_m
+        if max_step > 0.0 and step_m > max_step:
+            scaled = np.array(present_pose[:3]) + dpos * (max_step / step_m)
+            pose = (float(scaled[0]), float(scaled[1]), float(scaled[2]), pose[3], pose[4], pose[5])
+            logger.warning(
+                "AgxArm: EE jump %.3fm > %.3fm; rate-limited to per-frame step.",
+                step_m,
+                max_step,
+            )
+
+        try:
+            arm.move_p(list(pose))
+        except Exception as e:
+            logger.warning("AgxArm._send_ee_pose_action: move_p failed: %s", e)
+
+        applied: dict[str, float] = {
+            f"ee.{axis}": float(pose[i]) for i, axis in enumerate(("x", "y", "z", "roll", "pitch", "yaw"))
+        }
+
+        if self.config.control_gripper and self.effector is not None and "gripper.pos" in action:
+            try:
+                width_m = (
+                    float(np.clip(float(action["gripper.pos"]), 0.0, 1.0)) * self.config.gripper_max_range
+                )
+                self.effector.move_gripper_m(value=width_m, force=self.config.gripper_force)
+                applied["gripper.pos"] = float(action["gripper.pos"])
+            except Exception as e:
+                logger.warning("AgxArm._send_ee_pose_action: gripper command failed: %s", e)
+        return applied
+
+    def _send_joint_action(self, action: RobotAction) -> RobotAction:
+        """Clamp ``joint_N.pos`` to ``max_relative_target`` and call ``move_j``."""
+        arm = self.arm
+        assert arm is not None
 
         present_dict = self.get_joint_angles()
         present = [present_dict[f"joint_{i + 1}.pos"] for i in range(self.N_JOINTS)]
@@ -543,8 +701,6 @@ class AgxArm(Robot):
         except Exception as e:
             logger.warning("AgxArm.send_action: move_j failed: %s", e)
 
-        # Gripper. The lerobot ``gripper.pos`` ∈ [0, 1] is mapped to the
-        # configured metre range; the SDK's move_gripper_m expects metres.
         applied_action: dict[str, float] = dict(present_dict)
         applied_action.update(safe)
         if self.config.control_gripper and self.effector is not None and "gripper.pos" in action:

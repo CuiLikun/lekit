@@ -25,12 +25,39 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+
 from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.processor import ProcessorStepRegistry, RobotActionProcessorStep
 from lerobot.types import RobotAction
 from lerobot.utils.rotation import Rotation
 
 from .base import _GRIPPER_MOTOR_SCALE
+
+
+def _matrix_to_rpy(matrix: np.ndarray) -> tuple[float, float, float]:
+    """Decompose a 3x3 rotation matrix into XYZ-Euler ``(roll, pitch, yaw)`` in radians.
+
+    Mirrors the AgileX SDK convention (XYZ intrinsic Euler, equivalent to
+    ``R = Rz(yaw) @ Ry(pitch) @ Rx(roll)``). Implemented inline (rather than
+    via scipy) to avoid pulling in a new top-level dependency for the
+    single use site.
+    """
+    r00, r01 = matrix[0, 0], matrix[0, 1]
+    r11 = matrix[1, 1]
+    r20, r21, r22 = matrix[2, 0], matrix[2, 1], matrix[2, 2]
+
+    # Pitch: clamp to the open interval (-pi/2, pi/2) so asin stays defined;
+    # gimbal lock clamps to ±pi/2 and falls back to atan2 for roll/yaw.
+    pitch = float(np.arcsin(max(-1.0, min(1.0, -r20))))
+    if abs(r20) < 1.0 - 1e-9:
+        roll = float(np.arctan2(r21, r22))
+        yaw = float(np.arctan2(matrix[1, 0], r00))
+    else:
+        # Gimbal lock: pick roll=0 and back out yaw from r01/r11.
+        roll = 0.0
+        yaw = float(np.arctan2(-r01, r11))
+    return roll, pitch, yaw
 
 
 @ProcessorStepRegistry.register("map_xr_controller_action_to_robot_action")
@@ -84,4 +111,56 @@ class MapXRControllerActionToRobotAction(RobotActionProcessorStep):
         ]:
             features[PipelineFeatureType.ACTION][feat] = PolicyFeature(type=FeatureType.ACTION, shape=(1,))
 
+        return features
+
+
+@ProcessorStepRegistry.register("map_ee_pose_rotvec_to_agx_arm_rpy")
+@dataclass
+class MapEEPoseRotVecToAgxArmRPY(RobotActionProcessorStep):
+    """Convert IK-pipeline rotvec outputs into the AgxArm ``move_p`` contract.
+
+    Sits after ``EEBoundsAndSafety`` when the follower is an
+    :class:`AgxArm` in ``control_mode="ee_pose"``. Drops the IK step
+    entirely (AgxArm's firmware handles IK internally via ``move_p``).
+
+    Per-frame it rewrites:
+
+    - ``ee.wx`` / ``ee.wy`` / ``ee.wz`` (rotvec, radians) → ``ee.roll`` /
+      ``ee.pitch`` / ``ee.yaw`` (XYZ-Euler radians; the AgileX SDK convention).
+    - ``ee.gripper_pos`` ∈ [0, 100] → ``gripper.pos`` ∈ [0, 1]
+      (``100 = open`` → ``1.0``; the AgxArm driver scales to metres in
+      :meth:`AgxArm.send_action`).
+
+    Pure (stateless, no ``isaacteleop``).
+    """
+
+    def action(self, action: RobotAction) -> RobotAction:
+        for key in ("ee.wx", "ee.wy", "ee.wz"):
+            if key not in action:
+                raise ValueError(
+                    f"MapEEPoseRotVecToAgxArmRPY.action: missing {key!r} (expected rotvec "
+                    "outputs from MapXRControllerActionToRobotAction + EEBoundsAndSafety)."
+                )
+        rotvec = np.array(
+            [float(action.pop("ee.wx")), float(action.pop("ee.wy")), float(action.pop("ee.wz"))],
+            dtype=float,
+        )
+        # rotvec → matrix → XYZ-Euler (AgileX SDK's move_p expects RPY).
+        matrix = Rotation.from_rotvec(rotvec).as_matrix()
+        action["ee.roll"], action["ee.pitch"], action["ee.yaw"] = _matrix_to_rpy(matrix)
+
+        if "ee.gripper_pos" in action:
+            action["gripper.pos"] = float(
+                np.clip(action.pop("ee.gripper_pos") / _GRIPPER_MOTOR_SCALE, 0.0, 1.0)
+            )
+        return action
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        action_features = features[PipelineFeatureType.ACTION]
+        for feat in ("ee.wx", "ee.wy", "ee.wz", "ee.gripper_pos"):
+            action_features.pop(feat, None)
+        for feat in ("ee.roll", "ee.pitch", "ee.yaw", "gripper.pos"):
+            action_features[feat] = PolicyFeature(type=FeatureType.ACTION, shape=(1,))
         return features

@@ -22,7 +22,8 @@ Runs ``teleoperate.py``'s control loop while also saving each frame to a LeRobot
 
 Usage::
 
-    # XR (VR) controller: clutch + soft-orientation IK
+    # XR (VR) controller + AgxArm ``control_mode="ee_pose"`` (default: move_p,
+    # bypasses host-side IK — the AgileX firmware handles IK internally).
     python -m examples.isaac_teleop_to_so101.record \\
         --robot.type=agx_arm \\
         --robot.arm_model=piper_x \\
@@ -30,6 +31,7 @@ Usage::
         --robot.channel=can0 \\
         --robot.interface=socketcan \\
         --robot.id=agx_arm_x \\
+        --robot.control_mode=ee_pose \\
         --teleop.type=xr_controller \\
         --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \\
         --dataset.repo_id=<hf_user>/<dataset_name> \\
@@ -38,11 +40,19 @@ Usage::
         --dataset.episode_time_s=20 \\
         --dataset.reset_time_s=5
 
+    # XR + AgxArm in ``control_mode="joints"`` (move_j + max_relative_target clamp).
+    # Same CLI as above but drop ``--robot.control_mode=ee_pose`` (the default is
+    # ``joints``). Useful when you want host-side IK or a joint-space policy.
+
     # SO-101 leader arm: 1:1 joint mirror (real leader on /dev/ttyACM1).
     # The leader plugin must be configured to stream joint names matching
     # ``AgxArm.motors`` (joint_1..joint_6 + gripper) for the mirror to apply.
+    # Only the ``joints`` control mode is wired up for the leader pipeline;
+    # ``ee_pose`` mode requires a pose-streaming leader plugin (not yet
+    # supported in this example).
     python -m examples.isaac_teleop_to_so101.record \\
         --robot.type=agx_arm --robot.channel=can0 --robot.id=agx_arm_x \\
+        --robot.control_mode=joints \\
         --teleop.type=so101_leader --teleop.port=/dev/ttyACM1 --teleop.id=so101_leader_arm \\
         --launch_plugin=/path/to/IsaacTeleop/install/plugins/so101_leader/so101_leader_plugin \\
         --dataset.repo_id=<hf_user>/<dataset_name> --dataset.single_task="Pick up the cube" \\
@@ -58,6 +68,8 @@ import logging
 import time
 from dataclasses import asdict, dataclass
 from pprint import pformat
+
+from rich import print
 
 from lerobot.cameras import CameraConfig  # noqa: F401
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
@@ -129,6 +141,7 @@ def _record_loop(
     robot,
     device: Device,
     motor_names: list[str],
+    action_keys: list[str],
     events: dict,
     fps: int,
     dataset: LeRobotDataset | None = None,
@@ -139,12 +152,18 @@ def _record_loop(
 
     When ``dataset`` is None the loop still controls the robot (so the operator
     can reposition the arm during the reset window) but does not record frames.
+
+    ``motor_names`` is the joint-name list (suffix-stripped) used only by joint-mode
+    callers (``HoldLatch`` no longer needs it). ``action_keys`` is the robot's full
+    action schema (joints + gripper for joint mode, ee.{x,y,z,...} + gripper for
+    AgxArm ee-pose mode) used to populate the held-pose dict during idle frames.
     """
     control_interval = 1.0 / fps
     timestamp = 0.0
     start_t = time.perf_counter()
     record_frames = dataset is not None
-    hold = HoldLatch(motor_names)
+    del motor_names  # kept for API back-compat; HoldLatch now uses action_keys
+    hold = HoldLatch(action_keys)
 
     while timestamp < control_time_s:
         loop_start = time.perf_counter()
@@ -167,8 +186,9 @@ def _record_loop(
         # latched on the active->idle edge.
         raw = device.compute(obs)
         action = hold.resolve(raw, obs)
-
-        logging.info(f"compute: {raw}\naction: {action}")
+        print(f"obs={obs}")
+        print(f"raw={raw}")
+        print(f"action={action}")
 
         robot.send_action(action)
 
@@ -250,10 +270,16 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         listener, events = init_keyboard_listener()
 
+        # Full action schema (joints + gripper for joint mode, ee.{x,y,z,...} + gripper
+        # for AgxArm ee-pose mode) so the HoldLatch re-sends a complete dict when the
+        # teleop device is idle.
+        action_keys = sorted(robot.action_features.keys())
+
         loop_kwargs = {
             "robot": robot,
             "device": device,
             "motor_names": motor_names,
+            "action_keys": action_keys,
             "events": events,
             "fps": cfg.dataset.fps,
             "single_task": cfg.dataset.single_task,
