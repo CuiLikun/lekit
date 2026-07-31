@@ -412,7 +412,10 @@ class AgxArm(Robot):
         try:
             if arm is not None and self.config.disable_torque_on_disconnect:
                 try:
-                    arm.disable()
+                    #! WARNING: make sure the arm is safely parked before calling disable()
+                    #! -- the arm will drop torque immediately and may fall if not supported.
+                    # arm.disable()
+                    ...
                 except Exception:
                     logger.debug("AgxArm: disable() during disconnect failed, ignoring.")
             if arm is not None:
@@ -469,6 +472,20 @@ class AgxArm(Robot):
             value = np.clip(value / self.config.gripper_max_range, 0.0, 1.0)
 
         return {"gripper.pos": float(value)}
+
+    def get_flange_pose(self) -> tuple:
+        """Read the flange pose (x, y, z, roll, pitch, yaw) in metres / radians.
+
+        Returns:
+            6-tuple of (x, y, z, roll, pitch, yaw) in metres / radians.
+        """
+        arm = self.arm
+        assert arm is not None  # guaranteed by ``check_if_not_connected``
+
+        fp = arm.get_flange_pose()
+        if fp is None:
+            return (0.0,) * 6
+        return tuple(float(v) for v in fp.msg)
 
     @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:
@@ -550,6 +567,15 @@ class AgxArm(Robot):
             raise RuntimeError("AgxArm: arm is not connected.")
         self.arm.move_j(list(joints))
 
+    def move_p(self, pose: list[float] | tuple[float, ...]) -> None:
+        """Cartesian-space ``move_p`` (x, y, z in metres; roll, pitch, yaw in radians).
+
+        Bypasses ``max_relative_target``.
+        """
+        if self.arm is None:
+            raise RuntimeError("AgxArm: arm is not connected.")
+        self.arm.move_p(list(pose))
+
     @check_if_not_connected
     def move_gripper_m(self, value: float, force: float | None = None) -> None:
         """Drive the gripper to ``value`` metres (closedness = 0 at ``0``)."""
@@ -585,4 +611,3 @@ if __name__ == "__main__":
         while True:
             time.sleep(1.0 / 30.0)
             obs = robot.get_observation()
-            print(obs)
