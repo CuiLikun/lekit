@@ -59,6 +59,7 @@ from lerobot.robots.so_follower.robot_kinematic_processor import (
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.constants import HF_LEROBOT_CALIBRATION, HF_LEROBOT_HOME, TELEOPERATORS
 from lerobot.utils.robot_utils import precise_sleep
+from src.hardwares.agx_arm import AgxArmConfig  # noqa: F401  (registers agx_arm)
 
 from .isaac_teleop import (
     Clutch,
@@ -572,18 +573,23 @@ def build_device(cfg: LoopConfig) -> tuple:
     if cfg.teleop.cloudxr_env_file is None:
         cfg.teleop.cloudxr_env_file = CLOUDXR_ENV_FILE
 
-    # SO-101/SO-100 (IK pipeline) or mock_robot (headless smoke test of the
-    # CloudXR + Isaac Teleop stack with no follower). The IK is SO-101-specific,
-    # so mock_robot is accepted only when it declares no motors -- otherwise the
-    # joint targets have nowhere to land.
-    supported_robots = {"so101_follower", "so100_follower", "mock_robot"}
+    # SO-101/SO-100 (IK pipeline) or AgxArm (joint mirroring; the IK is
+    # SO-101-URDF-specific, so ``agx_arm`` works with the leader pipeline only
+    # unless a Piper X URDF is provided to ``setup_xr``) or mock_robot (headless
+    # smoke test of the CloudXR + Isaac Teleop stack with no follower). mock_robot
+    # is accepted only when it declares no motors -- otherwise the joint targets
+    # have nowhere to land.
+    supported_robots = {"so101_follower", "so100_follower", "agx_arm", "mock_robot"}
     if cfg.robot.type not in supported_robots:
         raise ValueError(
-            f"This example only supports SO-101/SO-100 followers or mock_robot "
+            f"This example only supports SO-101/SO-100 followers, AgxArm, or mock_robot "
             f"({sorted(supported_robots)}), but got --robot.type={cfg.robot.type}."
         )
 
-    # The degree-based pipeline relies on --robot.use_degrees (default True).
+    # The SO-101/SO-100 degree-based pipeline relies on --robot.use_degrees (default True).
+    # AgxArm is radians-native, so the XR IK pipeline (SO-101 URDF) is not directly
+    # compatible; the leader pipeline mirrors joint names 1:1 and works as long as the
+    # leader plugin streams joint names matching AgxArm.motors.
     robot = make_robot_from_config(cfg.robot)
     # Connect FIRST so the startup slew and clutch-home seed can read live joints.
     robot.connect()

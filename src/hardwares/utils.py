@@ -16,6 +16,10 @@ def make_robot_from_config(config: RobotConfig) -> Robot:
             from src.hardwares.jaka_robot import JakaRobot
 
             return JakaRobot(config)
+        case "agx_arm":
+            from src.hardwares.agx_arm import AgxArm
+
+            return AgxArm(config)
 
     from lerobot.robots import make_robot_from_config as lerobot_make_robot_from_config
 

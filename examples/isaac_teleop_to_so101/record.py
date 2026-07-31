@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Record a LeRobot dataset via NVIDIA Isaac Teleop -> SO-101.
+"""Record a LeRobot dataset via NVIDIA Isaac Teleop -> AgxArm (AgileX Piper X).
 
 Runs ``teleoperate.py``'s control loop while also saving each frame to a LeRobot dataset.
 ``--teleop.type`` selects the device (``xr_controller`` | ``so101_leader``) as in
@@ -24,9 +24,12 @@ Usage::
 
     # XR (VR) controller: clutch + soft-orientation IK
     python -m examples.isaac_teleop_to_so101.record \\
-        --robot.type=so101_follower \\
-        --robot.port=/dev/ttyACM0 \\
-        --robot.id=so101_follower_arm \\
+        --robot.type=agx_arm \\
+        --robot.arm_model=piper_x \\
+        --robot.firmware_version=v188 \\
+        --robot.channel=can0 \\
+        --robot.interface=socketcan \\
+        --robot.id=agx_arm_x \\
         --teleop.type=xr_controller \\
         --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \\
         --dataset.repo_id=<hf_user>/<dataset_name> \\
@@ -35,9 +38,11 @@ Usage::
         --dataset.episode_time_s=20 \\
         --dataset.reset_time_s=5
 
-    # SO-101 leader arm: 1:1 joint mirror (real leader on /dev/ttyACM1)
+    # SO-101 leader arm: 1:1 joint mirror (real leader on /dev/ttyACM1).
+    # The leader plugin must be configured to stream joint names matching
+    # ``AgxArm.motors`` (joint_1..joint_6 + gripper) for the mirror to apply.
     python -m examples.isaac_teleop_to_so101.record \\
-        --robot.type=so101_follower --robot.port=/dev/ttyACM0 --robot.id=so101_follower_arm \\
+        --robot.type=agx_arm --robot.channel=can0 --robot.id=agx_arm_x \\
         --teleop.type=so101_leader --teleop.port=/dev/ttyACM1 --teleop.id=so101_leader_arm \\
         --launch_plugin=/path/to/IsaacTeleop/install/plugins/so101_leader/so101_leader_plugin \\
         --dataset.repo_id=<hf_user>/<dataset_name> --dataset.single_task="Pick up the cube" \\
@@ -68,12 +73,11 @@ from lerobot.datasets import (
 )
 from lerobot.processor import make_default_processors
 from lerobot.robots import RobotConfig
-from lerobot.robots.so_follower import SOFollowerConfig  # noqa: F401  (registers so101_follower)
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dicts
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging
-from src.hardwares import mock_robot  # noqa: F401  (registers mock_robot for headless XR smoke tests)
+from src.hardwares.agx_arm import AgxArmConfig  # noqa: F401  (registers agx_arm)
 
 from .common import (
     ALIGN_DURATION_S,
@@ -88,7 +92,7 @@ from .isaac_teleop import IsaacTeleopConfig
 
 @dataclass
 class RecordConfig:
-    """CLI config for Isaac Teleop -> SO-101 dataset recording.
+    """CLI config for Isaac Teleop -> AgxArm (AgileX Piper X) dataset recording.
 
     ``--robot.*`` / ``--teleop.*`` / ``--dataset.*`` configure the follower, device, and
     recording; the loop/launch knobs below carry the same ``[xr]`` / ``[leader]`` tags as
@@ -151,14 +155,20 @@ def _record_loop(
 
         obs = robot.get_observation()
 
+        logging.info(
+            f"obs type={type(obs).__name__} len={len(obs)} connected={robot.is_connected} "
+            f"keys={list(obs.keys())[:8]}... sample={dict(list(obs.items())[:3])}"
+        )
+
         if record_frames:
             observation_frame = build_dataset_frame(dataset.features, obs, prefix=OBS_STR)
 
         # Device idle (XR clutch disengaged, or leader stream stale) -> hold the pose
         # latched on the active->idle edge.
-        action = hold.resolve(device.compute(obs), obs)
+        raw = device.compute(obs)
+        action = hold.resolve(raw, obs)
 
-        logging.info(f"action: {action}")
+        logging.info(f"compute: {raw}\naction: {action}")
 
         robot.send_action(action)
 
@@ -179,6 +189,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     # Connect the follower, build the selected Isaac device, and run its pre-loop startup
     # (reset slew / leader align) — shared with teleoperate.py.
     robot, device, motor_names = build_device(cfg)
+    print(f"{robot=}")
+    print(f"{device=}")
+    print(f"{motor_names=}")
 
     # Build dataset feature spec.  The IK pipeline lives inside device.compute(), so the
     # action features are exactly robot.action_features (joint positions in degrees).
