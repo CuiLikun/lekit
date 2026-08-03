@@ -530,19 +530,11 @@ class AgxArm(Robot):
 
         return {"gripper.pos": float(value)}
 
-    def get_flange_pose(self) -> tuple:
-        """Read the flange pose (x, y, z, roll, pitch, yaw) in metres / radians.
-
-        Returns:
-            6-tuple of (x, y, z, roll, pitch, yaw) in metres / radians.
-        """
-        arm = self.arm
-        assert arm is not None  # guaranteed by ``check_if_not_connected``
-
-        fp = arm.get_flange_pose()
-        if fp is None:
-            return (0.0,) * 6
-        return tuple(float(v) for v in fp.msg)
+    @check_if_not_connected
+    def get_flange_pose(self) -> list[float]:
+        fp = self.arm.get_flange_pose()
+        assert fp is not None, "AgxArm.get_flange_pose: SDK returned None"
+        return [float(v) for v in fp.msg]
 
     @check_if_not_connected
     def get_ee_pose(self) -> dict[str, float]:
@@ -763,7 +755,25 @@ if __name__ == "__main__":
     )
     robot = AgxArm(cfg)
     print(robot)
+    fps = 10.0
     with robot:
+        step = 0
         while True:
-            time.sleep(1.0 / 30.0)
+            time.sleep(1.0 / fps)
             obs = robot.get_observation()
+            pos = robot.get_flange_pose()
+            new_pos = [p + 0.001 for p in pos]
+            with np.printoptions(precision=4, suppress=True):
+                print(f"step {step}: {np.array(new_pos)}")
+            robot.send_action(
+                {
+                    "ee.x": new_pos[0],
+                    "ee.y": new_pos[1],
+                    "ee.z": new_pos[2],
+                    "ee.roll": new_pos[3],
+                    "ee.pitch": new_pos[4],
+                    "ee.yaw": new_pos[5],
+                    "gripper.pos": 0.5,
+                }
+            )
+            step += 1
