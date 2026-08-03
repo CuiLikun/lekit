@@ -764,16 +764,16 @@ if __name__ == "__main__":
             pos = robot.get_flange_pose()
             new_pos = [p + 0.001 for p in pos]
             with np.printoptions(precision=4, suppress=True):
-                print(f"step {step}: {np.array(new_pos)}")
-            robot.send_action(
-                {
-                    "ee.x": new_pos[0],
-                    "ee.y": new_pos[1],
-                    "ee.z": new_pos[2],
-                    "ee.roll": new_pos[3],
-                    "ee.pitch": new_pos[4],
-                    "ee.yaw": new_pos[5],
-                    "gripper.pos": 0.5,
-                }
-            )
+                print(obs)
+            # robot.send_action(
+            #     {
+            #         "ee.x": new_pos[0],
+            #         "ee.y": new_pos[1],
+            #         "ee.z": new_pos[2],
+            #         "ee.roll": new_pos[3],
+            #         "ee.pitch": new_pos[4],
+            #         "ee.yaw": new_pos[5],
+            #         "gripper.pos": 0.5,
+            #     }
+            # )
             step += 1

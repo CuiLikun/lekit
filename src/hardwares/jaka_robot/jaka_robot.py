@@ -23,11 +23,14 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Any, ClassVar
 
 import numpy as np
+
 from lerobot.robots.config import RobotConfig
 from lerobot.robots.robot import Robot
 from lerobot.robots.utils import ensure_safe_goal_position
@@ -74,6 +77,11 @@ PROG_STOPPED, PROG_RUNNING, PROG_PAUSED = 0, 1, 2
 
 # Motion planner types for ``set_motion_planner``.
 PLANNER_DISABLED, PLANNER_T, PLANNER_S = -1, 0, 1
+
+# Servo Move timing and queue limits documented by JAKA SDK 1.7.2.
+SERVO_CYCLE_S = 0.008
+DEFAULT_SERVO_STEP_NUM = 4
+SERVO_QUEUE_MAX = 100
 
 # Selective subset of controller error codes — surfaces a helpful message
 # instead of an opaque ``ret[0]`` value. See the JAKA SDK Python docs for the
@@ -155,6 +163,13 @@ class JakaRobotConfig(RobotConfig):
     # ``set_block_wait_timeout`` value used for blocking ``*_move`` calls.
     block_wait_timeout_s: float = 10.0
 
+    # Servo Move frame period is ``servo_step_num * 8 ms``. The default four
+    # cycles correspond to a nominal 31.25 Hz controller command period.
+    servo_step_num: int = DEFAULT_SERVO_STEP_NUM
+
+    # Warn once when the SDK-reported Servo Move queue reaches this depth.
+    servo_queue_warn_depth: int = 80
+
     def __post_init__(self):
         # Parent ensures cameras (if any) declare width/height/fps. JAKA ships
         # with no cameras, so the loop is a no-op.
@@ -183,6 +198,13 @@ class JakaRobotConfig(RobotConfig):
             raise ValueError("JakaRobotConfig.user_frame_id must be in [0, 15].")
         if self.block_wait_timeout_s < 0.5:
             raise ValueError("JakaRobotConfig.block_wait_timeout_s must be >= 0.5.")
+        if not 1 <= self.servo_step_num <= DEFAULT_SERVO_STEP_NUM:
+            raise ValueError(
+                f"JakaRobotConfig.servo_step_num must be in [1, {DEFAULT_SERVO_STEP_NUM}] "
+                "to maintain a nominal rate of at least 30 Hz."
+            )
+        if not 1 <= self.servo_queue_warn_depth <= SERVO_QUEUE_MAX:
+            raise ValueError(f"JakaRobotConfig.servo_queue_warn_depth must be in [1, {SERVO_QUEUE_MAX}].")
 
 
 # ── Robot implementation ─────────────────────────────────────────────────────
@@ -221,6 +243,8 @@ class JakaRobot(Robot):
         self.config: JakaRobotConfig = config
         # Underlying SDK controller handle; populated in ``connect``.
         self.rc: Any | None = None
+        self._servo_active = False
+        self._servo_queue_warned = False
 
     # ── Feature schemas ──
 
@@ -303,12 +327,6 @@ class JakaRobot(Robot):
         self._check(self.rc.set_tool_id(self.config.tool_id))
         self._check(self.rc.set_user_frame_id(self.config.user_frame_id))
         self._check(self.rc.set_collision_level(self.config.collision_level))
-        # ``set_block_wait_timeout`` is deprecated but still respected by some
-        # firmware versions; ignore errors to stay forward-compatible.
-        try:
-            self._check(self.rc.set_block_wait_timeout(self.config.block_wait_timeout_s))
-        except JakaError:
-            logger.debug("JakaRobot: set_block_wait_timeout unsupported, ignoring.")
 
         self.configure()
         logger.info("JakaRobot[%s] connected and ready.", self.config.ip)
@@ -330,6 +348,13 @@ class JakaRobot(Robot):
         """Best-effort teardown: disable, log out, drop the handle."""
         rc = self.rc
         try:
+            if self._servo_active:
+                try:
+                    self._check(rc.servo_move_enable(False, True))
+                except JakaError as e:
+                    logger.warning("JakaRobot: could not exit servo mode during disconnect: %s", e)
+                finally:
+                    self._servo_active = False
             try:
                 # ``payload = (ctrl_errcode, errmsg, powered_on, enabled)``
                 payload = self._check(rc.get_robot_status_simple(), return_payload=True)
@@ -381,6 +406,70 @@ class JakaRobot(Robot):
         return None
 
     # ── Observation / Action ──
+
+    @check_if_not_connected
+    def get_eef_pose(self) -> np.ndarray:
+        """Return the actual end-effector pose as ``[x, y, z, rx, ry, rz]``.
+
+        Translation is expressed in metres and XYZ Euler angles in radians.
+        """
+        payload = self._check(self.rc.get_actual_tcp_position(), return_payload=True)
+        if len(payload) != len(self.TCP_AXES):
+            raise JakaError(
+                -1,
+                f"expected {len(self.TCP_AXES)} end-effector pose values, got {len(payload)}",
+                payload=payload,
+            )
+        try:
+            pose = np.asarray(payload, dtype=float).copy()
+        except (TypeError, ValueError) as e:
+            raise JakaError(-1, "end-effector pose contains non-numeric values", payload=payload) from e
+        pose[:3] /= 1000.0
+        return pose
+
+    @check_if_not_connected
+    def set_eef_pose(self, target: list[float] | tuple[float, ...] | np.ndarray) -> None:
+        """Move the end effector to ``[x, y, z, rx, ry, rz]``.
+
+        Translation is specified in metres and XYZ Euler angles in radians.
+        The target is executed as a blocking absolute Cartesian linear move.
+        """
+        try:
+            pose = np.asarray(target, dtype=float)
+        except (TypeError, ValueError) as e:
+            raise ValueError("target must contain six numeric pose values") from e
+        if pose.shape != (len(self.TCP_AXES),):
+            raise ValueError(f"target must have shape ({len(self.TCP_AXES)},), got {pose.shape}")
+        if not np.all(np.isfinite(pose)):
+            raise ValueError("target pose values must all be finite")
+
+        tcp_target = pose.copy()
+        tcp_target[:3] *= 1000.0
+        self.move_l(tcp_target, move_mode=ABS, is_block=True)
+
+    @check_if_not_connected
+    def move_eef_relative(
+        self, delta: list[float] | tuple[float, ...] | np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Move relative to the latest actual end-effector pose.
+
+        ``delta`` uses metres/radians. The method samples the actual TCP pose,
+        derives one absolute target from it, and executes a blocking linear
+        move so controller-side trajectory planning completes the point move.
+        """
+        try:
+            offset = np.asarray(delta, dtype=float)
+        except (TypeError, ValueError) as e:
+            raise ValueError("delta must contain six numeric pose values") from e
+        if offset.shape != (len(self.TCP_AXES),):
+            raise ValueError(f"delta must have shape ({len(self.TCP_AXES)},), got {offset.shape}")
+        if not np.all(np.isfinite(offset)):
+            raise ValueError("delta pose values must all be finite")
+
+        actual_pose = self.get_eef_pose()
+        target_pose = actual_pose + offset
+        self.set_eef_pose(target_pose)
+        return actual_pose, target_pose
 
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
@@ -475,13 +564,15 @@ class JakaRobot(Robot):
         # Filter down to the joints the caller is actually driving. Unknown
         # keys are ignored so the caller can pass arbitrary telemetry fields.
         goals: dict[str, float] = {}
-        for i, m in enumerate(self.motors):
+        for m in self.motors:
             key = f"{m}.pos"
             if key in action:
                 try:
                     goals[key] = float(action[key])
                 except (TypeError, ValueError) as e:
-                    raise TypeError(f"JakaRobot.send_action: action[{key!r}]={action[key]!r} is not numeric") from e
+                    raise TypeError(
+                        f"JakaRobot.send_action: action[{key!r}]={action[key]!r} is not numeric"
+                    ) from e
 
         if goals:
             safe = ensure_safe_goal_position(
@@ -818,34 +909,148 @@ class JakaRobot(Robot):
 
     # ── Servo-mode (fast closed-loop) commands ──
 
+    @staticmethod
+    def _validate_servo_step_num(step_num: int) -> int:
+        step = int(step_num)
+        if not 1 <= step <= DEFAULT_SERVO_STEP_NUM:
+            raise ValueError(
+                f"step_num must be in [1, {DEFAULT_SERVO_STEP_NUM}] to maintain "
+                "a nominal rate of at least 30 Hz"
+            )
+        return step
+
+    @staticmethod
+    def _validate_servo_target(target, name: str) -> np.ndarray:
+        try:
+            values = np.asarray(target, dtype=float)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"{name} must contain six numeric values") from e
+        if values.shape != (6,):
+            raise ValueError(f"{name} must have shape (6,), got {values.shape}")
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"{name} values must all be finite")
+        return values
+
+    def servo_frame_period_s(self, step_num: int | None = None) -> float:
+        """Return the nominal controller period for one Servo Move frame."""
+        step = self._validate_servo_step_num(self.config.servo_step_num if step_num is None else step_num)
+        return step * SERVO_CYCLE_S
+
+    @contextmanager
+    @check_if_not_connected
+    def servo_stream(self, step_num: int | None = None) -> Generator[float]:
+        """Enter Servo Move mode and yield its nominal frame period in seconds.
+
+        The caller must plan a smooth trajectory and continuously send frames;
+        this synchronous context manager does not run a loop or repeat targets.
+        Actual frequency depends on caller timing, SDK latency, and the network.
+        """
+        if self._servo_active:
+            raise RuntimeError("a JAKA Servo Move stream is already active")
+        period_s = self.servo_frame_period_s(step_num)
+        self._check(self.rc.servo_move_enable(True, True))
+        self._servo_active = True
+        self._servo_queue_warned = False
+        try:
+            yield period_s
+        finally:
+            self._servo_active = False
+            try:
+                self._check(self.rc.servo_move_enable(False, True))
+            except JakaError as e:
+                logger.warning("JakaRobot: could not exit Servo Move mode: %s", e)
+
     @check_if_not_connected
     def servo_enable(self, enable: bool = True) -> None:
-        """Toggle servo mode. Required before :meth:`servo_j` / :meth:`servo_p`."""
+        """Toggle raw Servo Move mode; prefer :meth:`servo_stream` for cleanup."""
         self._check(self.rc.servo_move_enable(bool(enable), True))
+        self._servo_active = bool(enable)
+        if enable:
+            self._servo_queue_warned = False
 
     @check_if_not_connected
     def is_in_servo(self) -> bool:
         return bool(self._check(self.rc.is_in_servomove(), return_payload=True)[0])
 
+    def _servo_queue_depth(self, ret) -> int | None:
+        payload = self._check(ret, return_payload=True)
+        if not payload:
+            return None
+        try:
+            queue_depth = int(payload[0])
+        except (TypeError, ValueError) as e:
+            raise JakaError(-1, "invalid Servo Move queue depth response", payload=payload) from e
+        if not 0 <= queue_depth <= SERVO_QUEUE_MAX:
+            raise JakaError(-1, f"invalid Servo Move queue depth: {queue_depth}", payload=payload)
+        if queue_depth >= self.config.servo_queue_warn_depth and not self._servo_queue_warned:
+            logger.warning(
+                "JakaRobot: Servo Move queue depth %d/%d; actual send rate may be too high",
+                queue_depth,
+                SERVO_QUEUE_MAX,
+            )
+            self._servo_queue_warned = True
+        return queue_depth
+
     @check_if_not_connected
     def servo_j(
         self,
-        joint_pos: list[float] | tuple[float, ...],
+        joint_pos: list[float] | tuple[float, ...] | np.ndarray,
         move_mode: int = ABS,
-        step_num: int = 1,
-    ) -> None:
-        """Push one joint-space servo target. Period = ``step_num * 8 ms``."""
-        self._check(self.rc.servo_j(tuple(joint_pos), int(move_mode), int(step_num)))
+        step_num: int | None = None,
+    ) -> int | None:
+        """Push one joint Servo Move frame in radians.
+
+        The caller must continuously call this method at the nominal period;
+        one frame alone has no useful effect. Both absolute and incremental
+        targets are supported.
+        """
+        if not self._servo_active:
+            raise RuntimeError("enter servo_stream() or call servo_enable(True) before servo_j()")
+        if move_mode not in (ABS, INCR):
+            raise ValueError(f"move_mode must be ABS ({ABS}) or INCR ({INCR})")
+        step = self._validate_servo_step_num(self.config.servo_step_num if step_num is None else step_num)
+        target = self._validate_servo_target(joint_pos, "joint_pos")
+        return self._servo_queue_depth(self.rc.servo_j(tuple(target), int(move_mode), step))
 
     @check_if_not_connected
     def servo_p(
         self,
-        tcp_pos: list[float] | tuple[float, ...],
+        tcp_pos: list[float] | tuple[float, ...] | np.ndarray,
         move_mode: int = ABS,
-        step_num: int = 1,
-    ) -> None:
-        """Push one Cartesian servo target (mm / rad)."""
-        self._check(self.rc.servo_p(tuple(tcp_pos), int(move_mode), int(step_num)))
+        step_num: int | None = None,
+    ) -> int | None:
+        """Push one raw Cartesian Servo Move frame in SDK mm/rad units."""
+        if not self._servo_active:
+            raise RuntimeError("enter servo_stream() or call servo_enable(True) before servo_p()")
+        if move_mode not in (ABS, INCR):
+            raise ValueError(f"move_mode must be ABS ({ABS}) or INCR ({INCR})")
+        step = self._validate_servo_step_num(self.config.servo_step_num if step_num is None else step_num)
+        target = self._validate_servo_target(tcp_pos, "tcp_pos")
+        return self._servo_queue_depth(self.rc.servo_p(tuple(target), int(move_mode), step))
+
+    def servo_joint_frame(
+        self,
+        joint_pos: list[float] | tuple[float, ...] | np.ndarray,
+        move_mode: int = ABS,
+        step_num: int | None = None,
+    ) -> int | None:
+        """Push one validated high-frequency joint target in radians."""
+        return self.servo_j(joint_pos, move_mode=move_mode, step_num=step_num)
+
+    def servo_eef_frame(
+        self,
+        pose: list[float] | tuple[float, ...] | np.ndarray,
+        move_mode: int = ABS,
+        step_num: int | None = None,
+    ) -> int | None:
+        """Push ``[x, y, z, rx, ry, rz]`` in metres/radians.
+
+        In incremental mode, XYZ values are per-frame metre deltas. The caller
+        must continuously stream a smooth trajectory at the nominal period.
+        """
+        target = self._validate_servo_target(pose, "pose").copy()
+        target[:3] *= 1000.0
+        return self.servo_p(target, move_mode=move_mode, step_num=step_num)
 
     # ── IO helpers (work on cabinet / tool / extended IO blocks) ──
 
@@ -947,6 +1152,7 @@ __all__ = [
     "COORD_BASE",
     "COORD_JOINT",
     "COORD_TOOL",
+    "DEFAULT_SERVO_STEP_NUM",
     "INCR",
     "IO_CABINET",
     "IO_EXTEND",
@@ -958,6 +1164,8 @@ __all__ = [
     "PROG_PAUSED",
     "PROG_RUNNING",
     "PROG_STOPPED",
+    "SERVO_CYCLE_S",
+    "SERVO_QUEUE_MAX",
     "JakaError",
     "JakaRobot",
     "JakaRobotConfig",
@@ -965,19 +1173,170 @@ __all__ = [
 
 
 if __name__ == "__main__":
+    import select
     import time
 
     logging.basicConfig(level=logging.INFO)
 
-    cfg = JakaRobotConfig(ip="192.168.1.31")
+    offset_m = 0.05
+    cfg = JakaRobotConfig(ip="192.168.1.31", auto_enable=True)
     robot = JakaRobot(cfg)
     print(robot)
     with robot:
         print("SDK:", robot.get_sdk_version())
-        for _ in range(5):
-            obs = robot.get_observation()
-            jp = np.array([obs[f"joint_{i + 1}.actual_pos"] for i in range(6)])
-            print(f"joints: {np.round(jp, 3)}")
-            cmd = {f"joint_{i + 1}.pos": jp[i] + 0.01 for i in range(6)}
-            robot.send_action(cmd)
-            time.sleep(0.1)
+        initial_pose = robot.get_eef_pose()
+        print(f"initial EEF pose (m/rad): {np.round(initial_pose, 4)}")
+
+        choice = (
+            input("Type MOVE for the waypoint test, KEYBOARD for keyboard teleop, anything else to quit: ")
+            .strip()
+            .upper()
+        )
+
+        if choice == "MOVE":
+            print(
+                "Motion path: origin -> up -> origin -> down -> origin -> left -> origin -> right -> origin"
+            )
+            print(f"Translation offset: {offset_m:.3f} m; linear speed: {cfg.default_speed_linear:.1f} mm/s")
+
+            waypoints = (
+                ("up", np.array([0.0, 0.0, offset_m, 0.0, 0.0, 0.0])),
+                ("origin", np.zeros(6)),
+                ("down", np.array([0.0, 0.0, -offset_m, 0.0, 0.0, 0.0])),
+                ("origin", np.zeros(6)),
+                ("left", np.array([0.0, offset_m, 0.0, 0.0, 0.0, 0.0])),
+                ("origin", np.zeros(6)),
+                ("right", np.array([0.0, -offset_m, 0.0, 0.0, 0.0, 0.0])),
+                ("origin", np.zeros(6)),
+            )
+
+            try:
+                for name, offset in waypoints:
+                    target = initial_pose + offset
+                    print(f"moving {name}: {np.round(target, 4)}")
+                    robot.set_eef_pose(target)
+                    actual = robot.get_eef_pose()
+                    print(f"reached {name}: {np.round(actual, 4)}")
+            except (JakaError, KeyboardInterrupt) as e:
+                print(f"Motion test interrupted: {e}")
+                try:
+                    robot.motion_abort()
+                    print("Attempting to return to the initial pose...")
+                    robot.set_eef_pose(initial_pose)
+                except (JakaError, KeyboardInterrupt) as return_error:
+                    print(f"Could not return to the initial pose: {return_error}")
+                raise
+
+            print("Motion test complete; EEF returned to the initial pose.")
+
+        elif choice == "KEYBOARD":
+            try:
+                import termios
+                import tty
+            except ImportError as e:
+                raise SystemExit("Terminal raw mode requires POSIX termios/tty (Linux/macOS).") from e
+
+            # One key event moves the TCP by this amount.
+            KEY_STEP_M = 0.005
+
+            def parse_key(buf: bytes) -> str | None:
+                """Decode a complete sequence read from a cbreak terminal."""
+                if not buf:
+                    return None
+                if buf == b"\x1b":
+                    return "esc"
+                if buf.startswith(b"\x1b[") and len(buf) >= 3:
+                    return {"A": "up", "B": "down", "C": "right", "D": "left"}.get(
+                        buf[2:3].decode("ascii", "ignore")
+                    )
+                if buf.startswith(b"\x1bO") and len(buf) >= 3:
+                    return {"A": "up", "B": "down", "C": "right", "D": "left"}.get(
+                        buf[2:3].decode("ascii", "ignore")
+                    )
+                ch = buf[:1].decode("ascii", "ignore").lower()
+                if ch in ("w", "a", "s", "d", "z", "c", "q"):
+                    return ch
+                return None
+
+            def read_key(fd: int) -> str | None:
+                """Non-blocking read of one key, returning its decoded name or None."""
+                r, _, _ = select.select([fd], [], [], 0)
+                if not r:
+                    return None
+                first = os.read(fd, 1)
+                if first == b"\x1b":
+                    r, _, _ = select.select([fd], [], [], 0.05)
+                    if not r:
+                        return "esc"
+                    second = os.read(fd, 1)
+                    if second == b"[" or second == b"O":
+                        r, _, _ = select.select([fd], [], [], 0.05)
+                        if not r:
+                            return "esc"
+                        third = os.read(fd, 1)
+                        return parse_key(b"\x1b" + second + third)
+                    return parse_key(b"\x1b" + second)
+                return parse_key(first)
+
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+            print(
+                "Keyboard teleop:\n"
+                "  arrows / wasd:  X/Y plane (base frame)\n"
+                "  z / c:          +Z / -Z\n"
+                "  q or ESC:       quit"
+            )
+            print(f"Step: {KEY_STEP_M * 1000:.1f} mm per key event")
+            print(f"Initial EEF pose (m/rad): {np.round(initial_pose, 4)}")
+
+            quit_requested = False
+            moves_sent = 0
+            target_pose = initial_pose.copy()
+            print(f"target (m/rad): {np.round(target_pose, 4)}")
+            try:
+                while not quit_requested:
+                    key = read_key(fd)
+                    if key is None:
+                        time.sleep(0.01)
+                        continue
+                    if key in ("q", "esc"):
+                        quit_requested = True
+                        break
+
+                    delta = np.zeros(6)
+                    if key == "up" or key == "w":
+                        delta[1] = -KEY_STEP_M
+                    elif key == "down" or key == "s":
+                        delta[1] = KEY_STEP_M
+                    elif key == "left" or key == "a":
+                        delta[0] = -KEY_STEP_M
+                    elif key == "right" or key == "d":
+                        delta[0] = KEY_STEP_M
+                    elif key == "z":
+                        delta[2] = KEY_STEP_M
+                    elif key == "c":
+                        delta[2] = -KEY_STEP_M
+
+                    if np.any(delta != 0):
+                        actual_pose, target_pose = robot.move_eef_relative(delta)
+                        moves_sent += 1
+                        print(
+                            f"key={key} actual(m/rad)={np.round(actual_pose, 4)} "
+                            f"delta(m)={np.round(delta, 4)} target(m/rad)={np.round(target_pose, 4)}"
+                        )
+            finally:
+                try:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                except termios.error:
+                    print(
+                        "Warning: could not restore terminal settings; you may need to reset your terminal."
+                    )
+                final_pose = robot.get_eef_pose()
+                print(f"Moves sent: {moves_sent}")
+                print(f"Final EEF pose (m/rad): {np.round(final_pose, 4)}")
+                print(f"Final target    (m/rad): {np.round(target_pose, 4)}")
+                if quit_requested:
+                    print("Keyboard teleop ended by user request.")
+        else:
+            print("No interaction selected; exiting.")
