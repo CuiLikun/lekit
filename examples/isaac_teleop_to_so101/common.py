@@ -60,7 +60,7 @@ from lerobot.robots.so_follower.robot_kinematic_processor import (
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.constants import HF_LEROBOT_CALIBRATION, HF_LEROBOT_HOME, TELEOPERATORS
 from lerobot.utils.robot_utils import precise_sleep
-from src.hardwares.agx_arm import AgxArmConfig  # noqa: F401  (registers agx_arm)
+from src.robots.agx_arm import AgxArmConfig  # noqa: F401  (registers agx_arm)
 
 from .isaac_teleop import (
     Clutch,
@@ -343,35 +343,30 @@ def _wait_for_xr_controller(teleop_device: XRController) -> None:
 def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
     """Build the XR controller device bundle (clutch + IK-or-move_p pipeline).
 
-    Dispatches on the follower's control backend:
+    Dispatches on the follower control backend:
 
-    * ``AgxArm`` — the AgileX firmware does IK internally via ``move_p``, so we
-      drop the URDF + host IK step and just rename ``ee.{wx,wy,wz}`` (rotvec)
-      to ``ee.{roll,pitch,yaw}`` (RPY) plus remap ``ee.gripper_pos``
-      (RANGE_0_100) → ``gripper.pos`` (∈ [0, 1]). No Piper X URDF ships with
-      this example, so even ``control_mode="joints"`` cannot run with the IK
-      pipeline (the URDF joint names would mismatch the AgxArm joint names).
-    * Otherwise (SO-101/SO-100/mocK_robot) — original IK pipeline:
-      URDF + soft-orientation IK back to joint targets.
+    * AgxArm and JakaRobot receive Cartesian RPY targets directly. Their
+      controller-side Cartesian interfaces handle the joint conversion, so no
+      host URDF or inverse-kinematics processor is constructed.
+    * SO-101, SO-100, and mock_robot retain the original URDF-based host IK
+      pipeline.
     """
     teleop_config = cfg.teleop  # XRControllerConfig (selected via --teleop.type=xr_controller)
     teleop_device = XRController(teleop_config)
 
-    # Detect the AgxArm backend. We always run the XR pipeline in EE-pose mode
-    # for AgxArm because no Piper X URDF is shipped — host-side IK would fail
-    # on the AgxArm's ``joint_1..joint_6`` names. To keep the dataset feature
-    # spec (built from ``robot.action_features``) consistent with the pipeline
-    # output, we force the config to ``control_mode="ee_pose"`` here and
-    # invalidate the cached action/observation feature dicts. This also makes
-    # ``send_action`` dispatch to ``move_p`` — exactly what we want for XR.
-    from src.hardwares.agx_arm import AgxArm
+    # Cartesian-native backends receive the clutch-rebased TCP target
+    # directly. Their action schemas must be switched before dataset features
+    # are inspected.
+    from src.robots.agx_arm import AgxArm
 
-    if isinstance(robot, AgxArm):
+    is_jaka = robot.name == "jaka_robot"
+    use_ee_pose = isinstance(robot, AgxArm) or is_jaka
+    if use_ee_pose:
         if robot.config.control_mode != "ee_pose":
             logger.warning(
-                "AgxArm + XR pipeline: forcing control_mode='ee_pose' "
-                "(AgileX firmware handles IK internally via move_p; this "
-                "example ships no Piper X URDF for host-side IK)."
+                "%s + XR pipeline: forcing control_mode='ee_pose' so the "
+                "controller receives Cartesian targets directly without host-side IK.",
+                type(robot).__name__,
             )
             robot.config.control_mode = "ee_pose"
         # Drop any already-computed action/observation feature dicts so they are
@@ -382,16 +377,19 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
         for cached in ("action_features", "observation_features"):
             robot.__dict__.pop(cached, None)
 
-    use_ee_pose = isinstance(robot, AgxArm)
+    def measured_eef_pose() -> tuple[float, float, float, float, float, float]:
+        if isinstance(robot, AgxArm):
+            return tuple(float(value) for value in robot.get_flange_pose())
+        return tuple(float(value) for value in robot.get_eef_pose())
 
     if use_ee_pose:
-        # No URDF, no host-side IK: just rename the rotvec EE pose into the
-        # RPY + normalised gripper schema that AgxArm.send_action expects.
+        # No URDF or host-side IK: map the quaternion-derived rotation
+        # vector to the Cartesian RPY action contract.
         pipeline = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
             steps=[
                 MapXRControllerActionToRobotAction(),
-                # Same bounds/rate-limit as the joint pipeline — defence in depth,
-                # even though the AgxArm driver applies its own ee_max_step_m.
+                # Shared workspace/rate bound; hardware drivers apply
+                # their own per-frame Cartesian limits as defence in depth.
                 EEBoundsAndSafety(
                     end_effector_bounds={"min": [-1.0, -1.0, 0.0], "max": [1.0, 1.0, 1.0]},
                     max_ee_step_m=MAX_EE_STEP_M,
@@ -454,7 +452,7 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
                 # current pose (no movement) so the user can manually pose the
                 # arm if they want a non-default start.
                 print(
-                    "Reset-to-origin is a no-op for AgxArm in ee_pose mode "
+                    "Reset-to-origin is a no-op for direct EE-pose control "
                     "(park the arm manually before the first episode)."
                 )
             else:
@@ -470,11 +468,14 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
         # is jump-free, whether or not a reset slew ran.
         obs0 = robot.get_observation()
         if use_ee_pose:
-            home_base_T_ee = _pose6_to_t(robot.get_flange_pose())  # noqa: N806
+            home_base_T_ee = _pose6_to_t(measured_eef_pose())  # noqa: N806
         else:
             q_measured_deg = np.array([float(obs0[f"{name}.pos"]) for name in motor_names], dtype=float)
             home_base_T_ee = kinematics_solver.forward_kinematics(q_measured_deg)  # noqa: N806
         clutch = Clutch(home_base_T_ee)
+
+        if is_jaka:
+            robot.servo_enable(True)
 
         print("Starting teleop loop. Squeeze and move the controller to teleoperate the robot...")
 
@@ -496,7 +497,7 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
         is_engage_frame = enabled and not prev_enabled
         if is_engage_frame:
             if use_ee_pose:
-                measured_base_T_ee = _pose6_to_t(robot.get_flange_pose())  # noqa: N806
+                measured_base_T_ee = _pose6_to_t(measured_eef_pose())  # noqa: N806
             else:
                 q_measured = np.array([float(robot_obs[f"{name}.pos"]) for name in motor_names], dtype=float)
                 measured_base_T_ee = kinematics_solver.forward_kinematics(q_measured)  # noqa: N806
@@ -520,7 +521,14 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
         }
         return pipeline((ee_action, robot_obs))
 
-    return Device(compute=compute, startup=startup, cleanup=teleop_device.disconnect)
+    def cleanup() -> None:
+        try:
+            if is_jaka and robot.is_connected and robot._servo_active:
+                robot.servo_enable(False)
+        finally:
+            teleop_device.disconnect()
+
+    return Device(compute=compute, startup=startup, cleanup=cleanup)
 
 
 # ============================================================================
@@ -691,10 +699,10 @@ def build_device(cfg: LoopConfig) -> tuple:
     # smoke test of the CloudXR + Isaac Teleop stack with no follower). mock_robot
     # is accepted only when it declares no motors -- otherwise the joint targets
     # have nowhere to land.
-    supported_robots = {"so101_follower", "so100_follower", "agx_arm", "mock_robot"}
+    supported_robots = {"so101_follower", "so100_follower", "agx_arm", "jaka_robot", "mock_robot"}
     if cfg.robot.type not in supported_robots:
         raise ValueError(
-            f"This example only supports SO-101/SO-100 followers, AgxArm, or mock_robot "
+            f"This example only supports SO-101/SO-100 followers, AgxArm, JakaRobot, or mock_robot "
             f"({sorted(supported_robots)}), but got --robot.type={cfg.robot.type}."
         )
 

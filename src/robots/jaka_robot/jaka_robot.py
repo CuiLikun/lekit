@@ -20,6 +20,8 @@ SDK reference (1.7.2 controller family).
 
 from __future__ import annotations
 
+import ctypes
+import importlib
 import logging
 import os
 import sys
@@ -45,12 +47,20 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 # launcher script already sets the variable and this is a no-op.
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 os.environ["LD_LIBRARY_PATH"] = f"{_script_dir}:{os.environ.get('LD_LIBRARY_PATH', '')}"
-# Add the directory to ``sys.path`` so the ``jkrc`` Python wrapper package
-# can be located by the import system.
 if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 
-import jkrc  # type: ignore[import-not-found]
+# Updating LD_LIBRARY_PATH after process startup does not affect the active
+# dynamic linker. Load the vendored API with global symbols before jkrc.so.
+_jaka_api_path = os.path.join(_script_dir, "libjakaAPI.so")
+try:
+    ctypes.CDLL(_jaka_api_path, mode=ctypes.RTLD_GLOBAL)
+except OSError as e:
+    raise ImportError(
+        f"Unable to load the vendored JAKA SDK library at {_jaka_api_path}: {e}"
+    ) from e
+
+jkrc = importlib.import_module("jkrc")
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +141,9 @@ class JakaRobotConfig(RobotConfig):
     # Controller IP address.
     ip: str = "192.168.1.31"
 
+    # Joint mode uses joint_move; ee_pose streams absolute servo_p targets.
+    control_mode: str = "joints"
+
     # Default joint-space motion (rad/s, rad/s²). Used when ``move_j`` callers
     # do not override ``speed`` / ``acc`` explicitly.
     default_speed_joint: float = 0.5
@@ -144,6 +157,10 @@ class JakaRobotConfig(RobotConfig):
     # differs from its current position by more than this magnitude is capped.
     # ``None`` disables clamping.
     max_relative_target: float | dict[str, float] | None = 0.05
+
+    # Per-frame Cartesian Servo Move limits.
+    max_eef_step_m: float = 0.01
+    max_eef_step_rad: float = 0.08
 
     # Whether ``connect()`` should also power-on and enable the servos so the
     # first ``send_action`` is immediately ready.
@@ -176,6 +193,8 @@ class JakaRobotConfig(RobotConfig):
         super().__post_init__()
         if not self.ip:
             raise ValueError("JakaRobotConfig.ip must not be empty.")
+        if self.control_mode not in ("joints", "ee_pose"):
+            raise ValueError("JakaRobotConfig.control_mode must be 'joints' or 'ee_pose'.")
         if self.default_speed_joint <= 0:
             raise ValueError("JakaRobotConfig.default_speed_joint must be positive.")
         if self.default_acc_joint <= 0:
@@ -190,6 +209,10 @@ class JakaRobotConfig(RobotConfig):
                 "JakaRobotConfig.max_relative_target must be a positive scalar or a "
                 "dict of motor_name -> positive scalar, or None to disable."
             )
+        if self.max_eef_step_m <= 0:
+            raise ValueError("JakaRobotConfig.max_eef_step_m must be positive.")
+        if self.max_eef_step_rad <= 0:
+            raise ValueError("JakaRobotConfig.max_eef_step_rad must be positive.")
         if not 0 <= self.collision_level <= 5:
             raise ValueError("JakaRobotConfig.collision_level must be in [0, 5].")
         if self.tool_id < 0 or self.tool_id > 15:
@@ -215,11 +238,10 @@ class JakaRobot(Robot):
 
     The class follows the standard :class:`lerobot.robots.robot.Robot`
     contract. ``get_observation`` returns the per-joint planned/actual
-    positions, the TCP pose, and a handful of status flags. ``send_action``
-    accepts a dict of per-joint target positions (radians), safety-clamps
-    them against the current state, and dispatches a non-blocking
-    incremental ``joint_move`` so successive calls can run at the policy
-    control rate without stalling.
+    positions, the TCP pose, and a handful of status flags. send_action
+    dispatches according to JakaRobotConfig.control_mode: joint mode uses
+    non-blocking incremental joint_move calls, while ee_pose mode streams
+    absolute Cartesian targets through servo_p.
 
     For low-level access (drag mode, drag-mode IO, sinusoidal jog, servo
     streams, …) the underlying :class:`jkrc.RC` methods are exposed as
@@ -235,6 +257,14 @@ class JakaRobot(Robot):
     N_JOINTS: ClassVar[int] = 6
     motors: ClassVar[list[str]] = [f"joint_{i + 1}" for i in range(N_JOINTS)]
     TCP_AXES: ClassVar[tuple[str, ...]] = ("x", "y", "z", "rx", "ry", "rz")
+    EEF_ACTION_KEYS: ClassVar[tuple[str, ...]] = (
+        "ee.x",
+        "ee.y",
+        "ee.z",
+        "ee.roll",
+        "ee.pitch",
+        "ee.yaw",
+    )
 
     # ── Construction ──
 
@@ -245,6 +275,7 @@ class JakaRobot(Robot):
         self.rc: Any | None = None
         self._servo_active = False
         self._servo_queue_warned = False
+        self._last_eef_command: np.ndarray | None = None
 
     # ── Feature schemas ──
 
@@ -256,6 +287,8 @@ class JakaRobot(Robot):
         for axis in self.TCP_AXES:
             features[f"tcp.{axis}"] = float
             features[f"tcp.actual_{axis}"] = float
+        for key in self.EEF_ACTION_KEYS:
+            features[key] = float
         features.update(
             {
                 "status.powered_on": float,
@@ -272,7 +305,9 @@ class JakaRobot(Robot):
 
     @cached_property
     def action_features(self) -> dict[str, Any]:
-        """Schema for the action dict ``send_action`` expects."""
+        """Schema for the action dict send_action expects."""
+        if self.config.control_mode == "ee_pose":
+            return dict.fromkeys(self.EEF_ACTION_KEYS, float)
         return {f"{m}.pos": float for m in self.motors}
 
     # ── Connection state ──
@@ -355,6 +390,7 @@ class JakaRobot(Robot):
                     logger.warning("JakaRobot: could not exit servo mode during disconnect: %s", e)
                 finally:
                     self._servo_active = False
+                    self._last_eef_command = None
             try:
                 # ``payload = (ctrl_errcode, errmsg, powered_on, enabled)``
                 payload = self._check(rc.get_robot_status_simple(), return_payload=True)
@@ -368,6 +404,7 @@ class JakaRobot(Robot):
             logger.warning("JakaRobot: error during disconnect: %s", e)
         finally:
             self.rc = None
+            self._last_eef_command = None
             logger.info("JakaRobot[%s] disconnected.", self.config.ip)
 
     # ── Return-tuple validation ──
@@ -531,6 +568,10 @@ class JakaRobot(Robot):
         for i, axis in enumerate(self.TCP_AXES):
             obs[f"tcp.{axis}"] = float(tcp[i])
             obs[f"tcp.actual_{axis}"] = float(tcp_actual[i])
+        actual_eef = np.asarray(tcp_actual, dtype=float).copy()
+        actual_eef[:3] /= 1000.0
+        for key, value in zip(self.EEF_ACTION_KEYS, actual_eef, strict=True):
+            obs[key] = float(value)
         obs["status.powered_on"] = powered_on
         obs["status.enabled"] = enabled
         obs["status.estop"] = estop
@@ -543,6 +584,12 @@ class JakaRobot(Robot):
 
     @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:
+        """Send one joint or Cartesian target according to control_mode."""
+        if self.config.control_mode == "ee_pose":
+            return self._send_eef_action(action)
+        return self._send_joint_action(action)
+
+    def _send_joint_action(self, action: RobotAction) -> RobotAction:
         """Drive each named joint toward ``action[m]`` via incremental joint moves.
 
         Steps:
@@ -596,7 +643,54 @@ class JakaRobot(Robot):
         # result has the same shape as ``action_features``.
         return {**present, **safe}
 
-    # ── Direct motion commands (bypass the per-step safety clamp) ──
+    def _send_eef_action(self, action: RobotAction) -> RobotAction:
+        """Stream one absolute Cartesian Servo Move target in metres/radians."""
+        if not self._servo_active:
+            raise RuntimeError(
+                "JakaRobot ee_pose control requires Servo Move mode; call "
+                "servo_enable(True) before send_action()"
+            )
+
+        reference = (
+            self.get_eef_pose()
+            if self._last_eef_command is None
+            else self._last_eef_command.copy()
+        )
+        target = reference.copy()
+
+        for index, key in enumerate(self.EEF_ACTION_KEYS):
+            if key not in action:
+                continue
+            try:
+                value = float(action[key])
+            except (TypeError, ValueError) as e:
+                raise TypeError(
+                    f"JakaRobot.send_action: action[{key!r}]={action[key]!r} is not numeric"
+                ) from e
+            if not np.isfinite(value):
+                raise ValueError(f"JakaRobot.send_action: action[{key!r}] must be finite")
+            target[index] = value
+
+        translation_delta = target[:3] - reference[:3]
+        translation_norm = float(np.linalg.norm(translation_delta))
+        if translation_norm > self.config.max_eef_step_m:
+            translation_delta *= self.config.max_eef_step_m / translation_norm
+        target[:3] = reference[:3] + translation_delta
+
+        rotation_delta = (target[3:] - reference[3:] + np.pi) % (2.0 * np.pi) - np.pi
+        rotation_norm = float(np.linalg.norm(rotation_delta))
+        if rotation_norm > self.config.max_eef_step_rad:
+            rotation_delta *= self.config.max_eef_step_rad / rotation_norm
+        target[3:] = reference[3:] + rotation_delta
+
+        self.servo_eef_frame(target, move_mode=ABS, step_num=self.config.servo_step_num)
+        self._last_eef_command = target
+        return {
+            key: float(value)
+            for key, value in zip(self.EEF_ACTION_KEYS, target, strict=True)
+        }
+
+    # Direct motion commands bypass the per-step safety clamp.
 
     @check_if_not_connected
     def move_j(
@@ -951,10 +1045,12 @@ class JakaRobot(Robot):
         self._check(self.rc.servo_move_enable(True, True))
         self._servo_active = True
         self._servo_queue_warned = False
+        self._last_eef_command = None
         try:
             yield period_s
         finally:
             self._servo_active = False
+            self._last_eef_command = None
             try:
                 self._check(self.rc.servo_move_enable(False, True))
             except JakaError as e:
@@ -965,6 +1061,7 @@ class JakaRobot(Robot):
         """Toggle raw Servo Move mode; prefer :meth:`servo_stream` for cleanup."""
         self._check(self.rc.servo_move_enable(bool(enable), True))
         self._servo_active = bool(enable)
+        self._last_eef_command = None
         if enable:
             self._servo_queue_warned = False
 

@@ -14,54 +14,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Record a LeRobot dataset via NVIDIA Isaac Teleop -> AgxArm (AgileX Piper X).
+"""Record a LeRobot dataset via NVIDIA Isaac Teleop to JAKA.
 
-Runs ``teleoperate.py``'s control loop while also saving each frame to a LeRobot dataset.
-``--teleop.type`` selects the device (``xr_controller`` | ``so101_leader``) as in
-``teleoperate.py``.
+The XR controller is clutch-rebased onto the measured JAKA TCP pose. Every
+active frame becomes an absolute x/y/z/roll/pitch/yaw target in metres and
+radians and is sent with the JAKA SDK Cartesian Servo Move interface servo_p.
+No host-side inverse kinematics is constructed or called.
 
-Usage::
+The official SDK requires Servo Move to be enabled before streaming,
+continuous frames at step_num times 8 ms, and Servo Move to be disabled on
+exit. The shared device layer performs that lifecycle; this recorder stores
+the post-limit pose actually sent by JakaRobot.send_action.
 
-    # XR (VR) controller + AgxArm ``control_mode="ee_pose"`` (default: move_p,
-    # bypasses host-side IK — the AgileX firmware handles IK internally).
-    python -m examples.isaac_teleop_to_so101.record \\
-        --robot.type=agx_arm \\
-        --robot.arm_model=piper_x \\
-        --robot.firmware_version=v188 \\
-        --robot.channel=can0 \\
-        --robot.interface=socketcan \\
-        --robot.id=agx_arm_x \\
-        --robot.control_mode=ee_pose \\
-        --teleop.type=xr_controller \\
-        --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \\
-        --dataset.repo_id=<hf_user>/<dataset_name> \\
-        --dataset.single_task="Pick up vial from rack on the left side" \\
-        --dataset.num_episodes=3 \\
-        --dataset.episode_time_s=20 \\
+Usage:
+
+    python -m examples.isaac_teleop_to_jaka.record \
+        --robot.type=jaka_robot \
+        --robot.ip=192.168.1.31 \
+        --robot.id=jaka_arm \
+        --robot.control_mode=ee_pose \
+        --robot.servo_step_num=4 \
+        --teleop.type=xr_controller \
+        --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
+        --dataset.repo_id=<hf_user>/<dataset_name> \
+        --dataset.single_task="Pick up the object" \
+        --dataset.fps=30 \
+        --dataset.num_episodes=3 \
+        --dataset.episode_time_s=20 \
         --dataset.reset_time_s=5
 
-    # XR + AgxArm in ``control_mode="joints"`` (move_j + max_relative_target clamp).
-    # Same CLI as above but drop ``--robot.control_mode=ee_pose`` (the default is
-    # ``joints``). Useful when you want host-side IK or a joint-space policy.
-
-    # SO-101 leader arm: 1:1 joint mirror (real leader on /dev/ttyACM1).
-    # The leader plugin must be configured to stream joint names matching
-    # ``AgxArm.motors`` (joint_1..joint_6 + gripper) for the mirror to apply.
-    # Only the ``joints`` control mode is wired up for the leader pipeline;
-    # ``ee_pose`` mode requires a pose-streaming leader plugin (not yet
-    # supported in this example).
-    python -m examples.isaac_teleop_to_so101.record \\
-        --robot.type=agx_arm --robot.channel=can0 --robot.id=agx_arm_x \\
-        --robot.control_mode=joints \\
-        --teleop.type=so101_leader --teleop.port=/dev/ttyACM1 --teleop.id=so101_leader_arm \\
-        --launch_plugin=/path/to/IsaacTeleop/install/plugins/so101_leader/so101_leader_plugin \\
-        --dataset.repo_id=<hf_user>/<dataset_name> --dataset.single_task="Pick up the cube" \\
-        --dataset.num_episodes=3 --dataset.episode_time_s=20 --dataset.reset_time_s=5
-
-The loop/launch knobs mirror ``teleoperate.py`` (tagged ``[xr]`` / ``[leader]`` below).
-
-Keyboard shortcuts: Right/n = end episode early and save, Left/r = discard + re-record,
-Esc/q = stop after the current episode. All frames are recorded (including hold frames).
+Keyboard shortcuts: Right/n ends and saves the current episode, Left/r
+discards and re-records it, and Esc/q stops after the current episode.
+All frames, including clutch-disengaged hold frames, are recorded.
 """
 
 import logging
@@ -69,9 +53,18 @@ import time
 from dataclasses import asdict, dataclass
 from pprint import pformat
 
-from rich import print
-from src.hardwares.agx_arm import AgxArmConfig  # noqa: F401  (registers agx_arm)
-
+from examples.isaac_teleop_to_so101.common import (
+    ALIGN_DURATION_S,
+    RESET_DURATION_S,
+    Device,
+    HoldLatch,
+    build_device,
+    init_keyboard_listener,
+)
+from examples.isaac_teleop_to_so101.isaac_teleop import (
+    IsaacTeleopConfig,
+    XRControllerConfig,
+)
 from lerobot.cameras import CameraConfig  # noqa: F401
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.common.control_utils import sanity_check_dataset_robot_compatibility
@@ -90,21 +83,12 @@ from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dicts
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging
-
-from .common import (
-    ALIGN_DURATION_S,
-    RESET_DURATION_S,
-    Device,
-    HoldLatch,
-    build_device,
-    init_keyboard_listener,
-)
-from .isaac_teleop import IsaacTeleopConfig
+from src.robots.jaka_robot import JakaRobotConfig
 
 
 @dataclass
 class RecordConfig:
-    """CLI config for Isaac Teleop -> AgxArm (AgileX Piper X) dataset recording.
+    """CLI config for Isaac Teleop to JAKA Cartesian dataset recording.
 
     ``--robot.*`` / ``--teleop.*`` / ``--dataset.*`` configure the follower, device, and
     recording; the loop/launch knobs below carry the same ``[xr]`` / ``[leader]`` tags as
@@ -148,15 +132,12 @@ def _record_loop(
     control_time_s: float = 0.0,
     single_task: str | None = None,
 ) -> None:
-    """Run one episode (or reset phase) of the control loop.
+    """Run one episode or reset phase of the Cartesian control loop.
 
-    When ``dataset`` is None the loop still controls the robot (so the operator
-    can reposition the arm during the reset window) but does not record frames.
-
-    ``motor_names`` is the joint-name list (suffix-stripped) used only by joint-mode
-    callers (``HoldLatch`` no longer needs it). ``action_keys`` is the robot's full
-    action schema (joints + gripper for joint mode, ee.{x,y,z,...} + gripper for
-    AgxArm ee-pose mode) used to populate the held-pose dict during idle frames.
+    When dataset is None the loop still controls the robot so the operator can
+    reposition during reset, but frames are not recorded. motor_names is kept
+    only for compatibility with the shared device builder. action_keys holds
+    the six JAKA Cartesian fields used for clutch-disengaged hold frames.
     """
     control_interval = 1.0 / fps
     timestamp = 0.0
@@ -174,26 +155,16 @@ def _record_loop(
 
         obs = robot.get_observation()
 
-        logging.info(
-            f"obs type={type(obs).__name__} len={len(obs)} connected={robot.is_connected} "
-            f"keys={list(obs.keys())[:8]}... sample={dict(list(obs.items())[:3])}"
-        )
-
         if record_frames:
             observation_frame = build_dataset_frame(dataset.features, obs, prefix=OBS_STR)
 
-        # Device idle (XR clutch disengaged, or leader stream stale) -> hold the pose
-        # latched on the active->idle edge.
+        # XR clutch disengaged: hold the TCP pose latched on the idle edge.
         raw = device.compute(obs)
         action = hold.resolve(raw, obs)
-        print(f"obs={obs}")
-        print(f"raw={raw}")
-        print(f"action={action}")
-
-        robot.send_action(action)
+        sent_action = robot.send_action(action)
 
         if record_frames:
-            action_frame = build_dataset_frame(dataset.features, action, prefix=ACTION)
+            action_frame = build_dataset_frame(dataset.features, sent_action, prefix=ACTION)
             dataset.add_frame({**observation_frame, **action_frame, "task": single_task})
 
         dt_s = time.perf_counter() - loop_start
@@ -203,18 +174,35 @@ def _record_loop(
 
 @parser.wrap()
 def record(cfg: RecordConfig) -> LeRobotDataset:
+    if not isinstance(cfg.robot, JakaRobotConfig):
+        raise ValueError("isaac_teleop_to_jaka.record requires --robot.type=jaka_robot")
+    if not isinstance(cfg.teleop, XRControllerConfig):
+        raise ValueError("isaac_teleop_to_jaka.record supports only --teleop.type=xr_controller")
+    if cfg.robot.user_frame_id != 0:
+        raise ValueError(
+            "isaac_teleop_to_jaka.record requires --robot.user_frame_id=0 "
+            "because the default XR transform targets the robot base frame"
+        )
+
+    cfg.robot.control_mode = "ee_pose"
+    nominal_fps = 1.0 / (cfg.robot.servo_step_num * 0.008)
+    relative_fps_error = abs(float(cfg.dataset.fps) - nominal_fps) / nominal_fps
+    if relative_fps_error > 0.1:
+        raise ValueError(
+            f"--dataset.fps={cfg.dataset.fps} does not match JAKA Servo Move "
+            f"step_num={cfg.robot.servo_step_num} ({nominal_fps:.2f} Hz); "
+            "keep the difference within 10% (use fps=30 with step_num=4)."
+        )
+
     init_logging()
     logging.info(pformat(asdict(cfg)))
 
     # Connect the follower, build the selected Isaac device, and run its pre-loop startup
     # (reset slew / leader align) — shared with teleoperate.py.
     robot, device, motor_names = build_device(cfg)
-    print(f"{robot=}")
-    print(f"{device=}")
-    print(f"{motor_names=}")
 
-    # Build dataset feature spec.  The IK pipeline lives inside device.compute(), so the
-    # action features are exactly robot.action_features (joint positions in degrees).
+    # The XR device computes Cartesian targets directly. No host-side IK
+    # processor is constructed; dataset actions match robot.action_features.
     teleop_proc, _, obs_proc = make_default_processors()
     dataset_features = combine_feature_dicts(
         aggregate_pipeline_dataset_features(
@@ -270,9 +258,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         listener, events = init_keyboard_listener()
 
-        # Full action schema (joints + gripper for joint mode, ee.{x,y,z,...} + gripper
-        # for AgxArm ee-pose mode) so the HoldLatch re-sends a complete dict when the
-        # teleop device is idle.
+        # HoldLatch re-sends a complete Cartesian target while the clutch is idle.
         action_keys = sorted(robot.action_features.keys())
 
         loop_kwargs = {
