@@ -49,8 +49,32 @@ python -m examples.isaac_teleop_to_jaka.record \
 ~~~
 
 Hold the controller squeeze to engage motion. Releasing it holds the measured
-TCP pose. The trigger is currently ignored because the JAKA driver does not
-declare a gripper action.
+TCP pose. The trigger produces a normalized `gripper.pos` command where `0`
+means closed and `1` means open.
+
+The driver always records `gripper.pos`, but analog input and output are
+disabled by default because JAKA controllers and grippers can use different
+channels and electrical ranges. After verifying the wiring, configure feedback
+and control independently. For example, a cabinet AI0/AO0 mapped over 0-10 V:
+
+~~~bash
+    --robot.gripper_analog_input_enabled=true \
+    --robot.gripper_analog_output_enabled=true \
+    --robot.gripper_analog_input_iotype=0 \
+    --robot.gripper_analog_input_index=0 \
+    --robot.gripper_analog_output_iotype=0 \
+    --robot.gripper_analog_output_index=0 \
+    --robot.gripper_analog_input_min=0.0 \
+    --robot.gripper_analog_input_max=10.0 \
+    --robot.gripper_analog_output_min=0.0 \
+    --robot.gripper_analog_output_max=10.0
+~~~
+
+JAKA SDK IO types are `0` for cabinet, `1` for tool, and `2` for extension IO.
+Use the corresponding `*_inverted=true` option when the physical signal uses
+the opposite open/closed direction. The SDK documentation does not define one
+universal analog range, so use the gripper and controller electrical manuals
+instead of assuming the example's 0-10 V range.
 
 Before running, verify the tool frame, user frame, payload, collision level,
 workspace clearance, and emergency stop. The script powers on, enables, and

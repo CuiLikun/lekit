@@ -717,8 +717,12 @@ def build_device(cfg: LoopConfig) -> tuple:
     # disconnect the follower on any failure to avoid leaking the connection.
     device: Device | None = None
     try:
-        # Joint names in action order, read from {name}.pos action features (robot-agnostic).
-        motor_names = [key.removesuffix(".pos") for key in robot.action_features if key.endswith(".pos")]
+        # JAKA exposes joints, gripper, and EE pose in one fixed action schema;
+        # only its six physical joint names belong in joint-space setup paths.
+        if robot.name == "jaka_robot":
+            motor_names = list(robot.motors)
+        else:
+            motor_names = [key.removesuffix(".pos") for key in robot.action_features if key.endswith(".pos")]
 
         if isinstance(cfg.teleop, SO101LeaderArmConfig):
             device = setup_leader(cfg, robot, motor_names)

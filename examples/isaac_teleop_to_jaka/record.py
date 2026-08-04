@@ -137,8 +137,8 @@ def _record_loop(
 
     Actions are printed and recorded but never sent to the robot. When dataset
     is None, frames are not recorded. motor_names is kept only for
-    compatibility with the shared device builder. action_keys holds the six
-    JAKA Cartesian fields used for clutch-disengaged hold frames.
+    compatibility with the shared device builder. action_keys holds JAKA's
+    fixed joint, gripper, and Cartesian schema for clutch-disengaged holds.
     """
     control_interval = 1.0 / fps
     timestamp = 0.0

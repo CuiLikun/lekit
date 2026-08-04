@@ -26,7 +26,7 @@ import logging
 import os
 import sys
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from functools import cached_property
 from typing import Any, ClassVar
@@ -146,6 +146,24 @@ class JakaRobotConfig(RobotConfig):
     # Joint mode uses joint_move; ee_pose streams absolute servo_p targets.
     control_mode: str = "joints"
 
+    # Optional analog gripper integration. JAKA's SDK exposes analog input
+    # feedback and analog output commands, but the electrical range and channel
+    # depend on the installed gripper/controller wiring. Both directions are
+    # disabled by default so connecting the arm never changes an unknown AO.
+    gripper_analog_input_enabled: bool = False
+    gripper_analog_output_enabled: bool = False
+    gripper_analog_input_iotype: int = IO_CABINET
+    gripper_analog_input_index: int = 0
+    gripper_analog_output_iotype: int = IO_CABINET
+    gripper_analog_output_index: int = 0
+    gripper_analog_input_min: float = 0.0
+    gripper_analog_input_max: float = 10.0
+    gripper_analog_output_min: float = 0.0
+    gripper_analog_output_max: float = 10.0
+    gripper_analog_input_inverted: bool = False
+    gripper_analog_output_inverted: bool = False
+    gripper_fallback_position: float = 0.0
+
     # Default joint-space motion (rad/s, rad/s²). Used when ``move_j`` callers
     # do not override ``speed`` / ``acc`` explicitly.
     default_speed_joint: float = 0.5
@@ -197,6 +215,36 @@ class JakaRobotConfig(RobotConfig):
             raise ValueError("JakaRobotConfig.ip must not be empty.")
         if self.control_mode not in ("joints", "ee_pose"):
             raise ValueError("JakaRobotConfig.control_mode must be 'joints' or 'ee_pose'.")
+        for field_name, iotype in (
+            ("gripper_analog_input_iotype", self.gripper_analog_input_iotype),
+            ("gripper_analog_output_iotype", self.gripper_analog_output_iotype),
+        ):
+            if iotype not in (IO_CABINET, IO_TOOL, IO_EXTEND):
+                raise ValueError(
+                    f"JakaRobotConfig.{field_name} must be 0 (cabinet), 1 (tool), or 2 (extend)."
+                )
+        if self.gripper_analog_input_index < 0:
+            raise ValueError("JakaRobotConfig.gripper_analog_input_index must be non-negative.")
+        if self.gripper_analog_output_index < 0:
+            raise ValueError("JakaRobotConfig.gripper_analog_output_index must be non-negative.")
+        analog_limits = (
+            self.gripper_analog_input_min,
+            self.gripper_analog_input_max,
+            self.gripper_analog_output_min,
+            self.gripper_analog_output_max,
+        )
+        if not all(np.isfinite(limit) for limit in analog_limits):
+            raise ValueError("JakaRobotConfig gripper analog limits must all be finite.")
+        if self.gripper_analog_input_max <= self.gripper_analog_input_min:
+            raise ValueError(
+                "JakaRobotConfig.gripper_analog_input_max must be greater than gripper_analog_input_min."
+            )
+        if self.gripper_analog_output_max <= self.gripper_analog_output_min:
+            raise ValueError(
+                "JakaRobotConfig.gripper_analog_output_max must be greater than gripper_analog_output_min."
+            )
+        if not 0.0 <= self.gripper_fallback_position <= 1.0:
+            raise ValueError("JakaRobotConfig.gripper_fallback_position must be in [0, 1].")
         if self.default_speed_joint <= 0:
             raise ValueError("JakaRobotConfig.default_speed_joint must be positive.")
         if self.default_acc_joint <= 0:
@@ -239,11 +287,12 @@ class JakaRobot(Robot):
     """LeRobot-compatible JAKA 6-DOF robotic arm driver.
 
     The class follows the standard :class:`lerobot.robots.robot.Robot`
-    contract. ``get_observation`` returns the per-joint planned/actual
-    positions, the TCP pose, and a handful of status flags. send_action
-    dispatches according to JakaRobotConfig.control_mode: joint mode uses
-    non-blocking incremental joint_move calls, while ee_pose mode streams
-    absolute Cartesian targets through servo_p.
+    contract. ``get_observation`` always returns six measured joint positions,
+    normalized gripper feedback, and the measured TCP pose. ``send_action``
+    accepts that same fixed arm-state schema regardless of control mode: joint
+    mode executes the joint fields, while ee_pose mode streams the Cartesian
+    fields through servo_p. The inactive representation is recorded from the
+    controller's measured state.
 
     For low-level access (drag mode, drag-mode IO, sinusoidal jog, servo
     streams, …) the underlying :class:`jkrc.RC` methods are exposed as
@@ -284,14 +333,15 @@ class JakaRobot(Robot):
 
     @cached_property
     def observation_features(self) -> dict[str, Any]:
-        """Schema for everything ``get_observation`` emits."""
+        """Measured joints, gripper, end-effector pose, and camera frames."""
         features: dict[str, Any] = {f"{m}.pos": float for m in self.motors}
+        features["gripper.pos"] = float
+        for key in self.EEF_ACTION_KEYS:
+            features[key] = float
         features.update({f"{m}.actual_pos": float for m in self.motors})
         for axis in self.TCP_AXES:
             features[f"tcp.{axis}"] = float
             features[f"tcp.actual_{axis}"] = float
-        for key in self.EEF_ACTION_KEYS:
-            features[key] = float
         for camera_name, camera in self.cameras.items():
             if getattr(camera, "use_rgb", True):
                 features[camera_name] = (camera.height, camera.width, 3)
@@ -313,10 +363,11 @@ class JakaRobot(Robot):
 
     @cached_property
     def action_features(self) -> dict[str, Any]:
-        """Schema for the action dict send_action expects."""
-        if self.config.control_mode == "ee_pose":
-            return dict.fromkeys(self.EEF_ACTION_KEYS, float)
-        return {f"{m}.pos": float for m in self.motors}
+        """Fixed joint, gripper, and Cartesian action schema."""
+        features: dict[str, Any] = {f"{m}.pos": float for m in self.motors}
+        features["gripper.pos"] = float
+        features.update(dict.fromkeys(self.EEF_ACTION_KEYS, float))
+        return features
 
     # ── Connection state ──
 
@@ -530,70 +581,129 @@ class JakaRobot(Robot):
         self.set_eef_pose(target_pose)
         return actual_pose, target_pose
 
+    def _get_actual_joint_positions(self) -> dict[str, float]:
+        payload = self._check(self.rc.get_actual_joint_position(), return_payload=True)
+        if len(payload) != self.N_JOINTS:
+            raise JakaError(
+                -1,
+                f"expected {self.N_JOINTS} joint positions, got {len(payload)}",
+                payload=payload,
+            )
+        try:
+            positions = np.asarray(payload, dtype=float)
+        except (TypeError, ValueError) as e:
+            raise JakaError(-1, "joint positions contain non-numeric values", payload=payload) from e
+        if not np.all(np.isfinite(positions)):
+            raise JakaError(-1, "joint positions contain non-finite values", payload=payload)
+        return {f"{motor}.pos": float(positions[index]) for index, motor in enumerate(self.motors)}
+
+    @staticmethod
+    def _normalize_analog_value(value: float, minimum: float, maximum: float, inverted: bool) -> float:
+        normalized = float(np.clip((value - minimum) / (maximum - minimum), 0.0, 1.0))
+        return 1.0 - normalized if inverted else normalized
+
+    @staticmethod
+    def _denormalize_analog_value(position: float, minimum: float, maximum: float, inverted: bool) -> float:
+        normalized = 1.0 - position if inverted else position
+        return minimum + normalized * (maximum - minimum)
+
+    @check_if_not_connected
+    def get_gripper_position(self) -> dict[str, float]:
+        """Read normalized gripper feedback from the configured analog input."""
+        if not self.config.gripper_analog_input_enabled:
+            return {"gripper.pos": float(self.config.gripper_fallback_position)}
+
+        raw_value = self.get_analog_input(
+            self.config.gripper_analog_input_iotype,
+            self.config.gripper_analog_input_index,
+        )
+        position = self._normalize_analog_value(
+            raw_value,
+            self.config.gripper_analog_input_min,
+            self.config.gripper_analog_input_max,
+            self.config.gripper_analog_input_inverted,
+        )
+        return {"gripper.pos": position}
+
+    @check_if_not_connected
+    def set_gripper_position(self, position: float) -> float:
+        """Write a normalized gripper command to the configured analog output."""
+        try:
+            normalized = float(position)
+        except (TypeError, ValueError) as e:
+            raise TypeError(f"gripper position {position!r} is not numeric") from e
+        if not np.isfinite(normalized):
+            raise ValueError("gripper position must be finite")
+        normalized = float(np.clip(normalized, 0.0, 1.0))
+
+        if self.config.gripper_analog_output_enabled:
+            raw_value = self._denormalize_analog_value(
+                normalized,
+                self.config.gripper_analog_output_min,
+                self.config.gripper_analog_output_max,
+                self.config.gripper_analog_output_inverted,
+            )
+            self.set_analog_output(
+                self.config.gripper_analog_output_iotype,
+                self.config.gripper_analog_output_index,
+                raw_value,
+            )
+        return normalized
+
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
-        """Read the current joint/TCP state and a few status flags."""
+        """Read measured arm state, status flags, gripper feedback, and cameras."""
         rc = self.rc
-
-        # Joint positions (planned + servo-feedback).
         jp = self._check(rc.get_joint_position(), return_payload=True)
         jp_actual = self._check(rc.get_actual_joint_position(), return_payload=True)
-        # TCP pose (planned + servo-feedback).
         tcp = self._check(rc.get_tcp_position(), return_payload=True)
         tcp_actual = self._check(rc.get_actual_tcp_position(), return_payload=True)
 
-        # Status flags — best-effort: a flag we can't read is simply set to 0
-        # rather than failing the whole observation. The core joint/TCP reads
-        # above still raise on real errors.
         powered_on = enabled = 0.0
         estop = collision = on_limit = in_pos = drag = 0.0
         rapidrate = 1.0
         try:
             payload = self._check(rc.get_robot_status_simple(), return_payload=True)
-            # payload = (ctrl_errcode, errmsg, powered_on, enabled)
             powered_on = float(payload[2])
             enabled = float(payload[3])
         except JakaError:
             pass
-        for src, sink in (
-            ((rc.is_in_estop,), "estop"),
-            ((rc.is_in_collision,), "collision"),
-            ((rc.is_on_limit,), "on_limit"),
-            ((rc.is_in_pos,), "in_pos"),
-            ((rc.is_in_drag_mode,), "drag"),
+        for getter, name in (
+            (rc.is_in_estop, "estop"),
+            (rc.is_in_collision, "collision"),
+            (rc.is_on_limit, "on_limit"),
+            (rc.is_in_pos, "in_pos"),
+            (rc.is_in_drag_mode, "drag"),
         ):
             try:
-                payload = self._check(src[0](), return_payload=True)
-                val = float(payload[0])
+                value = float(self._check(getter(), return_payload=True)[0])
             except JakaError:
-                val = 0.0
-            if sink == "estop":
-                estop = val
-            elif sink == "collision":
-                collision = val
-            elif sink == "on_limit":
-                on_limit = val
-            elif sink == "in_pos":
-                in_pos = val
-            elif sink == "drag":
-                drag = val
-        try:
-            payload = self._check(rc.get_rapidrate(), return_payload=True)
-            rapidrate = float(payload[0])
-        except JakaError:
-            pass
+                value = 0.0
+            if name == "estop":
+                estop = value
+            elif name == "collision":
+                collision = value
+            elif name == "on_limit":
+                on_limit = value
+            elif name == "in_pos":
+                in_pos = value
+            else:
+                drag = value
+        with suppress(JakaError):
+            rapidrate = float(self._check(rc.get_rapidrate(), return_payload=True)[0])
 
         obs: dict[str, Any] = {}
-        for i, m in enumerate(self.motors):
-            obs[f"{m}.pos"] = float(jp[i])
-            obs[f"{m}.actual_pos"] = float(jp_actual[i])
-        for i, axis in enumerate(self.TCP_AXES):
-            obs[f"tcp.{axis}"] = float(tcp[i])
-            obs[f"tcp.actual_{axis}"] = float(tcp_actual[i])
+        for index, motor in enumerate(self.motors):
+            obs[f"{motor}.pos"] = float(jp[index])
+            obs[f"{motor}.actual_pos"] = float(jp_actual[index])
+        for index, axis in enumerate(self.TCP_AXES):
+            obs[f"tcp.{axis}"] = float(tcp[index])
+            obs[f"tcp.actual_{axis}"] = float(tcp_actual[index])
         actual_eef = np.asarray(tcp_actual, dtype=float).copy()
         actual_eef[:3] /= 1000.0
         for key, value in zip(self.EEF_ACTION_KEYS, actual_eef, strict=True):
             obs[key] = float(value)
+        obs.update(self.get_gripper_position())
         obs["status.powered_on"] = powered_on
         obs["status.enabled"] = enabled
         obs["status.estop"] = estop
@@ -611,10 +721,22 @@ class JakaRobot(Robot):
 
     @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:
-        """Send one joint or Cartesian target according to control_mode."""
+        """Send the active control representation and return the full schema."""
+        gripper_position = (
+            self.set_gripper_position(action["gripper.pos"])
+            if "gripper.pos" in action
+            else self.get_gripper_position()["gripper.pos"]
+        )
+
         if self.config.control_mode == "ee_pose":
-            return self._send_eef_action(action)
-        return self._send_joint_action(action)
+            applied = self._send_eef_action(action)
+            applied.update(self._get_actual_joint_positions())
+        else:
+            applied = self._send_joint_action(action)
+            for key, value in zip(self.EEF_ACTION_KEYS, self.get_eef_pose(), strict=True):
+                applied[key] = float(value)
+        applied["gripper.pos"] = gripper_position
+        return {key: float(applied[key]) for key in self.action_features}
 
     def _send_joint_action(self, action: RobotAction) -> RobotAction:
         """Drive each named joint toward ``action[m]`` via incremental joint moves.
@@ -632,8 +754,7 @@ class JakaRobot(Robot):
         """
         rc = self.rc
 
-        actual = self._check(rc.get_actual_joint_position(), return_payload=True)
-        present = {f"{m}.pos": float(actual[i]) for i, m in enumerate(self.motors)}
+        present = self._get_actual_joint_positions()
 
         # Filter down to the joints the caller is actually driving. Unknown
         # keys are ignored so the caller can pass arbitrary telemetry fields.
@@ -647,27 +768,32 @@ class JakaRobot(Robot):
                     raise TypeError(
                         f"JakaRobot.send_action: action[{key!r}]={action[key]!r} is not numeric"
                     ) from e
+                if not np.isfinite(goals[key]):
+                    raise ValueError(f"JakaRobot.send_action: action[{key!r}] must be finite")
 
-        if goals:
+        if goals and self.config.max_relative_target is not None:
             safe = ensure_safe_goal_position(
                 {k: (goals[k], present[k]) for k in goals},
                 self.config.max_relative_target,
             )
+        elif goals:
+            safe = dict(goals)
         else:
             safe = {}
 
-        # Build a 6-tuple delta in joint order. Joints the caller didn't touch
-        # (or that aren't even in the action dict) get a zero delta so the
-        # motion queue never sees ``None`` entries.
-        cmd = tuple(
-            safe.get(f"joint_{i + 1}.pos", present[f"joint_{i + 1}.pos"]) - present[f"joint_{i + 1}.pos"]
-            for i in range(self.N_JOINTS)
-        )
-        self._check(rc.joint_move(cmd, INCR, False, self.config.default_speed_joint))
+        if goals:
+            # Build a 6-tuple delta in joint order. Joints the caller didn't
+            # touch get a zero delta so the SDK never sees ``None`` entries.
+            cmd = tuple(
+                safe.get(f"joint_{i + 1}.pos", present[f"joint_{i + 1}.pos"]) - present[f"joint_{i + 1}.pos"]
+                for i in range(self.N_JOINTS)
+            )
+            self._check(rc.joint_move(cmd, INCR, False, self.config.default_speed_joint))
 
         # Echo back the values actually requested (post-clamp), filling any
         # joints the caller didn't include with their current position so the
-        # result has the same shape as ``action_features``.
+        # result contains the active representation; send_action fills the
+        # inactive Cartesian representation and gripper field.
         return {**present, **safe}
 
     def _send_eef_action(self, action: RobotAction) -> RobotAction:
