@@ -1,4 +1,4 @@
-"""LeRobot-compatible driver for AgileX robotic arms (Piper / Nero / ...).
+"""LeRobot-compatible driver for AgileX robotic arms (Piper / Nero).
 
 This module wraps the :mod:`pyAgxArm` Python SDK to implement
 :class:`AgxArm`, a drop-in :class:`lerobot.robots.robot.Robot` subclass for
@@ -13,17 +13,14 @@ are recognized by the SDK but not surfaced here.
 
 Joint schema (matches the SDK convention):
 
-* ``joint_1.pos`` … ``joint_6.pos`` — 6-DOF arm, observed and commanded in
-  radians (``pyAgxArm`` is radians-native).
-* ``gripper.pos`` — gripper width in **metres**, normalized by the Agx gripper
-  range convention (``0.0`` = closed, ``gripper_max_range`` = fully open).
-  This keeps the lerobot action schema independent of the Agx gripper's
-  per-firmware range preset (``0.07`` m or ``0.1`` m).
+* ``joint_1.pos`` … ``joint_N.pos`` — 6 DOF for Piper variants and 7 DOF for
+  Nero, observed and commanded in radians (``pyAgxArm`` is radians-native).
+* ``gripper.pos`` — normalized gripper opening (``0.0`` = closed, ``1.0`` =
+  fully open). SDK feedback and commands are converted to metres using
+  ``gripper_max_range`` (``0.07`` m or ``0.1`` m).
 
-Control mode: ``send_action`` issues a non-blocking ``move_j`` per arm cycle,
-plus an ``effector.move_gripper_m`` for the gripper. ``move_j`` is
-non-blocking (it returns once the joint command is on the bus), so successive
-calls at the policy control rate don't stall.
+Control mode: ``send_action`` issues ``move_j`` or ``move_p`` according to the
+configured mode, plus an ``effector.move_gripper_m`` for the gripper.
 
 Example:
 
@@ -37,7 +34,7 @@ Example:
     >>> robot = AgxArm(cfg)
     >>> with robot:
     ...     obs = robot.get_observation()
-    ...     robot.send_action({"joint_1.pos": 0.0, "joint_2.pos": 0.5, ..., "gripper.pos": 0.02})
+    ...     robot.send_action({"joint_1.pos": 0.0, "joint_2.pos": 0.5, ..., "gripper.pos": 0.5})
 
 See https://github.com/agilexrobotics/pyAgxArm for the upstream SDK.
 """
@@ -73,7 +70,7 @@ logger = logging.getLogger(__name__)
 
 def _require_pyagxarm():
     """Import pyAgxArm lazily and cache the module-level symbols we use."""
-    global _AGX, _AGX_FACTORY, _AGX_ARM_MODEL, _AGX_PIPER_FW, _AGX_NERO_FW
+    global _AGX
     if _AGX is None:
         try:
             import pyAgxArm as pyagxarm  # type: ignore[import-not-found]  # noqa: N813
@@ -84,18 +81,10 @@ def _require_pyagxarm():
                 "`agilexrobotics/pyAgxArm`)."
             ) from e
         _AGX = pyagxarm
-        _AGX_FACTORY = pyagxarm.AgxArmFactory
-        _AGX_ARM_MODEL = pyagxarm.ArmModel
-        _AGX_PIPER_FW = pyagxarm.PiperFW
-        _AGX_NERO_FW = pyagxarm.NeroFW
     return _AGX
 
 
 _AGX = None
-_AGX_FACTORY = None
-_AGX_ARM_MODEL = None
-_AGX_PIPER_FW = None
-_AGX_NERO_FW = None
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -181,13 +170,11 @@ class AgxArmConfig(RobotConfig):
     max_relative_target: float | dict[str, float] | None = 0.05
 
     # Action schema / control backend:
-    #   "joints"  — action is ``joint_1.pos..joint_6.pos + gripper.pos``; sent via
-    #               ``move_j`` + ``move_gripper_m``. Use this when you want the host
-    #               to do IK, or when the policy is trained in joint space.
-    #   "ee_pose" — action is ``ee.{x,y,z,roll,pitch,yaw} + gripper.pos``; sent via
-    #               ``move_p`` + ``move_gripper_m``. The AgileX firmware handles IK
-    #               internally, so the XR / leader pipeline can skip the URDF-based
-    #               IK step entirely.
+    #   "joints"  — joint targets are sent via ``move_j``; Cartesian fields are
+    #               returned from feedback.
+    #   "ee_pose" — Cartesian targets are sent via ``move_p``; joint fields are
+    #               returned from feedback. The AgileX firmware handles IK
+    #               internally, so the XR pipeline can skip host-side IK.
     # Type is ``str`` (not ``Literal[...]``) because draccus's CLI decoder
     # does not understand ``typing.Literal``; ``__post_init__`` validates.
     control_mode: str = "joints"
@@ -261,11 +248,9 @@ class AgxArm(Robot):
     """LeRobot-compatible AgileX arm driver.
 
     The class follows the standard :class:`lerobot.robots.robot.Robot`
-    contract. ``get_observation`` returns the per-joint measured positions
-    (radians) and the gripper width (metres) plus any configured camera
-    frames. ``send_action`` issues a non-blocking ``move_j`` for the arm and
-    a ``move_gripper_m`` for the gripper; successive calls at the policy
-    control rate don't stall.
+    contract. Piper variants expose six joints and Nero exposes seven. The
+    SDK receives Cartesian targets directly in ``ee_pose`` mode, so no host
+    inverse-kinematics solver is required.
 
     Lifecycle: ``connect`` builds the SDK config + factory, opens the CAN
     bus, optionally enables joints / clears errors / engages follower mode,
@@ -277,21 +262,22 @@ class AgxArm(Robot):
     config_class: ClassVar[type] = AgxArmConfig
     name: ClassVar[str] = "agx_arm"
 
-    # 6-DOF arm + gripper. Matches the pyAgxArm convention (``joint_1`` …
-    # ``joint_6`` + a separately-initialized ``agx_gripper`` effector).
+    # Piper variants have six joints; Nero has seven. The instance value is
+    # selected from the model so its schema matches the SDK command length.
     N_JOINTS: ClassVar[int] = 6
     motors: ClassVar[list[str]] = [f"joint_{i + 1}" for i in range(N_JOINTS)] + ["gripper"]
+    _JOINT_COUNTS: ClassVar[dict[str, int]] = {"nero": 7, **dict.fromkeys(_PIPER_MODELS, 6)}
 
     # ── Construction ──
 
     def __init__(self, config: AgxArmConfig):
         super().__init__(config)
         self.config: AgxArmConfig = config
-        # Underlying pyAgxArm driver + effector, populated on ``connect``.
+        self.N_JOINTS = self._JOINT_COUNTS[config.arm_model]
+        self.arm_motors = [f"joint_{index + 1}" for index in range(self.N_JOINTS)]
+        self.motors = [*self.arm_motors, "gripper"]
         self.arm: Any | None = None
         self.effector: Any | None = None
-        # Cameras — built lazily so an ``AgxArmConfig`` with no cameras
-        # doesn't pay the construction cost.
         self.cameras: dict[str, Any] = make_cameras_from_configs(config.cameras) if config.cameras else {}
 
     # ── Feature schemas ──
@@ -300,17 +286,12 @@ class AgxArm(Robot):
     def observation_features(self) -> dict[str, Any]:
         """Schema for everything ``get_observation`` emits.
 
-        Joints + gripper are always emitted (useful for diagnostics and
-        for joint-mode policies). The current measured EE pose is emitted
-        as ``ee.{x,y,z,roll,pitch,yaw}`` whenever ``control_mode == "ee_pose"``
-        so that downstream consumers (e.g. a recording pipeline) can log
-        the EE target without re-reading the SDK.
+        The measured joints, gripper, flange pose, and configured camera frames
+        are always emitted, independent of the active command representation.
         """
-        features: dict[str, Any] = {f"joint_{i + 1}.pos": float for i in range(self.N_JOINTS)}
+        features: dict[str, Any] = {f"{motor}.pos": float for motor in self.arm_motors}
         features["gripper.pos"] = float
-        if self.config.control_mode == "ee_pose":
-            for axis in ("x", "y", "z", "roll", "pitch", "yaw"):
-                features[f"ee.{axis}"] = float
+        features.update({f"ee.{axis}": float for axis in ("x", "y", "z", "roll", "pitch", "yaw")})
         for cam_key, cam in self.cameras.items():
             if getattr(cam, "use_rgb", True):
                 features[cam_key] = (cam.height, cam.width, 3)
@@ -322,20 +303,14 @@ class AgxArm(Robot):
     def action_features(self) -> dict[str, Any]:
         """Schema for the action dict ``send_action`` expects.
 
-        ``control_mode == "joints"`` (default):
-            ``joint_1.pos..joint_6.pos`` (radians) + ``gripper.pos`` (∈ [0, 1]).
-            Dispatched to ``move_j`` + ``move_gripper_m``.
-
-        ``control_mode == "ee_pose"``:
-            ``ee.{x,y,z}`` (m, base frame) + ``ee.{roll,pitch,yaw}`` (radians,
-            base frame) + ``gripper.pos`` (∈ [0, 1]). Dispatched to
-            ``move_p`` + ``move_gripper_m``.
+        The schema always contains both ``joint_N.pos`` and
+        ``ee.{x,y,z,roll,pitch,yaw}`` fields, plus ``gripper.pos``. The active
+        ``control_mode`` selects which arm representation is sent to the SDK.
         """
-        if self.config.control_mode == "ee_pose":
-            return {f"ee.{axis}": float for axis in ("x", "y", "z", "roll", "pitch", "yaw")} | {
-                "gripper.pos": float,
-            }
-        return {f"joint_{i + 1}.pos": float for i in range(self.N_JOINTS)} | {"gripper.pos": float}
+        features: dict[str, Any] = {f"{motor}.pos": float for motor in self.arm_motors}
+        features.update({f"ee.{axis}": float for axis in ("x", "y", "z", "roll", "pitch", "yaw")})
+        features["gripper.pos"] = float
+        return features
 
     # ── Connection state ──
 
@@ -367,60 +342,36 @@ class AgxArm(Robot):
 
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
-        """Open the CAN bus, optionally enable joints, and connect cameras.
+        """Open the CAN bus, configure the arm, and connect cameras."""
+        del calibrate
 
-        Args:
-            calibrate: Accepted for interface parity — ignored. The AgileX
-                controller self-calibrates.
-        """
-        del calibrate  # Unused — see docstring.
-
-        _require_pyagxarm()
-
-        cfg = _AGX.create_agx_arm_config(
+        sdk = _require_pyagxarm()
+        sdk_config = sdk.create_agx_arm_config(
             robot=self.config.arm_model,
             firmeware_version=self.config.firmware_version,
             interface=self.config.interface,
             channel=self.config.channel,
             bitrate=self.config.bitrate,
         )
-        arm = _AGX_FACTORY.create_arm(cfg)
-
-        # Open the CAN bus + start the SDK's reader threads. ``connect`` is
-        # idempotent in the SDK, so a re-entrant call here would no-op.
-        arm.connect()
+        arm = sdk.AgxArmFactory.create_arm(sdk_config)
         self.arm = arm
 
-        if self.config.auto_clear_joint_error:
-            try:
-                arm.clear_joint_error()
-            except Exception:
-                logger.debug("AgxArm: clear_joint_error unsupported / failed, ignoring.")
-
-        if self.config.auto_enable:
-            try:
-                arm.enable()
-            except Exception:
-                logger.debug("AgxArm: enable() returned False / unsupported, ignoring.")
-
-        if self.config.auto_set_follower_mode:
-            try:
+        try:
+            arm.connect()
+            if self.config.auto_clear_joint_error and arm.clear_joint_error() is False:
+                logger.warning("AgxArm: controller did not acknowledge clear_joint_error().")
+            if self.config.auto_enable:
+                self._enable_arm(arm)
+            if self.config.auto_set_follower_mode:
                 arm.set_follower_mode()
-            except Exception:
-                logger.debug("AgxArm: set_follower_mode unsupported, ignoring.")
 
-        # Initialise + connect the effector (only agx_gripper is wired up).
-        if self.config.effector == "agx_gripper":
-            try:
-                self.effector = arm.init_effector(arm.OPTIONS.EFFECTOR.AGX_GRIPPER)
-            except Exception as e:
-                logger.warning("AgxArm: failed to initialise agx_gripper effector: %s", e)
-                self.effector = None
-
-        for cam in self.cameras.values():
-            cam.connect()
-
-        self.configure()
+            self.effector = arm.init_effector(arm.OPTIONS.EFFECTOR.AGX_GRIPPER)
+            for camera in self.cameras.values():
+                camera.connect()
+            self.configure()
+        except Exception:
+            self.disconnect()
+            raise
         logger.info(
             "AgxArm[%s %s fw=%s on %s/%s] connected.",
             self.config.arm_model,
@@ -430,252 +381,166 @@ class AgxArm(Robot):
             self.config.channel,
         )
 
-    def configure(self) -> None:
-        """Apply runtime configuration. Called once at the end of ``connect``.
+    @staticmethod
+    def _enable_arm(arm: Any) -> None:
+        deadline = time.monotonic() + 2.0
+        while not arm.enable():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("AgxArm: timed out waiting for all joints to enable.")
+            time.sleep(0.01)
 
-        Override-friendly — subclasses can extend this to install joint
-        limits / payload settings / TCP offsets.
-        """
-        if not self.is_connected:
-            return
-        # ``move_j`` clamps joint targets when joint-limits are enabled and
-        # the user has supplied overrides via the SDK config. We leave it
-        # off here — the lerobot ``max_relative_target`` clamp is what we
-        # actually enforce — but expose the hook so subclasses can flip it.
-        if self.arm is not None and hasattr(self.arm, "set_joint_limits_enabled"):
-            try:
-                self.arm.set_joint_limits_enabled(False)
-            except Exception:
-                logger.debug("AgxArm: set_joint_limits_enabled failed, ignoring.")
+    def configure(self) -> None:
+        """Enable the SDK's model-specific software joint limits."""
+        if self.arm is not None:
+            self.arm.set_joint_limits_enabled(True)
 
     def disconnect(self) -> None:
-        """Best-effort teardown: disable joints, drop the bus + cameras.
-
-        Idempotent and safe to call when ``connect()`` never fully
-        succeeded (e.g. CAN bus missing) -- the base ``Robot.__exit__``
-        unconditionally calls ``disconnect()`` on context exit, so we
-        can't let the ``@check_if_not_connected`` guard abort cleanup
-        with a ``DeviceNotConnectedError`` that masks the original
-        connection error.
-        """
+        """Best-effort teardown of torque, CAN resources, and cameras."""
         arm = self.arm
-        try:
-            if arm is not None and self.config.disable_torque_on_disconnect:
+        if arm is not None:
+            if self.config.disable_torque_on_disconnect:
                 try:
-                    #! WARNING: make sure the arm is safely parked before calling disable()
-                    #! -- the arm will drop torque immediately and may fall if not supported.
-                    # arm.disable()
-                    ...
-                except Exception:
-                    logger.debug("AgxArm: disable() during disconnect failed, ignoring.")
-            if arm is not None:
+                    if arm.is_connected():
+                        arm.disable()
+                except Exception as e:
+                    logger.warning("AgxArm: could not disable joints during disconnect: %s", e)
+            try:
                 arm.disconnect()
-        except Exception as e:
-            logger.warning("AgxArm: error during disconnect: %s", e)
-        finally:
-            for cam in self.cameras.values():
-                try:
-                    cam.disconnect()
-                except Exception:
-                    logger.debug("AgxArm: camera disconnect failed, ignoring.")
-            self.arm = None
-            self.effector = None
-            logger.info("AgxArm[%s] disconnected.", self.id)
+            except Exception as e:
+                logger.warning("AgxArm: error during disconnect: %s", e)
+        for camera in self.cameras.values():
+            try:
+                camera.disconnect()
+            except Exception:
+                logger.debug("AgxArm: camera disconnect failed, ignoring.")
+        self.arm = None
+        self.effector = None
+        logger.info("AgxArm[%s] disconnected.", self.id)
 
     # ── Observation / Action ──
 
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
-        """Read joint angles (rad), gripper width (m), and any camera frames.
-
-        When ``control_mode == "ee_pose"`` the current measured flange pose
-        is included as ``ee.{x,y,z,roll,pitch,yaw}`` so downstream consumers
-        can log the EE state without re-querying the SDK.
-        """
+        """Read arm state and configured camera frames."""
         obs: dict[str, Any] = {}
         obs.update(self.get_joint_angles())
         obs.update(self.get_gripper_position())
-        if self.config.control_mode == "ee_pose":
-            obs.update(self.get_ee_pose())
+        obs.update(self.get_ee_pose())
 
-        # Cameras.
-        for cam_key, cam in self.cameras.items():
-            if getattr(cam, "use_rgb", True):
-                obs[cam_key] = cam.read_latest()
-            if getattr(cam, "use_depth", False):
-                obs[f"{cam_key}_depth"] = cam.read_latest_depth()
-
+        for camera_name, camera in self.cameras.items():
+            if getattr(camera, "use_rgb", True):
+                obs[camera_name] = camera.read_latest()
+            if getattr(camera, "use_depth", False):
+                obs[f"{camera_name}_depth"] = camera.read_latest_depth()
         return obs
 
     @check_if_not_connected
     def get_joint_angles(self) -> dict[str, float]:
-        """Read current 6-DOF joint angles in radians as ``joint_i.pos`` fields."""
-        arm = self.arm
-        assert arm is not None  # guaranteed by ``check_if_not_connected``
+        """Read the configured model's measured joint angles in radians."""
+        sample = self.arm.get_joint_angles()
+        if sample is None:
+            return dict.fromkeys((f"{motor}.pos" for motor in self.arm_motors), 0.0)
 
-        # The SDK can return None before the first joint-state frame arrives.
-        ja = arm.get_joint_angles()
-        angles = [0.0] * self.N_JOINTS if ja is None else [float(v) for v in ja.msg]
-        return {f"joint_{i + 1}.pos": float(angles[i]) for i in range(self.N_JOINTS)}
+        angles = np.asarray(sample.msg, dtype=float)
+        if angles.shape != (self.N_JOINTS,) or not np.all(np.isfinite(angles)):
+            raise RuntimeError(f"AgxArm: invalid joint feedback {sample.msg!r}.")
+        return {f"{motor}.pos": float(angles[index]) for index, motor in enumerate(self.arm_motors)}
 
     @check_if_not_connected
     def get_gripper_position(self) -> dict[str, float]:
         """Read normalized gripper position in [0, 1] as ``gripper.pos`` field."""
-        # The Agx gripper reports width in metres; normalize by configured range.
-        value = 0.0
-        if self.effector is not None and self.effector.get_gripper_status() is not None:
-            gs = self.effector.get_gripper_status()
-            value = float(gs.msg.value) if gs is not None else 0.0
-            value = np.clip(value / self.config.gripper_max_range, 0.0, 1.0)
+        status = None if self.effector is None else self.effector.get_gripper_status()
+        if status is None:
+            return {"gripper.pos": 0.0}
+        if status.msg.mode != "width":
+            raise RuntimeError("AgxArm: AgxGripper must be in width mode to report gripper.pos.")
 
-        return {"gripper.pos": float(value)}
+        value = float(status.msg.value)
+        if not np.isfinite(value):
+            raise RuntimeError(f"AgxArm: invalid gripper feedback {value!r}.")
+        return {"gripper.pos": float(np.clip(value / self.config.gripper_max_range, 0.0, 1.0))}
 
     @check_if_not_connected
     def get_flange_pose(self) -> list[float]:
-        fp = self.arm.get_flange_pose()
-        assert fp is not None, "AgxArm.get_flange_pose: SDK returned None"
-        return [float(v) for v in fp.msg]
+        sample = self.arm.get_flange_pose()
+        if sample is None:
+            raise RuntimeError("AgxArm: no flange-pose feedback has been received.")
+
+        pose = np.asarray(sample.msg, dtype=float)
+        if pose.shape != (6,) or not np.all(np.isfinite(pose)):
+            raise RuntimeError(f"AgxArm: invalid flange-pose feedback {sample.msg!r}.")
+        return [float(value) for value in pose]
 
     @check_if_not_connected
     def get_ee_pose(self) -> dict[str, float]:
-        """Read the current flange pose as ``ee.{x,y,z,roll,pitch,yaw}`` fields.
-
-        Used as the observation when ``control_mode == "ee_pose"`` so the
-        recorded dataset captures the EE state (matching the EE-pose action
-        schema).
-        """
-        pose = self.get_flange_pose()
-        return {
-            "ee.x": float(pose[0]),
-            "ee.y": float(pose[1]),
-            "ee.z": float(pose[2]),
-            "ee.roll": float(pose[3]),
-            "ee.pitch": float(pose[4]),
-            "ee.yaw": float(pose[5]),
-        }
+        """Read the current flange pose as Cartesian action fields."""
+        return dict(
+            zip(
+                ("ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw"),
+                self.get_flange_pose(),
+                strict=True,
+            )
+        )
 
     @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:
-        """Dispatch ``action`` to ``move_j`` or ``move_p`` based on its keys.
+        """Dispatch the configured joint-space or Cartesian control command."""
+        if self.config.control_mode == "ee_pose":
+            applied = self._send_ee_pose_action(action)
+            applied.update(self.get_joint_angles())
+        else:
+            applied = self._send_joint_action(action)
+            applied.update(self.get_ee_pose())
+        return {key: float(applied[key]) for key in self.action_features}
 
-        Dispatch rules:
+    @staticmethod
+    def _as_finite_float(value: Any, key: str) -> float:
+        try:
+            result = float(value)
+        except (TypeError, ValueError) as e:
+            raise TypeError(f"AgxArm.send_action: action[{key!r}]={value!r} is not numeric") from e
+        if not np.isfinite(result):
+            raise ValueError(f"AgxArm.send_action: action[{key!r}] must be finite")
+        return result
 
-        * ``ee.x`` in ``action`` (and ``control_mode == "ee_pose"``) → EE
-          pose path. ``ee.{x,y,z}`` (m, base frame) + ``ee.{roll,pitch,yaw}``
-          (radians) are forwarded to ``move_p``; ``gripper.pos`` ∈ [0, 1]
-          is scaled to ``gripper_max_range`` metres and sent via
-          ``move_gripper_m``.
-        * ``joint_N.pos`` in ``action`` → joint path. Per-joint targets are
-          clamped against ``config.max_relative_target`` (radians) and
-          issued via a non-blocking ``move_j``.
-        * Otherwise, the controller's measured state is echoed back and
-          nothing is commanded — useful for the idle frames of a record
-          loop.
+    def _apply_gripper_action(self, action: RobotAction) -> float:
+        if "gripper.pos" not in action:
+            return self.get_gripper_position()["gripper.pos"]
 
-        Returns the (clamped) action that was actually sent to the
-        controller so the caller can log or compare it against the raw
-        policy output.
-        """
-        arm = self.arm
-        assert arm is not None  # guaranteed by ``check_if_not_connected``
-
-        if self.config.control_mode == "ee_pose" and "ee.x" in action:
-            return self._send_ee_pose_action(action)
-        if "joint_1.pos" in action:
-            return self._send_joint_action(action)
-
-        # No recognised control keys → idle frame, echo joints.
-        applied = self.get_joint_angles()
-        applied.update(self.get_gripper_position())
-        if self.config.control_gripper and self.effector is not None and "gripper.pos" in action:
-            try:
-                width_m = (
-                    float(np.clip(float(action["gripper.pos"]), 0.0, 1.0)) * self.config.gripper_max_range
-                )
-                self.effector.move_gripper_m(value=width_m, force=self.config.gripper_force)
-                applied["gripper.pos"] = float(action["gripper.pos"])
-            except Exception as e:
-                logger.warning("AgxArm.send_action: idle-frame gripper command failed: %s", e)
-        return applied
-
-    # ── Internal send-action helpers ──
+        position = float(np.clip(self._as_finite_float(action["gripper.pos"], "gripper.pos"), 0.0, 1.0))
+        if self.config.control_gripper and self.effector is not None:
+            self.move_gripper_m(position * self.config.gripper_max_range)
+        return position
 
     def _send_ee_pose_action(self, action: RobotAction) -> RobotAction:
-        """Forward ``ee.{x,y,z,roll,pitch,yaw} + gripper.pos`` to ``move_p`` + gripper."""
-        arm = self.arm
-        assert arm is not None
+        """Rate-limit a flange target before passing it to SDK Cartesian control."""
+        keys = ("ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw")
+        current = np.asarray(self.get_flange_pose(), dtype=float)
+        target = current.copy()
+        for index, key in enumerate(keys):
+            if key in action:
+                target[index] = self._as_finite_float(action[key], key)
 
-        try:
-            pose = (
-                float(action["ee.x"]),
-                float(action["ee.y"]),
-                float(action["ee.z"]),
-                float(action["ee.roll"]),
-                float(action["ee.pitch"]),
-                float(action["ee.yaw"]),
-            )
-        except (KeyError, TypeError, ValueError) as e:
-            raise TypeError(f"AgxArm._send_ee_pose_action: malformed ee pose action: {e}") from e
+        delta = target[:3] - current[:3]
+        distance = float(np.linalg.norm(delta))
+        if distance > self.config.ee_max_step_m:
+            target[:3] = current[:3] + delta * (self.config.ee_max_step_m / distance)
 
-        # Defence-in-depth per-frame rate limit. The XR pipeline already
-        # rate-limits via EEBoundsAndSafety; this protects callers that
-        # bypass that step (e.g. direct ``send_action`` from a policy).
-        present_pose = self.get_flange_pose()
-        dpos = np.array(pose[:3]) - np.array(present_pose[:3])
-        step_m = float(np.linalg.norm(dpos))
-        max_step = self.config.ee_max_step_m
-        if max_step > 0.0 and step_m > max_step:
-            scaled = np.array(present_pose[:3]) + dpos * (max_step / step_m)
-            pose = (float(scaled[0]), float(scaled[1]), float(scaled[2]), pose[3], pose[4], pose[5])
-            logger.warning(
-                "AgxArm: EE jump %.3fm > %.3fm; rate-limited to per-frame step.",
-                step_m,
-                max_step,
-            )
-
-        try:
-            arm.move_p(list(pose))
-        except Exception as e:
-            logger.warning("AgxArm._send_ee_pose_action: move_p failed: %s", e)
-
-        applied: dict[str, float] = {
-            f"ee.{axis}": float(pose[i]) for i, axis in enumerate(("x", "y", "z", "roll", "pitch", "yaw"))
-        }
-
-        if self.config.control_gripper and self.effector is not None and "gripper.pos" in action:
-            try:
-                width_m = (
-                    float(np.clip(float(action["gripper.pos"]), 0.0, 1.0)) * self.config.gripper_max_range
-                )
-                self.effector.move_gripper_m(value=width_m, force=self.config.gripper_force)
-                applied["gripper.pos"] = float(action["gripper.pos"])
-            except Exception as e:
-                logger.warning("AgxArm._send_ee_pose_action: gripper command failed: %s", e)
+        self.move_p(target)
+        applied = {key: float(target[index]) for index, key in enumerate(keys)}
+        applied["gripper.pos"] = self._apply_gripper_action(action)
         return applied
 
     def _send_joint_action(self, action: RobotAction) -> RobotAction:
         """Clamp ``joint_N.pos`` to ``max_relative_target`` and call ``move_j``."""
-        arm = self.arm
-        assert arm is not None
-
         present_dict = self.get_joint_angles()
-        present = [present_dict[f"joint_{i + 1}.pos"] for i in range(self.N_JOINTS)]
-
-        # Filter down to the joints the caller is actually driving. Unknown
-        # keys are ignored so the caller can pass arbitrary telemetry fields
-        # (e.g. status flags) without breaking the contract.
+        present = [present_dict[f"{motor}.pos"] for motor in self.arm_motors]
         goals: dict[str, float] = {}
-        for i in range(self.N_JOINTS):
-            key = f"joint_{i + 1}.pos"
+        for motor in self.arm_motors:
+            key = f"{motor}.pos"
             if key in action:
-                try:
-                    goals[key] = float(action[key])
-                except (TypeError, ValueError) as e:
-                    raise TypeError(
-                        f"AgxArm.send_action: action[{key!r}]={action[key]!r} is not numeric"
-                    ) from e
+                goals[key] = self._as_finite_float(action[key], key)
 
-        safe: dict[str, float] = {}
         if goals and self.config.max_relative_target is not None:
             safe = ensure_safe_goal_position(
                 {k: (goals[k], present_dict[k]) for k in goals},
@@ -683,28 +548,18 @@ class AgxArm(Robot):
             )
         elif goals:
             safe = dict(goals)
+        else:
+            safe = {}
 
-        # Build the 6-tuple move_j target in joint order. Joints the caller
-        # didn't touch fall back to their present position so the SDK never
-        # sees ``None`` entries.
-        cmd = tuple(safe.get(f"joint_{i + 1}.pos", present[i]) for i in range(self.N_JOINTS))
-        try:
-            arm.move_j(list(cmd))
-        except Exception as e:
-            logger.warning("AgxArm.send_action: move_j failed: %s", e)
+        if goals:
+            command = [
+                safe.get(f"{motor}.pos", present[index]) for index, motor in enumerate(self.arm_motors)
+            ]
+            self.move_j(command)
 
-        applied_action: dict[str, float] = dict(present_dict)
-        applied_action.update(safe)
-        if self.config.control_gripper and self.effector is not None and "gripper.pos" in action:
-            try:
-                width_m = (
-                    float(np.clip(float(action["gripper.pos"]), 0.0, 1.0)) * self.config.gripper_max_range
-                )
-                self.effector.move_gripper_m(value=width_m, force=self.config.gripper_force)
-                applied_action["gripper.pos"] = float(action["gripper.pos"])
-            except Exception as e:
-                logger.warning("AgxArm.send_action: gripper command failed: %s", e)
-        return applied_action
+        applied = {**present_dict, **safe}
+        applied["gripper.pos"] = self._apply_gripper_action(action)
+        return applied
 
     # ── Direct motion commands (bypass the per-step safety clamp) ──
 
@@ -715,7 +570,8 @@ class AgxArm(Robot):
             raise RuntimeError("AgxArm: arm is not connected.")
         self.arm.move_j(list(joints))
 
-    def move_p(self, pose: list[float] | tuple[float, ...]) -> None:
+    @check_if_not_connected
+    def move_p(self, pose: list[float] | tuple[float, ...] | np.ndarray) -> None:
         """Cartesian-space ``move_p`` (x, y, z in metres; roll, pitch, yaw in radians).
 
         Bypasses ``max_relative_target``.
@@ -726,7 +582,7 @@ class AgxArm(Robot):
 
     @check_if_not_connected
     def move_gripper_m(self, value: float, force: float | None = None) -> None:
-        """Drive the gripper to ``value`` metres (closedness = 0 at ``0``)."""
+        """Drive the gripper to ``value`` metres of opening width."""
         if self.effector is None:
             raise RuntimeError("AgxArm: gripper effector is not initialized.")
         self.effector.move_gripper_m(

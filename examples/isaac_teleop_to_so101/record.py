@@ -155,8 +155,7 @@ def _record_loop(
 
     ``motor_names`` is the joint-name list (suffix-stripped) used only by joint-mode
     callers (``HoldLatch`` no longer needs it). ``action_keys`` is the robot's full
-    action schema (joints + gripper for joint mode, ee.{x,y,z,...} + gripper for
-    AgxArm ee-pose mode) used to populate the held-pose dict during idle frames.
+    action schema used to populate the held-pose dict during idle frames.
     """
     control_interval = 1.0 / fps
     timestamp = 0.0
@@ -213,8 +212,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     print(f"{device=}")
     print(f"{motor_names=}")
 
-    # Build dataset feature spec.  The IK pipeline lives inside device.compute(), so the
-    # action features are exactly robot.action_features (joint positions in degrees).
+    # Build the dataset feature spec from the robot schema. The selected teleop pipeline
+    # supplies only the active command representation; the robot fills feedback fields.
     teleop_proc, _, obs_proc = make_default_processors()
     dataset_features = combine_feature_dicts(
         aggregate_pipeline_dataset_features(
@@ -270,9 +269,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         listener, events = init_keyboard_listener()
 
-        # Full action schema (joints + gripper for joint mode, ee.{x,y,z,...} + gripper
-        # for AgxArm ee-pose mode) so the HoldLatch re-sends a complete dict when the
-        # teleop device is idle.
+        # Full action schema so HoldLatch re-sends a complete dict when the teleop device is idle.
         action_keys = sorted(robot.action_features.keys())
 
         loop_kwargs = {

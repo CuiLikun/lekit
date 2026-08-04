@@ -109,10 +109,9 @@ class Device:
 def hold_action(obs: RobotObservation, action_keys: list[str]) -> dict[str, float]:
     """Re-send the measured state for the given action keys — the explicit hold when a device is idle.
 
-    ``action_keys`` is the robot's full action schema (e.g. ``["joint_1.pos", ..., "gripper.pos"]``
-    in joint mode, or ``["ee.x", ..., "gripper.pos"]`` in AgxArm ee-pose mode). Keys missing
-    from ``obs`` (e.g. an ee.x key the robot hasn't observed yet) are silently dropped, so a
-    freshly-connected robot whose EE pose hasn't been read once doesn't crash the hold path.
+    ``action_keys`` is the robot's full action schema. Keys missing from ``obs`` are silently
+    dropped, so a freshly-connected robot whose EE pose has not been read yet does not crash
+    the hold path.
     """
     return {key: float(obs[key]) for key in action_keys if key in obs}
 
@@ -151,9 +150,8 @@ class HoldLatch:
     error, so each re-command of the measurement lowers the goal by that error again.
     Latching the target once on the active->idle transition holds a fixed pose instead.
 
-    ``action_keys`` is the robot's full action schema (so the held dict has the same
-    shape as ``send_action`` expects — joints + gripper in joint mode, ee.{x,y,z,...} +
-    gripper in AgxArm ee-pose mode).
+    ``action_keys`` is the robot's full action schema, so the held dict has the same
+    shape as ``send_action`` expects.
     """
 
     def __init__(self, action_keys: list[str]):
@@ -709,7 +707,7 @@ def build_device(cfg: LoopConfig) -> tuple:
     # The SO-101/SO-100 degree-based pipeline relies on --robot.use_degrees (default True).
     # AgxArm is radians-native, so the XR IK pipeline (SO-101 URDF) is not directly
     # compatible; the leader pipeline mirrors joint names 1:1 and works as long as the
-    # leader plugin streams joint names matching AgxArm.motors.
+    # leader plugin streams joint names matching AgxArm.arm_motors.
     robot = make_robot_from_config(cfg.robot)
     # Connect FIRST so the startup slew and clutch-home seed can read live joints.
     robot.connect()
@@ -719,7 +717,9 @@ def build_device(cfg: LoopConfig) -> tuple:
     try:
         # JAKA exposes joints, gripper, and EE pose in one fixed action schema;
         # only its six physical joint names belong in joint-space setup paths.
-        if robot.name == "jaka_robot":
+        if robot.name == "agx_arm":
+            motor_names = list(robot.arm_motors)
+        elif robot.name == "jaka_robot":
             motor_names = list(robot.motors)
         else:
             motor_names = [key.removesuffix(".pos") for key in robot.action_features if key.endswith(".pos")]

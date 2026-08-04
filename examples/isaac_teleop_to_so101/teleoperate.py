@@ -90,8 +90,7 @@ class TeleoperateConfig:
 def teleoperate(cfg: TeleoperateConfig):
     robot, device, motor_names = build_device(cfg)
     del motor_names  # kept for API back-compat; HoldLatch now uses action_keys
-    # Full action schema (joints + gripper for joint mode, ee.{x,y,z,...} + gripper for
-    # AgxArm ee-pose mode) so the held-pose dict has the same shape as ``send_action``.
+    # Full action schema so the held-pose dict has the same shape as ``send_action``.
     action_keys = sorted(robot.action_features.keys())
     hold = HoldLatch(action_keys)
     try:
