@@ -18,13 +18,13 @@
 
 The XR controller is clutch-rebased onto the measured JAKA TCP pose. Every
 active frame becomes an absolute x/y/z/roll/pitch/yaw target in metres and
-radians and is sent with the JAKA SDK Cartesian Servo Move interface servo_p.
-No host-side inverse kinematics is constructed or called.
+radians. Targets are printed for dry-run inspection and are not sent to the
+JAKA SDK. No host-side inverse kinematics is constructed or called.
 
 The official SDK requires Servo Move to be enabled before streaming,
 continuous frames at step_num times 8 ms, and Servo Move to be disabled on
-exit. The shared device layer performs that lifecycle; this recorder stores
-the post-limit pose actually sent by JakaRobot.send_action.
+exit. This dry-run recorder does not start Servo Move; it stores the action
+that would have been sent.
 
 Usage:
 
@@ -35,7 +35,7 @@ Usage:
         --robot.control_mode=ee_pose \
         --robot.servo_step_num=4 \
         --teleop.type=xr_controller \
-        --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
+        --robot.cameras="{ hand: {type: intelrealsense, serial_number_or_name: '342522070741', width: 640, height: 480, fps: 30}}" \
         --dataset.repo_id=<hf_user>/<dataset_name> \
         --dataset.single_task="Pick up the object" \
         --dataset.fps=30 \
@@ -67,6 +67,7 @@ from examples.isaac_teleop_to_so101.isaac_teleop import (
 )
 from lerobot.cameras import CameraConfig  # noqa: F401
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
+from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.common.control_utils import sanity_check_dataset_robot_compatibility
 from lerobot.configs import parser
 from lerobot.configs.dataset import DatasetRecordConfig
@@ -134,10 +135,10 @@ def _record_loop(
 ) -> None:
     """Run one episode or reset phase of the Cartesian control loop.
 
-    When dataset is None the loop still controls the robot so the operator can
-    reposition during reset, but frames are not recorded. motor_names is kept
-    only for compatibility with the shared device builder. action_keys holds
-    the six JAKA Cartesian fields used for clutch-disengaged hold frames.
+    Actions are printed and recorded but never sent to the robot. When dataset
+    is None, frames are not recorded. motor_names is kept only for
+    compatibility with the shared device builder. action_keys holds the six
+    JAKA Cartesian fields used for clutch-disengaged hold frames.
     """
     control_interval = 1.0 / fps
     timestamp = 0.0
@@ -184,6 +185,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             "because the default XR transform targets the robot base frame"
         )
 
+    # This recorder is intentionally dry-run: it must not power or enable the
+    # arm while it only prints the Cartesian targets.
+    cfg.robot.auto_power_on = False
+    cfg.robot.auto_enable = False
     cfg.robot.control_mode = "ee_pose"
     nominal_fps = 1.0 / (cfg.robot.servo_step_num * 0.008)
     relative_fps_error = abs(float(cfg.dataset.fps) - nominal_fps) / nominal_fps

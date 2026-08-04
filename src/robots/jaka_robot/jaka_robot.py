@@ -27,12 +27,13 @@ import os
 import sys
 from collections.abc import Generator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import Any, ClassVar
 
 import numpy as np
 
+from lerobot.cameras import CameraConfig, make_cameras_from_configs
 from lerobot.robots.config import RobotConfig
 from lerobot.robots.robot import Robot
 from lerobot.robots.utils import ensure_safe_goal_position
@@ -56,9 +57,7 @@ _jaka_api_path = os.path.join(_script_dir, "libjakaAPI.so")
 try:
     ctypes.CDLL(_jaka_api_path, mode=ctypes.RTLD_GLOBAL)
 except OSError as e:
-    raise ImportError(
-        f"Unable to load the vendored JAKA SDK library at {_jaka_api_path}: {e}"
-    ) from e
+    raise ImportError(f"Unable to load the vendored JAKA SDK library at {_jaka_api_path}: {e}") from e
 
 jkrc = importlib.import_module("jkrc")
 
@@ -140,6 +139,9 @@ class JakaRobotConfig(RobotConfig):
 
     # Controller IP address.
     ip: str = "192.168.1.31"
+
+    # Cameras recorded alongside JAKA state and actions.
+    cameras: dict[str, CameraConfig] = field(default_factory=dict)
 
     # Joint mode uses joint_move; ee_pose streams absolute servo_p targets.
     control_mode: str = "joints"
@@ -271,6 +273,7 @@ class JakaRobot(Robot):
     def __init__(self, config: JakaRobotConfig):
         super().__init__(config)
         self.config: JakaRobotConfig = config
+        self.cameras = make_cameras_from_configs(config.cameras)
         # Underlying SDK controller handle; populated in ``connect``.
         self.rc: Any | None = None
         self._servo_active = False
@@ -289,6 +292,11 @@ class JakaRobot(Robot):
             features[f"tcp.actual_{axis}"] = float
         for key in self.EEF_ACTION_KEYS:
             features[key] = float
+        for camera_name, camera in self.cameras.items():
+            if getattr(camera, "use_rgb", True):
+                features[camera_name] = (camera.height, camera.width, 3)
+            if getattr(camera, "use_depth", False):
+                features[f"{camera_name}_depth"] = (camera.height, camera.width, 1)
         features.update(
             {
                 "status.powered_on": float,
@@ -314,8 +322,8 @@ class JakaRobot(Robot):
 
     @property
     def is_connected(self) -> bool:
-        """True once ``connect`` has established a live RC handle."""
-        return self.rc is not None
+        """True once the controller and every configured camera are connected."""
+        return self.rc is not None and all(camera.is_connected for camera in self.cameras.values())
 
     @property
     def is_calibrated(self) -> bool:
@@ -363,7 +371,14 @@ class JakaRobot(Robot):
         self._check(self.rc.set_user_frame_id(self.config.user_frame_id))
         self._check(self.rc.set_collision_level(self.config.collision_level))
 
-        self.configure()
+        try:
+            for camera in self.cameras.values():
+                camera.connect()
+            self.configure()
+        except Exception:
+            logger.exception("JakaRobot: camera initialization failed; cleaning up connection.")
+            self.disconnect()
+            raise
         logger.info("JakaRobot[%s] connected and ready.", self.config.ip)
 
     def configure(self) -> None:
@@ -378,12 +393,11 @@ class JakaRobot(Robot):
         # runtime via ``set_motion_planner``.
         self._check(self.rc.set_motion_planner(PLANNER_T))
 
-    @check_if_not_connected
     def disconnect(self) -> None:
         """Best-effort teardown: disable, log out, drop the handle."""
         rc = self.rc
         try:
-            if self._servo_active:
+            if rc is not None and self._servo_active:
                 try:
                     self._check(rc.servo_move_enable(False, True))
                 except JakaError as e:
@@ -393,16 +407,24 @@ class JakaRobot(Robot):
                     self._last_eef_command = None
             try:
                 # ``payload = (ctrl_errcode, errmsg, powered_on, enabled)``
-                payload = self._check(rc.get_robot_status_simple(), return_payload=True)
-                if bool(payload[3]):
-                    self._check(rc.disable_robot())
+                if rc is not None:
+                    payload = self._check(rc.get_robot_status_simple(), return_payload=True)
+                    if bool(payload[3]):
+                        self._check(rc.disable_robot())
             except JakaError:
                 pass
-            logout = getattr(rc, "logout", None) or rc.log_out
-            self._check(logout())
+            if rc is not None:
+                logout = getattr(rc, "logout", None) or rc.log_out
+                self._check(logout())
         except JakaError as e:
             logger.warning("JakaRobot: error during disconnect: %s", e)
         finally:
+            for camera in self.cameras.values():
+                if camera.is_connected or getattr(camera, "thread", None) is not None:
+                    try:
+                        camera.disconnect()
+                    except Exception as e:  # nosec B110
+                        logger.warning("JakaRobot: could not disconnect camera: %s", e)
             self.rc = None
             self._last_eef_command = None
             logger.info("JakaRobot[%s] disconnected.", self.config.ip)
@@ -580,6 +602,11 @@ class JakaRobot(Robot):
         obs["status.in_pos"] = in_pos
         obs["status.drag_mode"] = drag
         obs["status.rapidrate"] = rapidrate
+        for camera_name, camera in self.cameras.items():
+            if getattr(camera, "use_rgb", True):
+                obs[camera_name] = camera.read_latest()
+            if getattr(camera, "use_depth", False):
+                obs[f"{camera_name}_depth"] = camera.read_latest_depth()
         return obs
 
     @check_if_not_connected
@@ -651,11 +678,7 @@ class JakaRobot(Robot):
                 "servo_enable(True) before send_action()"
             )
 
-        reference = (
-            self.get_eef_pose()
-            if self._last_eef_command is None
-            else self._last_eef_command.copy()
-        )
+        reference = self.get_eef_pose() if self._last_eef_command is None else self._last_eef_command.copy()
         target = reference.copy()
 
         for index, key in enumerate(self.EEF_ACTION_KEYS):
@@ -685,10 +708,7 @@ class JakaRobot(Robot):
 
         self.servo_eef_frame(target, move_mode=ABS, step_num=self.config.servo_step_num)
         self._last_eef_command = target
-        return {
-            key: float(value)
-            for key, value in zip(self.EEF_ACTION_KEYS, target, strict=True)
-        }
+        return {key: float(value) for key, value in zip(self.EEF_ACTION_KEYS, target, strict=True)}
 
     # Direct motion commands bypass the per-step safety clamp.
 
@@ -866,7 +886,6 @@ class JakaRobot(Robot):
 
     # ── Power / enable / drag ──
 
-    @check_if_not_connected
     def power_on(self) -> None:
         """Power on the arm (~8 s delay)."""
         self._check(self.rc.power_on())
@@ -877,7 +896,6 @@ class JakaRobot(Robot):
         """Power off the arm."""
         self._check(self.rc.power_off())
 
-    @check_if_not_connected
     def enable_robot(self) -> None:
         """Engage the servos."""
         self._check(self.rc.enable_robot())
