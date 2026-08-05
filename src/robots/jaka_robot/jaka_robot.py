@@ -335,13 +335,12 @@ class JakaRobot(Robot):
     def observation_features(self) -> dict[str, Any]:
         """Measured joints, gripper, end-effector pose, and camera frames."""
         features: dict[str, Any] = {f"{m}.pos": float for m in self.motors}
-        features["gripper.pos"] = float
+        if self.config.gripper_analog_input_enabled:
+            features["gripper.pos"] = float
         for key in self.EEF_ACTION_KEYS:
             features[key] = float
-        features.update({f"{m}.actual_pos": float for m in self.motors})
         for axis in self.TCP_AXES:
             features[f"tcp.{axis}"] = float
-            features[f"tcp.actual_{axis}"] = float
         for camera_name, camera in self.cameras.items():
             if getattr(camera, "use_rgb", True):
                 features[camera_name] = (camera.height, camera.width, 3)
@@ -581,8 +580,9 @@ class JakaRobot(Robot):
         self.set_eef_pose(target_pose)
         return actual_pose, target_pose
 
-    def _get_actual_joint_positions(self) -> dict[str, float]:
-        payload = self._check(self.rc.get_actual_joint_position(), return_payload=True)
+    def _get_joint_positions(self, getter: Any) -> dict[str, float]:
+        """Read one controller joint-position representation as action fields."""
+        payload = self._check(getter(), return_payload=True)
         if len(payload) != self.N_JOINTS:
             raise JakaError(
                 -1,
@@ -596,6 +596,14 @@ class JakaRobot(Robot):
         if not np.all(np.isfinite(positions)):
             raise JakaError(-1, "joint positions contain non-finite values", payload=payload)
         return {f"{motor}.pos": float(positions[index]) for index, motor in enumerate(self.motors)}
+
+    def _get_planned_joint_positions(self) -> dict[str, float]:
+        """Return the controller's planned joint target for the active motion."""
+        return self._get_joint_positions(self.rc.get_joint_position)
+
+    def _get_actual_joint_positions(self) -> dict[str, float]:
+        """Return joint positions measured by the robot encoders."""
+        return self._get_joint_positions(self.rc.get_actual_joint_position)
 
     @staticmethod
     def _normalize_analog_value(value: float, minimum: float, maximum: float, inverted: bool) -> float:
@@ -652,11 +660,9 @@ class JakaRobot(Robot):
 
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
-        """Read measured arm state, status flags, gripper feedback, and cameras."""
+        """Read real-time measured arm state, status flags, and camera frames."""
         rc = self.rc
-        jp = self._check(rc.get_joint_position(), return_payload=True)
         jp_actual = self._check(rc.get_actual_joint_position(), return_payload=True)
-        tcp = self._check(rc.get_tcp_position(), return_payload=True)
         tcp_actual = self._check(rc.get_actual_tcp_position(), return_payload=True)
 
         powered_on = enabled = 0.0
@@ -694,16 +700,15 @@ class JakaRobot(Robot):
 
         obs: dict[str, Any] = {}
         for index, motor in enumerate(self.motors):
-            obs[f"{motor}.pos"] = float(jp[index])
-            obs[f"{motor}.actual_pos"] = float(jp_actual[index])
+            obs[f"{motor}.pos"] = float(jp_actual[index])
         for index, axis in enumerate(self.TCP_AXES):
-            obs[f"tcp.{axis}"] = float(tcp[index])
-            obs[f"tcp.actual_{axis}"] = float(tcp_actual[index])
+            obs[f"tcp.{axis}"] = float(tcp_actual[index])
         actual_eef = np.asarray(tcp_actual, dtype=float).copy()
         actual_eef[:3] /= 1000.0
         for key, value in zip(self.EEF_ACTION_KEYS, actual_eef, strict=True):
             obs[key] = float(value)
-        obs.update(self.get_gripper_position())
+        if self.config.gripper_analog_input_enabled:
+            obs.update(self.get_gripper_position())
         obs["status.powered_on"] = powered_on
         obs["status.enabled"] = enabled
         obs["status.estop"] = estop
@@ -730,7 +735,9 @@ class JakaRobot(Robot):
 
         if self.config.control_mode == "ee_pose":
             applied = self._send_eef_action(action)
-            applied.update(self._get_actual_joint_positions())
+            # servo_p performs IK in the controller. Record its planned joint
+            # target as the action; encoder feedback belongs in observations.
+            applied.update(self._get_planned_joint_positions())
         else:
             applied = self._send_joint_action(action)
             for key, value in zip(self.EEF_ACTION_KEYS, self.get_eef_pose(), strict=True):

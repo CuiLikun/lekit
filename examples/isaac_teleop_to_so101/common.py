@@ -37,7 +37,7 @@ import sys
 import time
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib.resources import files
 from logging import getLogger
 from pathlib import Path
@@ -104,6 +104,7 @@ class Device:
     compute: Callable[[RobotObservation | None], RobotAction | None]
     startup: Callable[[], None]
     cleanup: Callable[[], None]
+    telemetry: dict[str, object] = field(default_factory=dict)
 
 
 def hold_action(obs: RobotObservation, action_keys: list[str]) -> dict[str, float]:
@@ -434,6 +435,7 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
     # post-slew MEASURED pose) and shared with compute() via nonlocal.
     clutch: Clutch | None = None
     prev_enabled = False
+    telemetry: dict[str, object] = {}
 
     def startup() -> None:
         nonlocal clutch
@@ -487,6 +489,13 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
         squeeze = float(xr_action["squeeze"])
         trigger = float(xr_action["trigger"])
         enabled = squeeze > teleop_config.clutch_threshold
+        telemetry.update(
+            grip_pos=tuple(float(value) for value in grip_pos),
+            grip_quat=tuple(float(value) for value in grip_quat),
+            squeeze=squeeze,
+            trigger=trigger,
+            clutch_engaged=enabled,
+        )
 
         # On the engage edge, latch the clutch home at the arm's MEASURED EE pose and the
         # controller origin so the per-frame delta starts at zero. Latching the last
@@ -526,7 +535,7 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
         finally:
             teleop_device.disconnect()
 
-    return Device(compute=compute, startup=startup, cleanup=cleanup)
+    return Device(compute=compute, startup=startup, cleanup=cleanup, telemetry=telemetry)
 
 
 # ============================================================================

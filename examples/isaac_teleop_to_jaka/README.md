@@ -36,11 +36,9 @@ python -m examples.isaac_teleop_to_jaka.record \
     --robot.id=jaka_arm \
     --robot.control_mode=ee_pose \
     --robot.servo_step_num=4 \
-    --robot.max_eef_step_m=0.01 \
-    --robot.max_eef_step_rad=0.08 \
     --teleop.type=xr_controller \
-    --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
-    --dataset.repo_id=<hf_user>/<dataset_name> \
+    --robot.cameras="{ hand: {type: intelrealsense, serial_number_or_name: '342522070741', width: 640, height: 480, fps: 30}}" \
+    --dataset.repo_id="sorel/pick-cube" \
     --dataset.single_task="Pick up the object" \
     --dataset.fps=30 \
     --dataset.num_episodes=3 \
