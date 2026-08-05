@@ -6,14 +6,19 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "cmake>=3.29.0,<4.0.0",
+    "fastapi>=0.115",
     "lerobot[all]>=0.6.0",
     "pyzmq>=27.1.0",
     "textual>=8.2.8",
     "pyAgxArm@git+https://github.com/agilexrobotics/pyAgxArm.git",
+    "uvicorn>=0.30",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"robots.jaka_robot" = ["web_debug.html"]
 
 [tool.uv]
 package = true

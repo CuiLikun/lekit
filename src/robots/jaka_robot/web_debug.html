@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>JAKA Robot Debugger</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --canvas: #121518;
+        --surface: #1a2025;
+        --line: #344049;
+        --text: #e6edf2;
+        --muted: #91a0ab;
+        --green: #4cc38a;
+        --amber: #e2a644;
+        --red: #e36b67;
+        --blue: #5ca9e8;
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-width: 760px; background: var(--canvas); color: var(--text); font: 14px/1.35 ui-sans-serif, system-ui, sans-serif; }
+      button, select { font: inherit; }
+      header { height: 58px; display: flex; align-items: center; gap: 10px; padding: 0 24px; border-bottom: 1px solid var(--line); background: var(--surface); }
+      h1 { margin: 0 18px 0 0; font-size: 16px; font-weight: 650; letter-spacing: 0; }
+      button { min-height: 32px; padding: 0 12px; border: 1px solid #44515b; border-radius: 4px; color: var(--text); background: #273038; cursor: pointer; }
+      button:hover:not(:disabled) { background: #34404a; }
+      button:disabled { opacity: .45; cursor: not-allowed; }
+      button[data-variant="primary"] { border-color: #2678bd; background: #1b5d91; }
+      button[data-variant="warning"] { border-color: #ae7827; background: #805817; }
+      button[data-variant="success"] { border-color: #278b60; background: #1d6548; }
+      button[data-variant="danger"] { border-color: #a74443; background: #7d3130; }
+      #connection { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+      #message { margin-left: 8px; }
+      main { max-width: 1360px; margin: 0 auto; padding: 22px 24px 42px; }
+      .state-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 32px; }
+      .state-column { min-width: 0; }
+      .state-column section + section { margin-top: 26px; }
+      .section-head { display: flex; align-items: center; gap: 14px; margin-bottom: 9px; }
+      h2 { margin: 0; font-size: 13px; font-weight: 650; letter-spacing: 0; color: var(--muted); text-transform: uppercase; }
+      label { color: var(--muted); }
+      select { min-width: 86px; height: 30px; padding: 0 6px; border: 1px solid var(--line); border-radius: 4px; color: var(--text); background: var(--surface); }
+      .state-grid { display: grid; grid-template-columns: minmax(150px, 1.35fr) repeat(3, minmax(100px, 1fr)) 48px 48px; border-top: 1px solid var(--line); }
+      .cell { min-height: 42px; display: flex; align-items: center; padding: 0 12px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+      .head { min-height: 30px; color: var(--muted); font-size: 12px; }
+      .value { color: #d6e9f9; justify-content: flex-end; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .limit { color: var(--muted); justify-content: flex-end; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .axis { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .move { width: 34px; min-height: 28px; padding: 0; justify-self: center; font-size: 18px; line-height: 1; }
+      .message { color: var(--muted); font-variant-numeric: tabular-nums; }
+      .message.error { color: var(--red); }
+      .message.ok { color: var(--green); }
+      .console-section { margin-top: 28px; }
+      #debug-console { height: 132px; overflow-y: auto; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: #101417; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .console-row { display: grid; grid-template-columns: 72px 58px 1fr; gap: 10px; min-height: 24px; padding: 3px 10px; border-bottom: 1px solid #222b31; color: var(--muted); }
+      .console-row:last-child { border-bottom: 0; }
+      .console-level { color: var(--blue); text-transform: uppercase; }
+      .console-row.error .console-level, .console-row.error { color: var(--red); }
+      @media (max-width: 1160px) { .state-columns { grid-template-columns: 1fr; } }
+      @media (max-width: 820px) { body { min-width: 0; } header { height: auto; min-height: 58px; flex-wrap: wrap; padding: 10px 14px; } #connection { margin-left: 0; } main { padding: 16px 14px; } .state-grid { grid-template-columns: minmax(112px, 1.2fr) repeat(3, minmax(76px, 1fr)) 42px 42px; } .cell { padding: 0 7px; } }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>JAKA Robot Debugger</h1>
+      <button id="connect" data-variant="primary">Connect</button>
+      <button id="power" data-variant="warning" disabled>Power On</button>
+      <button id="enable" disabled>Enable</button>
+      <button id="servo" disabled>Servo On</button>
+      <button id="abort" data-variant="danger" disabled>Abort</button>
+      <span id="connection">Opening WebSocket...</span>
+      <span id="message" class="message">Waiting for robot state.</span>
+    </header>
+    <main>
+      <div class="state-columns">
+        <div class="state-column">
+          <section>
+            <div class="section-head"><h2>Joint State</h2><label>Step <select id="joint-step"><option value="0.005">0.005 rad</option><option value="0.01">0.01 rad</option><option value="0.02" selected>0.02 rad</option><option value="0.05">0.05 rad</option><option value="0.1">0.1 rad</option></select></label></div>
+            <div id="joints" class="state-grid"></div>
+          </section>
+          <section>
+            <div class="section-head"><h2>Gripper</h2><label>Step <select id="gripper-step"><option value="0.01">0.01</option><option value="0.02">0.02</option><option value="0.05" selected>0.05</option><option value="0.1">0.1</option></select></label></div>
+            <div id="gripper" class="state-grid"></div>
+          </section>
+        </div>
+        <div class="state-column">
+          <section>
+            <div class="section-head"><h2>TCP State</h2><label>XYZ <select id="linear-step"><option value="0.001">0.001 m</option><option value="0.002">0.002 m</option><option value="0.005" selected>0.005 m</option><option value="0.01">0.01 m</option></select></label><label>RPY <select id="angular-step"><option value="0.01">0.01 rad</option><option value="0.02">0.02 rad</option><option value="0.05" selected>0.05 rad</option><option value="0.1">0.1 rad</option></select></label></div>
+            <div id="eef" class="state-grid"></div>
+          </section>
+        </div>
+      </div>
+      <section class="console-section">
+        <div class="section-head"><h2>Console</h2><button id="clear-console" type="button">Clear</button></div>
+        <div id="debug-console" role="log" aria-live="polite"></div>
+      </section>
+    </main>
+    <script>
+      const GROUPS = { joints: ["joint_1.pos", "joint_2.pos", "joint_3.pos", "joint_4.pos", "joint_5.pos", "joint_6.pos"], eef: ["ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw"], gripper: ["gripper.pos"] };
+      const controls = Object.fromEntries(Object.values(GROUPS).flat().map(key => [key, {}]));
+      const message = document.querySelector("#message");
+      const connection = document.querySelector("#connection");
+      const debugConsole = document.querySelector("#debug-console");
+      let socket;
+      let lastStateAt = 0;
+      let lastConsoleEventId = 0;
+
+      function format(value) { return typeof value === "number" ? value.toFixed(5) : "--"; }
+      function limit(value, index) { return Array.isArray(value) ? format(value[index]) : "n/a"; }
+      function stepFor(key) {
+        if (key.startsWith("joint_")) return Number(document.querySelector("#joint-step").value);
+        if (["ee.x", "ee.y", "ee.z"].includes(key)) return Number(document.querySelector("#linear-step").value);
+        if (key.startsWith("ee.")) return Number(document.querySelector("#angular-step").value);
+        return Number(document.querySelector("#gripper-step").value);
+      }
+      function send(payload) { if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload)); }
+      function setMessage(text, type = "") { message.textContent = text; message.className = `message ${type}`; }
+      function appendConsole(event) {
+        if (event.id && event.id <= lastConsoleEventId) return;
+        if (event.id) lastConsoleEventId = event.id;
+        const row = document.createElement("div");
+        row.className = `console-row ${event.level || "info"}`;
+        row.innerHTML = `<span>${event.time || new Date().toLocaleTimeString()}</span><span class="console-level">${event.level || "info"}</span><span></span>`;
+        row.lastElementChild.textContent = event.message;
+        debugConsole.append(row);
+        debugConsole.scrollTop = debugConsole.scrollHeight;
+      }
+      function buildGrid(id, keys) {
+        const root = document.querySelector(`#${id}`);
+        root.innerHTML = ["Axis", "Min", "Current", "Max", "", ""].map(item => `<div class="cell head">${item}</div>`).join("");
+        for (const key of keys) {
+          root.insertAdjacentHTML("beforeend", `<div class="cell axis">${key}</div><div class="cell limit" data-min="${key}">n/a</div><div class="cell value" data-value="${key}">--</div><div class="cell limit" data-max="${key}">n/a</div><button class="move" data-key="${key}" data-direction="-1" aria-label="Decrease ${key}" disabled>-</button><button class="move" data-key="${key}" data-direction="1" aria-label="Increase ${key}" disabled>+</button>`);
+        }
+      }
+      function render(frame) {
+        const { controller, observation, limits, console: events = [] } = frame;
+        const connected = controller.connected;
+        const servo = connected && controller.servo_active;
+        document.querySelector("#connect").textContent = connected ? "Disconnect" : "Connect";
+        document.querySelector("#connect").dataset.variant = connected ? "success" : "primary";
+        document.querySelector("#power").textContent = controller.powered_on ? "Power Off" : "Power On";
+        document.querySelector("#power").dataset.variant = controller.powered_on ? "success" : "warning";
+        document.querySelector("#enable").textContent = controller.enabled ? "Disable" : "Enable";
+        document.querySelector("#enable").dataset.variant = controller.enabled ? "success" : "default";
+        document.querySelector("#servo").textContent = servo ? "Servo Off" : "Servo On";
+        document.querySelector("#servo").dataset.variant = servo ? "success" : "default";
+        document.querySelector("#power").disabled = !connected;
+        document.querySelector("#enable").disabled = !connected || !controller.powered_on;
+        document.querySelector("#servo").disabled = !connected || !controller.enabled;
+        document.querySelector("#abort").disabled = !connected;
+        document.querySelectorAll(".move").forEach(button => button.disabled = !connected || !controller.enabled);
+        Object.keys(controls).forEach(key => {
+          document.querySelector(`[data-value="${key}"]`).textContent = format(observation[key]);
+          document.querySelector(`[data-min="${key}"]`).textContent = limit(limits[key], 0);
+          document.querySelector(`[data-max="${key}"]`).textContent = limit(limits[key], 1);
+        });
+        lastStateAt = performance.now();
+        connection.textContent = connected ? `Connected | Power ${controller.powered_on ? "on" : "off"} | Enabled ${controller.enabled ? "yes" : "no"} | Servo ${servo ? "on" : "off"}` : "Disconnected";
+        events.forEach(appendConsole);
+      }
+      function connectSocket() {
+        const scheme = location.protocol === "https:" ? "wss" : "ws";
+        socket = new WebSocket(`${scheme}://${location.host}/ws`);
+        socket.onopen = () => setMessage("WebSocket connected.", "ok");
+        socket.onmessage = event => {
+          const payload = JSON.parse(event.data);
+          if (payload.type === "state") render(payload);
+          if (payload.type === "error") setMessage(payload.message, "error");
+        };
+        socket.onclose = () => { connection.textContent = "WebSocket disconnected. Reconnecting..."; setTimeout(connectSocket, 800); };
+        socket.onerror = () => setMessage("WebSocket transport error.", "error");
+      }
+      buildGrid("joints", GROUPS.joints); buildGrid("eef", GROUPS.eef); buildGrid("gripper", GROUPS.gripper);
+      ["connect", "power", "enable", "servo", "abort"].forEach(command => document.querySelector(`#${command}`).addEventListener("click", () => send({ type: "command", command: command === "connect" ? "connection" : command })));
+      document.querySelectorAll(".move").forEach(button => button.addEventListener("click", () => send({ type: "relative", key: button.dataset.key, delta: Number(button.dataset.direction) * stepFor(button.dataset.key) })));
+      document.querySelector("#clear-console").addEventListener("click", () => { debugConsole.replaceChildren(); });
+      setInterval(() => { if (lastStateAt && performance.now() - lastStateAt > 1500) setMessage("Waiting for a robot state frame...", "error"); }, 250);
+      connectSocket();
+    </script>
+  </body>
+</html>

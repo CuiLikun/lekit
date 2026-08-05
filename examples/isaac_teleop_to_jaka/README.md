@@ -34,7 +34,6 @@ python -m examples.isaac_teleop_to_jaka.record \
     --robot.type=jaka_robot \
     --robot.ip=192.168.1.31 \
     --robot.id=jaka_arm \
-    --robot.control_mode=ee_pose \
     --robot.servo_step_num=4 \
     --teleop.type=xr_controller \
     --robot.cameras="{ hand: {type: intelrealsense, serial_number_or_name: '342522070741', width: 640, height: 480, fps: 30}}" \

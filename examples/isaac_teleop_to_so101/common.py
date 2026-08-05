@@ -353,14 +353,14 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
     teleop_config = cfg.teleop  # XRControllerConfig (selected via --teleop.type=xr_controller)
     teleop_device = XRController(teleop_config)
 
-    # Cartesian-native backends receive the clutch-rebased TCP target
-    # directly. Their action schemas must be switched before dataset features
-    # are inspected.
+    # Cartesian-native backends receive the clutch-rebased TCP target directly.
+    # AgxArm needs its configured action schema switched; JAKA dispatches each
+    # action from its fields and exposes a fixed joint + EEF schema.
     from src.robots.agx_arm import AgxArm
 
     is_jaka = robot.name == "jaka_robot"
     use_ee_pose = isinstance(robot, AgxArm) or is_jaka
-    if use_ee_pose:
+    if isinstance(robot, AgxArm):
         if robot.config.control_mode != "ee_pose":
             logger.warning(
                 "%s + XR pipeline: forcing control_mode='ee_pose' so the "

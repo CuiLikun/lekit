@@ -26,7 +26,6 @@ Usage:
         --robot.type=jaka_robot \
         --robot.ip=192.168.1.31 \
         --robot.id=jaka_arm \
-        --robot.control_mode=ee_pose \
         --robot.servo_step_num=4 \
         --teleop.type=xr_controller \
         --robot.cameras="{ hand: {type: intelrealsense, serial_number_or_name: '342522070741', width: 640, height: 480, fps: 30}}" \
@@ -74,7 +73,7 @@ from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dicts
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging
-from src.robots.jaka_robot import JakaRobot, JakaRobotConfig
+from robots.jaka_robot import JakaRobot, JakaRobotConfig
 
 from .xr import CLOUDXR_ENV_FILE, IsaacTeleopConfig, make_xr_device
 
@@ -177,11 +176,6 @@ def build_device(cfg: "RecordConfig") -> tuple[JakaRobot, Device]:
                 "isaac_teleop_to_jaka.record requires --robot.user_frame_id=0 because the "
                 "default XR transform targets the robot base frame."
             )
-        robot.config.control_mode = "ee_pose"
-        # Invalidate cached feature dicts since control_mode changed.
-        for cached in ("action_features", "observation_features"):
-            robot.__dict__.pop(cached, None)
-
         bundle = make_xr_device(robot, cfg.teleop)
         device = Device(
             compute=bundle["compute"],
@@ -342,8 +336,6 @@ def _record_loop(
 
 @parser.wrap()
 def record(cfg: RecordConfig) -> LeRobotDataset:
-    cfg.robot.control_mode = "ee_pose"
-
     nominal_fps = 1.0 / (cfg.robot.servo_step_num * 0.008)
     relative_fps_error = abs(float(cfg.dataset.fps) - nominal_fps) / nominal_fps
     if relative_fps_error > 0.1:
@@ -408,7 +400,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         listener, events = init_keyboard_listener()
 
-        action_keys = sorted(robot.action_features.keys())
+        # The recorder commands Cartesian Servo Move. JAKA still returns its
+        # full fixed action schema so joint feedback is recorded in the action
+        # frame, but idle hold commands must contain only the EEF representation.
+        action_keys = [key for key in robot.action_features if key.startswith("ee.")]
+        if "gripper.pos" in robot.action_features:
+            action_keys.append("gripper.pos")
 
         loop_kwargs = {
             "robot": robot,

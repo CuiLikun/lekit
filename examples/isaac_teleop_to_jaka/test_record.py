@@ -1,7 +1,7 @@
 import pytest
 
 from lerobot.configs.dataset import DatasetRecordConfig
-from src.robots.jaka_robot import JakaRobotConfig
+from robots.jaka_robot import JakaRobotConfig
 
 from . import record as record_module
 from .record import RecordConfig

@@ -14,7 +14,7 @@ import time
 
 import numpy as np
 
-from hardwares.jaka_robot.jaka_robot import ABS, JakaError, JakaRobot, JakaRobotConfig
+from robots.jaka_robot.jaka_robot import ABS, JakaError, JakaRobot, JakaRobotConfig
 
 
 def _parse_args() -> argparse.Namespace:
@@ -92,7 +92,9 @@ def _run_stream(robot: JakaRobot, mode: str, duration_s: float, step_num: int) -
     print(f"measured frequency: {achieved_hz:.2f} Hz")
     print(f"deadline overruns: {overruns}")
     if latency_ms.size:
-        print(f"SDK latency mean/p95/max: {latency_ms.mean():.2f}/{np.percentile(latency_ms, 95):.2f}/{latency_ms.max():.2f} ms")
+        print(
+            f"SDK latency mean/p95/max: {latency_ms.mean():.2f}/{np.percentile(latency_ms, 95):.2f}/{latency_ms.max():.2f} ms"
+        )
     if period_ms.size:
         print(f"frame period mean/p95: {period_ms.mean():.2f}/{np.percentile(period_ms, 95):.2f} ms")
     if queue_depths:
