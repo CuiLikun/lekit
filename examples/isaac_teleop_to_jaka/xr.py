@@ -302,7 +302,9 @@ class IsaacTeleopTeleoperator(Teleoperator):
         info = self._session.last_step_info
         if info is not None:
             if info.worker_exception is not None:
-                raise RuntimeError("Isaac Teleop retargeting worker raised an exception") from info.worker_exception
+                raise RuntimeError(
+                    "Isaac Teleop retargeting worker raised an exception"
+                ) from info.worker_exception
             if info.frame_deadline_miss:
                 logger.warning(
                     "Isaac Teleop frame deadline miss (returned_age_frames=%s)",

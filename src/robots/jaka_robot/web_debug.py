@@ -18,7 +18,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, Literal
 
@@ -34,23 +34,19 @@ _EEF_KEYS = ("ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw")
 _CONTROL_KEYS = (*_JOINT_KEYS, *_EEF_KEYS, "gripper.pos")
 _Command = Literal["connection", "power", "enable", "servo", "abort"]
 _DASHBOARD_PATH = Path(__file__).with_name("web_debug.html")
-_DEFAULT_RELATIVE_ACTION_HOLD_S = 0.20
 
 
 class JakaWebDebugger:
     """Own one robot and serialize all browser-triggered hardware operations."""
 
-    def __init__(
-        self, robot: JakaRobot, *, relative_action_hold_s: float = _DEFAULT_RELATIVE_ACTION_HOLD_S
-    ) -> None:
-        if relative_action_hold_s < 0:
-            raise ValueError("relative_action_hold_s must not be negative")
+    def __init__(self, robot: JakaRobot) -> None:
         self.robot = robot
         self._lock = threading.RLock()
         self._motion_lock = threading.Lock()
-        self._relative_action_hold_s = relative_action_hold_s
         self._console_events: deque[dict[str, Any]] = deque(maxlen=120)
         self._next_event_id = 1
+        self._last_servo_telemetry_at = 0.0
+        self._last_servo_error: str | None = None
 
     def snapshot(self) -> dict[str, Any]:
         """Return a compact, JSON-safe hardware snapshot for one browser frame."""
@@ -64,12 +60,13 @@ class JakaWebDebugger:
                 "servo_active": False,
             }
             observation: dict[str, float] = {}
+            servo_status = self.robot.get_servo_status()
             if connected:
                 state = self.robot.get_controller_state()
                 controller.update(
                     powered_on=state["powered_on"],
                     enabled=state["enabled"],
-                    servo_active=self.robot._servo_active,
+                    servo_active=servo_status["active"],
                 )
                 values = self.robot.get_observation()
                 observation = {
@@ -77,10 +74,12 @@ class JakaWebDebugger:
                     for key in _CONTROL_KEYS
                     if key in values and isinstance(values[key], (int, float, np.number))
                 }
+            self._record_servo_status(servo_status)
             return {
                 "timestamp_ns": time.monotonic_ns(),
                 "controller": controller,
                 "observation": observation,
+                "servo": servo_status,
                 "limits": self._limits(),
                 "console": list(self._console_events),
             }
@@ -100,7 +99,7 @@ class JakaWebDebugger:
                     self._require_connection()
                     state = self.robot.get_controller_state()
                     if state["powered_on"]:
-                        if self.robot._servo_active:
+                        if self.robot.servo_active:
                             self.robot.servo_enable(False)
                         if state["enabled"]:
                             self.robot.disable_robot()
@@ -115,7 +114,7 @@ class JakaWebDebugger:
                         self.robot.enable_robot()
                 elif command == "servo":
                     self._require_connection()
-                    self.robot.servo_enable(not self.robot._servo_active)
+                    self.robot.servo_enable(not self.robot.servo_active)
                 elif command == "abort":
                     self._require_connection()
                     self.robot.motion_abort()
@@ -135,7 +134,7 @@ class JakaWebDebugger:
         with self._motion_lock:
             try:
                 with self._lock:
-                    use_servo = self.robot._servo_active
+                    use_servo = self.robot.servo_active
                     mode = "Servo Move" if use_servo else "controller-planned move"
                     self._record("info", f"Relative action requested: {key} {float(delta):+.5f}")
                     self._record("info", f"Action mode selected: {mode}")
@@ -144,12 +143,8 @@ class JakaWebDebugger:
                     self._record("info", f"Applied target: {key}={target:.5f}")
 
                 if use_servo and key != "gripper.pos":
-                    frame_count = self._stream_target(key, target)
                     with self._lock:
-                        self._record(
-                            "info",
-                            f"Servo target stream completed: {key}={target:.5f}, frames={frame_count}",
-                        )
+                        self._record("info", f"Servo target updated: {key}={target:.5f}")
                 elif key != "gripper.pos":
                     with self._lock:
                         self._record("info", f"Controller-planned move completed: {key}={target:.5f}")
@@ -171,24 +166,29 @@ class JakaWebDebugger:
         with self._lock:
             self._record("error", message)
 
-    def _stream_target(self, key: str, target: float) -> int:
-        """Continue one arm target for a bounded interval required by Servo Move."""
-
-        if self._relative_action_hold_s == 0:
-            return 1
-        deadline = time.monotonic() + self._relative_action_hold_s
-        period_s = self.robot.servo_frame_period_s()
-        frame_count = 1  # ``send_relative_action`` already sent the first Servo frame.
-        while True:
-            remaining_s = deadline - time.monotonic()
-            if remaining_s <= 0:
-                return frame_count
-            time.sleep(min(period_s, remaining_s))
-            with self._lock:
-                if not self.robot.is_connected or not self.robot._servo_active:
-                    raise RuntimeError("Servo Move ended before the relative action stream completed.")
-                self.robot.send_action({key: target}, use_servo=True)
-                frame_count += 1
+    def _record_servo_status(self, status: Mapping[str, Any]) -> None:
+        error = status.get("last_error") or status.get("watchdog")
+        if error and error != self._last_servo_error:
+            self._record("error", f"Servo sender stopped: {error}")
+            self._last_servo_error = str(error)
+        if not status.get("active"):
+            return
+        now = time.monotonic()
+        if now - self._last_servo_telemetry_at < 1.0:
+            return
+        self._last_servo_telemetry_at = now
+        queue_depth = status.get("queue_depth")
+        queue_text = "n/a" if queue_depth is None else str(queue_depth)
+        target_age = status.get("target_age_s")
+        age_text = "n/a" if target_age is None else f"{float(target_age):.2f}s"
+        self._record(
+            "info",
+            f"Servo {status.get('representation') or 'idle'} | "
+            f"{float(status.get('send_rate_hz', 0.0)):.1f} Hz | "
+            f"p95 {float(status.get('period_p95_ms', 0.0)):.2f} ms | "
+            f"max {float(status.get('period_max_ms', 0.0)):.2f} ms | "
+            f"overruns {int(status.get('overruns', 0))} | queue {queue_text} | target age {age_text}",
+        )
 
     def _record(self, level: Literal["info", "error"], message: str) -> None:
         self._console_events.append(
@@ -218,23 +218,28 @@ def create_app(
     config: JakaRobotConfig,
     *,
     refresh_hz: float = 30.0,
-    relative_action_hold_s: float = _DEFAULT_RELATIVE_ACTION_HOLD_S,
 ) -> FastAPI:
     """Create a local browser debugger app for one JAKA controller."""
 
     if refresh_hz <= 0:
         raise ValueError("refresh_hz must be positive")
 
-    debugger = JakaWebDebugger(JakaRobot(config), relative_action_hold_s=relative_action_hold_s)
+    debugger = JakaWebDebugger(JakaRobot(config))
+    broadcaster = _StateBroadcaster(debugger, period_s=1.0 / refresh_hz)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        yield
-        debugger.disconnect()
+        observation_task = asyncio.create_task(broadcaster.run(), name="jaka-observation-broadcast")
+        try:
+            yield
+        finally:
+            broadcaster.stop()
+            await observation_task
+            await asyncio.to_thread(debugger.disconnect)
 
     app = FastAPI(title="JAKA Robot Debugger", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.state.debugger = debugger
-    frame_period_s = 1.0 / refresh_hz
+    app.state.broadcaster = broadcaster
 
     @app.get("/", include_in_schema=False)
     def dashboard() -> FileResponse:
@@ -243,31 +248,81 @@ def create_app(
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:
         await websocket.accept()
-        try:
-            while True:
-                try:
-                    message = await asyncio.wait_for(websocket.receive_json(), timeout=frame_period_s)
-                    if isinstance(message, Mapping) and message.get("type") == "relative":
-                        asyncio.create_task(_handle_relative_message(debugger, message))
-                    else:
-                        await _handle_message(debugger, message)
-                except TimeoutError:
-                    pass
-                except Exception as exc:
-                    debugger.record_error(f"WebSocket command failed: {exc}")
-                    await websocket.send_json({"type": "error", "message": str(exc)})
-                try:
-                    frame = await asyncio.to_thread(debugger.snapshot)
-                except Exception as exc:
-                    debugger.record_error(f"WebSocket observation failed: {exc}")
-                    await websocket.send_json({"type": "error", "message": str(exc)})
-                    await asyncio.sleep(frame_period_s)
-                    continue
-                await websocket.send_json({"type": "state", **frame})
-        except WebSocketDisconnect:
-            return
+        send_lock = asyncio.Lock()
+        sender = asyncio.create_task(_send_state_frames(websocket, broadcaster, send_lock))
+        receiver = asyncio.create_task(_receive_commands(websocket, debugger, send_lock))
+        done, pending = await asyncio.wait({sender, receiver}, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        for task in pending:
+            with suppress(asyncio.CancelledError):
+                await task
+        for task in done:
+            with suppress(WebSocketDisconnect):
+                task.result()
 
     return app
+
+
+class _StateBroadcaster:
+    """Poll the hardware once and share each frame with every WebSocket."""
+
+    def __init__(self, debugger: JakaWebDebugger, *, period_s: float) -> None:
+        self.debugger = debugger
+        self.period_s = period_s
+        self._condition = asyncio.Condition()
+        self._stop = asyncio.Event()
+        self._frame: dict[str, Any] | None = None
+        self._version = 0
+
+    async def run(self) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time()
+        while not self._stop.is_set():
+            try:
+                frame = await asyncio.to_thread(self.debugger.snapshot)
+            except Exception as exc:
+                self.debugger.record_error(f"WebSocket observation failed: {exc}")
+            else:
+                async with self._condition:
+                    self._frame = frame
+                    self._version += 1
+                    self._condition.notify_all()
+            deadline += self.period_s
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self._stop.wait(), timeout=max(0.0, deadline - loop.time()))
+            if loop.time() - deadline > self.period_s:
+                deadline = loop.time()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    async def next_frame(self, version: int) -> tuple[int, dict[str, Any]]:
+        async with self._condition:
+            await self._condition.wait_for(lambda: self._frame is not None and self._version != version)
+            assert self._frame is not None
+            return self._version, self._frame
+
+
+async def _send_state_frames(
+    websocket: WebSocket, broadcaster: _StateBroadcaster, send_lock: asyncio.Lock
+) -> None:
+    version = -1
+    while True:
+        version, frame = await broadcaster.next_frame(version)
+        async with send_lock:
+            await websocket.send_json({"type": "state", **frame})
+
+
+async def _receive_commands(websocket: WebSocket, debugger: JakaWebDebugger, send_lock: asyncio.Lock) -> None:
+    while True:
+        message = await websocket.receive_json()
+        try:
+            await _handle_message(debugger, message)
+        except Exception as exc:
+            debugger.record_error(f"WebSocket command failed: {exc}")
+            async with send_lock:
+                await websocket.send_json({"type": "error", "message": str(exc)})
 
 
 async def _handle_message(debugger: JakaWebDebugger, message: Mapping[str, Any]) -> None:
@@ -284,15 +339,6 @@ async def _handle_message(debugger: JakaWebDebugger, message: Mapping[str, Any])
     raise ValueError(f"unsupported message type: {message_type}")
 
 
-async def _handle_relative_message(debugger: JakaWebDebugger, message: Mapping[str, Any]) -> None:
-    """Run a bounded Servo stream without delaying WebSocket state frames."""
-
-    try:
-        await _handle_message(debugger, message)
-    except Exception as exc:
-        debugger.record_error(f"WebSocket relative action failed: {exc}")
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Browser-based JAKA robot debugger")
     parser.add_argument("--ip", required=True, help="JAKA controller IP address")
@@ -301,12 +347,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--port", type=int, default=8000, help="Server port")
     parser.add_argument("--refresh-hz", type=float, default=30.0, help="WebSocket state push rate")
-    parser.add_argument(
-        "--relative-action-hold-s",
-        type=float,
-        default=_DEFAULT_RELATIVE_ACTION_HOLD_S,
-        help="Seconds to continue each arm target for Servo Move",
-    )
     parser.add_argument(
         "--joint-limits-json",
         type=_parse_limits_json,
@@ -340,8 +380,6 @@ def main() -> None:
     args = parse_args()
     if not 1 <= args.port <= 65535:
         raise SystemExit("--port must be in [1, 65535]")
-    if args.relative_action_hold_s < 0:
-        raise SystemExit("--relative-action-hold-s must not be negative")
     config = JakaRobotConfig(
         ip=args.ip,
         auto_power_on=args.power_on,
@@ -350,15 +388,7 @@ def main() -> None:
         joint_position_limits=args.joint_limits_json,
         eef_pose_limits=args.eef_limits_json,
     )
-    uvicorn.run(
-        create_app(
-            config,
-            refresh_hz=args.refresh_hz,
-            relative_action_hold_s=args.relative_action_hold_s,
-        ),
-        host=args.host,
-        port=args.port,
-    )
+    uvicorn.run(create_app(config, refresh_hz=args.refresh_hz), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

@@ -295,7 +295,7 @@ class JakaDebugApp(App[None]):
                         self.robot.connect()
                 elif command == "power":
                     if self._powered_on:
-                        if self.robot._servo_active:
+                        if self.robot.servo_active:
                             self.robot.servo_enable(False)
                         if self._enabled:
                             self.robot.disable_robot()
@@ -308,7 +308,7 @@ class JakaDebugApp(App[None]):
                     else:
                         self.robot.enable_robot()
                 elif command == "servo":
-                    self.robot.servo_enable(not self.robot._servo_active)
+                    self.robot.servo_enable(not self.robot.servo_active)
                 else:
                     self.robot.motion_abort()
                 state = self.robot.get_controller_state() if self.robot.is_connected else None
@@ -332,7 +332,7 @@ class JakaDebugApp(App[None]):
 
     def _refresh_controls(self) -> None:
         connected = self.robot.is_connected
-        servo_active = connected and self.robot._servo_active
+        servo_active = connected and self.robot.servo_active
 
         self._set_button(
             "#connect-toggle",

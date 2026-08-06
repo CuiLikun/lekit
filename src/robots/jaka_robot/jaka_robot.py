@@ -14,7 +14,11 @@ from __future__ import annotations
 import ctypes
 import importlib
 import logging
+import math
 import sys
+import threading
+import time
+from collections import deque
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -42,7 +46,7 @@ COORD_BASE, COORD_JOINT, COORD_TOOL = 0, 1, 2
 IO_CABINET, IO_TOOL, IO_EXTEND = 0, 1, 2
 PLANNER_DISABLED, PLANNER_T, PLANNER_S = -1, 0, 1
 SERVO_CYCLE_S = 0.008
-DEFAULT_SERVO_STEP_NUM = 4
+DEFAULT_SERVO_STEP_NUM = 1
 SERVO_QUEUE_MAX = 100
 
 _ERROR_MESSAGES = {
@@ -132,12 +136,77 @@ def _vector(values: Any, *, name: str) -> np.ndarray:
     return vector
 
 
+def _approach_vector(current: np.ndarray, target: np.ndarray, max_delta: float) -> np.ndarray:
+    """Move a vector toward a target by at most one Euclidean step."""
+
+    delta = target - current
+    distance = float(np.linalg.norm(delta))
+    if distance <= max_delta or distance == 0.0:
+        return target.copy()
+    return current + delta * (max_delta / distance)
+
+
+def _euler_to_quaternion(rpy: np.ndarray) -> np.ndarray:
+    """Convert XYZ roll/pitch/yaw radians to a normalized wxyz quaternion."""
+
+    roll, pitch, yaw = rpy / 2.0
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    quaternion = np.array(
+        [
+            cr * cp * cy + sr * sp * sy,
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy,
+        ]
+    )
+    return quaternion / np.linalg.norm(quaternion)
+
+
+def _quaternion_to_euler(quaternion: np.ndarray) -> np.ndarray:
+    """Convert a normalized wxyz quaternion to XYZ roll/pitch/yaw radians."""
+
+    w, x, y, z = quaternion / np.linalg.norm(quaternion)
+    roll = math.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+    pitch_term = 2.0 * (w * y - z * x)
+    pitch = math.copysign(math.pi / 2.0, pitch_term) if abs(pitch_term) >= 1.0 else math.asin(pitch_term)
+    yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    return np.array([roll, pitch, yaw])
+
+
+def _quaternion_distance(start: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, float]:
+    """Return the shortest-arc target quaternion and angular distance."""
+
+    dot = float(np.dot(start, target))
+    if dot < 0.0:
+        target = -target
+        dot = -dot
+    return target, 2.0 * math.acos(float(np.clip(dot, -1.0, 1.0)))
+
+
+def _quaternion_slerp(start: np.ndarray, target: np.ndarray, fraction: float) -> np.ndarray:
+    """Interpolate two wxyz quaternions along their shortest arc."""
+
+    target, angle = _quaternion_distance(start, target)
+    if angle < 1e-9:
+        return target.copy()
+    half_angle = angle / 2.0
+    sin_half_angle = math.sin(half_angle)
+    result = (
+        math.sin((1.0 - fraction) * half_angle) / sin_half_angle * start
+        + math.sin(fraction * half_angle) / sin_half_angle * target
+    )
+    return result / np.linalg.norm(result)
+
+
 @RobotConfig.register_subclass("jaka_robot")
 @dataclass
 class JakaRobotConfig(RobotConfig):
     """Connection, control, and optional IO configuration for :class:`JakaRobot`."""
 
     ip: str = "192.168.1.31"
+    type: str = "jaka_robot"
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
 
     auto_power_on: bool = True
@@ -161,6 +230,15 @@ class JakaRobotConfig(RobotConfig):
     eef_pose_limits: dict[str, tuple[float, float]] = field(default_factory=dict)
     servo_step_num: int = DEFAULT_SERVO_STEP_NUM
     servo_queue_warn_depth: int = 80
+    servo_joint_max_velocity_rad_s: float = 1.0
+    servo_joint_max_acceleration_rad_s2: float = 2.0
+    servo_eef_max_velocity_m_s: float = 0.05
+    servo_eef_max_acceleration_m_s2: float = 0.2
+    servo_eef_max_angular_velocity_rad_s: float = 0.5
+    servo_eef_max_angular_acceleration_rad_s2: float = 1.0
+    servo_target_timeout_s: float | None = None
+    servo_max_consecutive_overruns: int = 20
+    servo_shutdown_timeout_s: float = 2.0
 
     # Optional analog gripper mapping. Disabled mappings never read/write IO.
     gripper_analog_input_enabled: bool = False
@@ -193,6 +271,27 @@ class JakaRobotConfig(RobotConfig):
             raise ValueError("JakaRobotConfig.servo_step_num must be at least 1.")
         if not 1 <= self.servo_queue_warn_depth <= SERVO_QUEUE_MAX:
             raise ValueError(f"servo_queue_warn_depth must be in [1, {SERVO_QUEUE_MAX}].")
+        if not 0 < self.servo_joint_max_velocity_rad_s <= math.pi:
+            raise ValueError("servo_joint_max_velocity_rad_s must be in (0, pi].")
+        for name, value in (
+            ("servo_joint_max_acceleration_rad_s2", self.servo_joint_max_acceleration_rad_s2),
+            ("servo_eef_max_velocity_m_s", self.servo_eef_max_velocity_m_s),
+            ("servo_eef_max_acceleration_m_s2", self.servo_eef_max_acceleration_m_s2),
+            ("servo_eef_max_angular_velocity_rad_s", self.servo_eef_max_angular_velocity_rad_s),
+            (
+                "servo_eef_max_angular_acceleration_rad_s2",
+                self.servo_eef_max_angular_acceleration_rad_s2,
+            ),
+            ("servo_shutdown_timeout_s", self.servo_shutdown_timeout_s),
+        ):
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be positive and finite.")
+        if self.servo_target_timeout_s is not None and (
+            not np.isfinite(self.servo_target_timeout_s) or self.servo_target_timeout_s <= 0
+        ):
+            raise ValueError("servo_target_timeout_s must be positive and finite, or None.")
+        if self.servo_max_consecutive_overruns < 1:
+            raise ValueError("servo_max_consecutive_overruns must be at least 1.")
         if self.max_relative_target is not None and not (
             isinstance(self.max_relative_target, (int, float, dict))
             and not isinstance(self.max_relative_target, bool)
@@ -287,9 +386,27 @@ class JakaRobot(Robot):
         self.config = config
         self.cameras = make_cameras_from_configs(config.cameras) if config.cameras else {}
         self.rc: Any | None = None
+        self._sdk_lock = threading.RLock()
+        self._servo_state_lock = threading.RLock()
+        self._servo_stop = threading.Event()
+        self._servo_thread: threading.Thread | None = None
         self._servo_active = False
         self._servo_queue_warned = False
         self._last_eef_target: np.ndarray | None = None
+        self._servo_representation: Literal["joints", "eef"] | None = None
+        self._servo_target: np.ndarray | None = None
+        self._servo_commanded_position: np.ndarray | None = None
+        self._servo_joint_velocity = np.zeros(6)
+        self._servo_linear_velocity = np.zeros(3)
+        self._servo_angular_speed = 0.0
+        self._servo_target_updated_at: float | None = None
+        self._servo_period_samples: deque[float] = deque(maxlen=512)
+        self._servo_frames_sent = 0
+        self._servo_overruns = 0
+        self._servo_consecutive_overruns = 0
+        self._servo_queue_depth: int | None = None
+        self._servo_last_error: str | None = None
+        self._servo_watchdog: str | None = None
         self._last_gripper_position = config.gripper_fallback_position
         self._powered_by_driver = False
         self._enabled_by_driver = False
@@ -320,6 +437,13 @@ class JakaRobot(Robot):
     @property
     def is_calibrated(self) -> bool:
         return True
+
+    @property
+    def servo_active(self) -> bool:
+        """Return whether the managed Servo sender is active."""
+
+        with self._servo_state_lock:
+            return self._servo_active
 
     def calibrate(self) -> None:
         """JAKA joint calibration is controller-managed."""
@@ -357,7 +481,7 @@ class JakaRobot(Robot):
         """Use JAKA's T planner for explicit point-to-point movements."""
 
         if self.rc is not None:
-            self._call("set_motion_planner", self.rc.set_motion_planner(PLANNER_T))
+            self._call("set_motion_planner", self.rc.set_motion_planner(PLANNER_S))
 
     def disconnect(self) -> None:
         """Safely leave Servo Move, release owned state, and log out."""
@@ -405,7 +529,8 @@ class JakaRobot(Robot):
 
     def _read_joint_vector(self) -> np.ndarray:
         assert self.rc is not None
-        values = self._call("get_actual_joint_position", self.rc.get_actual_joint_position())
+        with self._sdk_lock:
+            values = self._call("get_actual_joint_position", self.rc.get_actual_joint_position())
         try:
             return _vector(values, name="actual joint position")
         except ValueError as exc:
@@ -413,7 +538,8 @@ class JakaRobot(Robot):
 
     def _read_tcp_vector_mm(self) -> np.ndarray:
         assert self.rc is not None
-        values = self._call("get_actual_tcp_position", self.rc.get_actual_tcp_position())
+        with self._sdk_lock:
+            values = self._call("get_actual_tcp_position", self.rc.get_actual_tcp_position())
         try:
             return _vector(values, name="actual TCP position")
         except ValueError as exc:
@@ -457,8 +583,9 @@ class JakaRobot(Robot):
         The arm representation is inferred from the supplied fields. Joint and
         Cartesian fields cannot be mixed in one frame because the controller
         accepts only one arm representation per command. ``use_servo=True``
-        submits a Servo Move frame; ``False`` submits one controller-planned
-        joint or linear move and requires Servo Move to be inactive.
+        atomically updates the target tracked by the internal 8 ms Servo
+        scheduler. ``False`` submits one controller-planned joint or linear
+        move and requires Servo Move to be inactive.
         """
 
         representation = self._action_representation(action, name="action")
@@ -553,7 +680,9 @@ class JakaRobot(Robot):
         requested = self._apply_position_limits(requested, self.config.joint_position_limits)
         target = tuple(requested[f"{motor}.pos"] for motor in self.motors)
         if use_servo:
-            self.servo_joint_frame(target)
+            self._update_servo_target(
+                "joints", np.asarray(target), current=np.fromiter(current.values(), float)
+            )
         else:
             self.move_j(target, is_block=True)
         return requested
@@ -583,7 +712,7 @@ class JakaRobot(Robot):
             if key in self.config.eef_pose_limits:
                 target[index] = np.clip(target[index], *self.config.eef_pose_limits[key])
         if use_servo:
-            self.servo_eef_frame(target)
+            self._update_servo_target("eef", target, current=reference)
             self._last_eef_target = target
         else:
             self.move_l(target, is_block=True)
@@ -605,38 +734,40 @@ class JakaRobot(Robot):
 
         target = _vector(joints, name="joints")
         assert self.rc is not None
-        self._call(
-            "joint_move",
-            self.rc.joint_move(
-                tuple(map(float, target)),
-                ABS,
-                bool(is_block),
-                self.config.joint_speed if speed is None else speed,
-            ),
-        )
+        with self._sdk_lock:
+            self._call(
+                "joint_move",
+                self.rc.joint_move(
+                    tuple(map(float, target)),
+                    ABS,
+                    bool(is_block),
+                    self.config.joint_speed if speed is None else speed,
+                ),
+            )
 
     @check_if_not_connected
     def move_l(self, pose: Any, *, is_block: bool = True, speed_mm_s: float | None = None) -> None:
         """Execute one controller-planned absolute TCP linear move in m/rad."""
 
         target = _vector(pose, name="pose").copy()
-        target[:3] *= 1000.0
+        target[:3] *= 1000.0  # convert to mm for JAKA SDK
         assert self.rc is not None
-        self._call(
-            "linear_move",
-            self.rc.linear_move(
-                tuple(map(float, target)),
-                ABS,
-                bool(is_block),
-                self.config.linear_speed_mm_s if speed_mm_s is None else speed_mm_s,
-            ),
-        )
+        with self._sdk_lock:
+            self._call(
+                "linear_move",
+                self.rc.linear_move(
+                    tuple(map(float, target)),
+                    ABS,
+                    bool(is_block),
+                    self.config.linear_speed_mm_s if speed_mm_s is None else speed_mm_s,
+                ),
+            )
 
     @check_if_not_connected
     def set_eef_pose(self, pose: Any) -> None:
         """Compatibility alias for a blocking controller-planned linear move."""
 
-        self.move_l(pose, is_block=True)
+        self.move_l(pose, is_block=False)
 
     @check_if_not_connected
     def move_eef_relative(self, delta: Any) -> tuple[np.ndarray, np.ndarray]:
@@ -644,7 +775,7 @@ class JakaRobot(Robot):
 
         current = self.get_eef_pose()
         target = current + _vector(delta, name="delta")
-        self.move_l(target, is_block=True)
+        self.move_l(target, is_block=False)
         return current, target
 
     @check_if_not_connected
@@ -652,7 +783,8 @@ class JakaRobot(Robot):
         """Power the controller on and record that this adapter owns that state."""
 
         assert self.rc is not None
-        self._call("power_on", self.rc.power_on())
+        with self._sdk_lock:
+            self._call("power_on", self.rc.power_on())
         self._powered_by_driver = True
 
     @check_if_not_connected
@@ -660,7 +792,8 @@ class JakaRobot(Robot):
         """Explicitly power the controller off after all motion has stopped."""
 
         assert self.rc is not None
-        self._call("power_off", self.rc.power_off())
+        with self._sdk_lock:
+            self._call("power_off", self.rc.power_off())
         self._powered_by_driver = False
 
     @check_if_not_connected
@@ -668,7 +801,8 @@ class JakaRobot(Robot):
         """Enable robot servos and record that this adapter owns that state."""
 
         assert self.rc is not None
-        self._call("enable_robot", self.rc.enable_robot())
+        with self._sdk_lock:
+            self._call("enable_robot", self.rc.enable_robot())
         self._enabled_by_driver = True
 
     @check_if_not_connected
@@ -678,7 +812,8 @@ class JakaRobot(Robot):
         if self._servo_active:
             self._set_servo(False)
         assert self.rc is not None
-        self._call("disable_robot", self.rc.disable_robot())
+        with self._sdk_lock:
+            self._call("disable_robot", self.rc.disable_robot())
         self._enabled_by_driver = False
 
     @check_if_not_connected
@@ -692,7 +827,8 @@ class JakaRobot(Robot):
                 "powered_on": self._powered_by_driver,
                 "enabled": self._enabled_by_driver,
             }
-        values = self._call("get_robot_status_simple", getter())
+        with self._sdk_lock:
+            values = self._call("get_robot_status_simple", getter())
         if len(values) < 2:
             raise JakaError("get_robot_status_simple", -1, values)
         return {"powered_on": bool(values[-2]), "enabled": bool(values[-1])}
@@ -702,21 +838,24 @@ class JakaRobot(Robot):
         """Stop the controller's active planned motion."""
 
         assert self.rc is not None
-        self._call("motion_abort", self.rc.motion_abort())
+        with self._sdk_lock:
+            self._call("motion_abort", self.rc.motion_abort())
 
     @check_if_not_connected
     def clear_error(self) -> None:
         """Clear a recoverable controller fault after its physical cause is resolved."""
 
         assert self.rc is not None
-        self._call("clear_error", self.rc.clear_error())
+        with self._sdk_lock:
+            self._call("clear_error", self.rc.clear_error())
 
     @check_if_not_connected
     def set_drag_mode(self, enabled: bool) -> None:
         """Enable or disable JAKA drag mode."""
 
         assert self.rc is not None
-        self._call("drag_mode_enable", self.rc.drag_mode_enable(bool(enabled)))
+        with self._sdk_lock:
+            self._call("drag_mode_enable", self.rc.drag_mode_enable(bool(enabled)))
 
     def servo_frame_period_s(self, step_num: int | None = None) -> float:
         """Return the nominal period of one Servo Move frame."""
@@ -728,28 +867,285 @@ class JakaRobot(Robot):
 
     @check_if_not_connected
     def servo_enable(self, enabled: bool = True) -> None:
-        """Enter or leave Servo Move mode. Repeated calls are idempotent."""
+        """Start or stop continuous 8 ms Servo target tracking.
+
+        Enabling initializes the scheduler from measured joint feedback before
+        entering Servo Move. Disabling first stops and joins the sender, then
+        asks the controller to leave Servo Move mode. Repeated calls are
+        idempotent.
+        """
 
         self._set_servo(bool(enabled))
 
     def _set_servo(self, enabled: bool, *, suppress_errors: bool = False) -> None:
-        if self._servo_active == enabled:
-            return
         assert self.rc is not None
+        if enabled:
+            if self._servo_active:
+                return
+            initial_position = self._read_joint_vector()
+            try:
+                self._set_controller_servo(True)
+            except JakaError:
+                if suppress_errors:
+                    logger.warning("Could not enter JAKA Servo Move mode during setup.", exc_info=True)
+                    return
+                raise
+            with self._servo_state_lock:
+                self._servo_active = True
+                self._servo_queue_warned = False
+                self._last_eef_target = None
+                self._servo_representation = "joints"
+                self._servo_target = initial_position.copy()
+                self._servo_commanded_position = initial_position.copy()
+                self._servo_joint_velocity.fill(0.0)
+                self._servo_linear_velocity.fill(0.0)
+                self._servo_angular_speed = 0.0
+                self._servo_target_updated_at = time.monotonic()
+                self._servo_period_samples.clear()
+                self._servo_frames_sent = 0
+                self._servo_overruns = 0
+                self._servo_consecutive_overruns = 0
+                self._servo_queue_depth = None
+                self._servo_last_error = None
+                self._servo_watchdog = None
+                self._servo_stop.clear()
+                self._servo_thread = threading.Thread(
+                    target=self._servo_worker,
+                    name=f"jaka-servo-{self.config.ip}",
+                    daemon=True,
+                )
+                self._servo_thread.start()
+            return
+
+        thread = self._servo_thread
+        if not self._servo_active and (thread is None or not thread.is_alive()):
+            return
+        self._servo_stop.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=self.config.servo_shutdown_timeout_s)
+            if thread.is_alive():
+                message = (
+                    f"Servo sender did not stop within {self.config.servo_shutdown_timeout_s:.2f}s; "
+                    "controller mode was not changed concurrently with an in-flight SDK call."
+                )
+                with self._servo_state_lock:
+                    self._servo_last_error = message
+                if suppress_errors:
+                    logger.error(message)
+                    return
+                raise RuntimeError(message)
         try:
+            self._set_controller_servo(False)
+        except JakaError:
+            if suppress_errors:
+                logger.warning("Could not leave JAKA Servo Move mode during cleanup.", exc_info=True)
+            else:
+                raise
+        finally:
+            with self._servo_state_lock:
+                self._servo_active = False
+                self._servo_thread = None
+                self._servo_representation = None
+                self._servo_target = None
+                self._servo_commanded_position = None
+                self._servo_queue_warned = False
+                self._last_eef_target = None
+
+    def _set_controller_servo(self, enabled: bool) -> None:
+        assert self.rc is not None
+        with self._sdk_lock:
             try:
                 result = self.rc.servo_move_enable(enabled, True)
             except TypeError:
                 result = self.rc.servo_move_enable(enabled)
             self._call("servo_move_enable", result)
-        except JakaError:
-            if suppress_errors:
-                logger.warning("Could not leave JAKA Servo Move mode during cleanup.", exc_info=True)
-                return
-            raise
-        self._servo_active = enabled
-        self._servo_queue_warned = False
-        self._last_eef_target = None
+
+    def _update_servo_target(
+        self,
+        representation: Literal["joints", "eef"],
+        target: np.ndarray,
+        *,
+        current: np.ndarray,
+    ) -> None:
+        """Atomically replace the desired target consumed by the sender."""
+
+        target = _vector(target, name="Servo target").copy()
+        current = _vector(current, name="current Servo position").copy()
+        with self._servo_state_lock:
+            if not self._servo_active or self._servo_thread is None or not self._servo_thread.is_alive():
+                detail = f" Last worker error: {self._servo_last_error}" if self._servo_last_error else ""
+                raise RuntimeError(f"Servo Move sender is not running.{detail}")
+            if self._servo_representation != representation:
+                self._servo_representation = representation
+                self._servo_commanded_position = current
+                self._servo_joint_velocity.fill(0.0)
+                self._servo_linear_velocity.fill(0.0)
+                self._servo_angular_speed = 0.0
+            self._servo_target = target
+            self._servo_target_updated_at = time.monotonic()
+
+    def _servo_worker(self) -> None:
+        period_s = SERVO_CYCLE_S
+        deadline = time.monotonic()
+        last_frame_at: float | None = None
+        try:
+            while not self._servo_stop.is_set():
+                wait_s = deadline - time.monotonic()
+                if wait_s > 0 and self._servo_stop.wait(wait_s):
+                    return
+                frame_at = time.monotonic()
+                if last_frame_at is not None:
+                    measured_period = frame_at - last_frame_at
+                    with self._servo_state_lock:
+                        self._servo_period_samples.append(measured_period)
+                        if measured_period > period_s * 1.5:
+                            self._servo_overruns += 1
+                            self._servo_consecutive_overruns += 1
+                        else:
+                            self._servo_consecutive_overruns = 0
+                        if self._servo_consecutive_overruns >= self.config.servo_max_consecutive_overruns:
+                            raise RuntimeError(
+                                "Servo watchdog detected "
+                                f"{self._servo_consecutive_overruns} consecutive timing overruns"
+                            )
+                last_frame_at = frame_at
+
+                with self._servo_state_lock:
+                    self._check_servo_target_timeout(frame_at)
+                    representation = self._servo_representation
+                    if representation is None or self._servo_target is None:
+                        raise RuntimeError("Servo sender has no initialized target")
+                    if representation == "joints":
+                        frame = self._step_servo_joints(period_s)
+                        queue_depth = self._send_servo_joint_frame(frame, step_num=1)
+                    else:
+                        frame = self._step_servo_eef(period_s)
+                        queue_depth = self._send_servo_eef_frame(frame, step_num=1)
+                    self._servo_frames_sent += 1
+                    self._servo_queue_depth = queue_depth
+
+                deadline += period_s
+                if frame_at >= deadline:
+                    missed = int((frame_at - deadline) // period_s) + 1
+                    deadline += missed * period_s
+        except Exception as exc:
+            self._fail_servo_worker(exc)
+
+    def _check_servo_target_timeout(self, now: float) -> None:
+        timeout_s = self.config.servo_target_timeout_s
+        if timeout_s is None or self._servo_target_updated_at is None:
+            return
+        age_s = now - self._servo_target_updated_at
+        if age_s > timeout_s:
+            self._servo_watchdog = f"target timeout after {age_s:.3f}s"
+            raise RuntimeError(f"Servo watchdog target timeout after {age_s:.3f}s")
+
+    def _step_servo_joints(self, period_s: float) -> np.ndarray:
+        assert self._servo_commanded_position is not None and self._servo_target is not None
+        error = self._servo_target - self._servo_commanded_position
+        acceleration = self.config.servo_joint_max_acceleration_rad_s2
+        max_velocity = self.config.servo_joint_max_velocity_rad_s
+        goal_velocity = np.sign(error) * np.minimum(max_velocity, np.sqrt(2.0 * acceleration * np.abs(error)))
+        self._servo_joint_velocity += np.clip(
+            goal_velocity - self._servo_joint_velocity,
+            -acceleration * period_s,
+            acceleration * period_s,
+        )
+        step = self._servo_joint_velocity * period_s
+        reached = np.abs(step) >= np.abs(error)
+        step[reached] = error[reached]
+        self._servo_joint_velocity[reached] = 0.0
+        self._servo_commanded_position = self._servo_commanded_position + step
+        return self._servo_commanded_position.copy()
+
+    def _step_servo_eef(self, period_s: float) -> np.ndarray:
+        assert self._servo_commanded_position is not None and self._servo_target is not None
+        commanded = self._servo_commanded_position.copy()
+
+        translation_error = self._servo_target[:3] - commanded[:3]
+        distance = float(np.linalg.norm(translation_error))
+        if distance > 1e-12:
+            max_velocity = self.config.servo_eef_max_velocity_m_s
+            acceleration = self.config.servo_eef_max_acceleration_m_s2
+            speed = min(max_velocity, math.sqrt(2.0 * acceleration * distance))
+            goal_velocity = translation_error / distance * speed
+            self._servo_linear_velocity = _approach_vector(
+                self._servo_linear_velocity, goal_velocity, acceleration * period_s
+            )
+            translation_step = self._servo_linear_velocity * period_s
+            if float(np.linalg.norm(translation_step)) >= distance:
+                commanded[:3] = self._servo_target[:3]
+                self._servo_linear_velocity.fill(0.0)
+            else:
+                commanded[:3] += translation_step
+        else:
+            self._servo_linear_velocity.fill(0.0)
+
+        start_q = _euler_to_quaternion(commanded[3:])
+        target_q = _euler_to_quaternion(self._servo_target[3:])
+        target_q, angle = _quaternion_distance(start_q, target_q)
+        if angle > 1e-9:
+            acceleration = self.config.servo_eef_max_angular_acceleration_rad_s2
+            goal_speed = min(
+                self.config.servo_eef_max_angular_velocity_rad_s,
+                math.sqrt(2.0 * acceleration * angle),
+            )
+            self._servo_angular_speed = min(goal_speed, self._servo_angular_speed + acceleration * period_s)
+            angular_step = self._servo_angular_speed * period_s
+            if angular_step >= angle:
+                commanded[3:] = self._servo_target[3:]
+                self._servo_angular_speed = 0.0
+            else:
+                commanded[3:] = _quaternion_to_euler(
+                    _quaternion_slerp(start_q, target_q, angular_step / angle)
+                )
+        else:
+            self._servo_angular_speed = 0.0
+
+        self._servo_commanded_position = commanded
+        return commanded.copy()
+
+    def _fail_servo_worker(self, exc: Exception) -> None:
+        message = str(exc)
+        logger.error("JAKA Servo sender stopped: %s", message, exc_info=True)
+        with self._servo_state_lock:
+            self._servo_last_error = message
+            if self._servo_watchdog is None and "watchdog" in message.lower():
+                self._servo_watchdog = message
+            self._servo_active = False
+            self._servo_stop.set()
+        try:
+            self._set_controller_servo(False)
+        except Exception:
+            logger.error("Could not leave Servo Move after sender failure.", exc_info=True)
+
+    def get_servo_status(self) -> dict[str, Any]:
+        """Return a JSON-safe snapshot of sender timing and safety state."""
+
+        with self._servo_state_lock:
+            samples = np.asarray(self._servo_period_samples, dtype=float)
+            mean_period = float(samples.mean()) if samples.size else 0.0
+            now = time.monotonic()
+            target_age = (
+                max(0.0, now - self._servo_target_updated_at)
+                if self._servo_target_updated_at is not None
+                else None
+            )
+            return {
+                "active": self._servo_active,
+                "worker_alive": self._servo_thread is not None and self._servo_thread.is_alive(),
+                "representation": self._servo_representation,
+                "target_age_s": target_age,
+                "send_rate_hz": 1.0 / mean_period if mean_period > 0 else 0.0,
+                "period_p95_ms": float(np.percentile(samples, 95) * 1000.0) if samples.size else 0.0,
+                "period_max_ms": float(samples.max() * 1000.0) if samples.size else 0.0,
+                "frames_sent": self._servo_frames_sent,
+                "overruns": self._servo_overruns,
+                "consecutive_overruns": self._servo_consecutive_overruns,
+                "queue_depth": self._servo_queue_depth,
+                "watchdog": self._servo_watchdog,
+                "last_error": self._servo_last_error,
+            }
 
     @contextmanager
     def servo_stream(self, step_num: int | None = None) -> Generator[float]:
@@ -770,45 +1166,63 @@ class JakaRobot(Robot):
         """Return the controller-reported Servo Move state."""
 
         assert self.rc is not None
-        values = self._call("is_in_servomove", self.rc.is_in_servomove())
+        with self._sdk_lock:
+            values = self._call("is_in_servomove", self.rc.is_in_servomove())
         return bool(values[0]) if values else self._servo_active
 
     @check_if_not_connected
     def servo_joint_frame(
         self, joints: Any, *, move_mode: int = ABS, step_num: int | None = None
     ) -> int | None:
-        """Submit one raw joint Servo Move target in radians."""
+        """Submit one advanced raw joint frame outside target tracking.
+
+        Prefer ``send_action(..., use_servo=True)``. A raw frame is serialized
+        with the managed sender but will be superseded on its next 8 ms cycle.
+        """
 
         if not self._servo_active:
             raise RuntimeError("Servo Move is disabled.")
         if move_mode not in {ABS, INCR}:
             raise ValueError("Servo Move supports ABS or INCR targets only.")
         target = _vector(joints, name="joints")
-        assert self.rc is not None
-        return self._queue_depth(
-            self._call(
-                "servo_j",
-                self.rc.servo_j(tuple(map(float, target)), move_mode, self._servo_step_num(step_num)),
-            )
-        )
+        return self._send_servo_joint_frame(target, move_mode=move_mode, step_num=step_num)
 
     @check_if_not_connected
     def servo_eef_frame(self, pose: Any, *, move_mode: int = ABS, step_num: int | None = None) -> int | None:
-        """Submit one raw Cartesian Servo Move target in m/rad."""
+        """Submit one advanced raw Cartesian frame outside target tracking."""
 
         if not self._servo_active:
             raise RuntimeError("Servo Move is disabled.")
         if move_mode not in {ABS, INCR}:
             raise ValueError("Servo Move supports ABS or INCR targets only.")
-        target = _vector(pose, name="pose").copy()
+        target = _vector(pose, name="pose")
+        return self._send_servo_eef_frame(target, move_mode=move_mode, step_num=step_num)
+
+    def _send_servo_joint_frame(
+        self, joints: np.ndarray, *, move_mode: int = ABS, step_num: int | None = None
+    ) -> int | None:
+        assert self.rc is not None
+        with self._sdk_lock:
+            return self._queue_depth(
+                self._call(
+                    "servo_j",
+                    self.rc.servo_j(tuple(map(float, joints)), move_mode, self._servo_step_num(step_num)),
+                )
+            )
+
+    def _send_servo_eef_frame(
+        self, pose: np.ndarray, *, move_mode: int = ABS, step_num: int | None = None
+    ) -> int | None:
+        target = pose.copy()
         target[:3] *= 1000.0
         assert self.rc is not None
-        return self._queue_depth(
-            self._call(
-                "servo_p",
-                self.rc.servo_p(tuple(map(float, target)), move_mode, self._servo_step_num(step_num)),
+        with self._sdk_lock:
+            return self._queue_depth(
+                self._call(
+                    "servo_p",
+                    self.rc.servo_p(tuple(map(float, target)), move_mode, self._servo_step_num(step_num)),
+                )
             )
-        )
 
     def _servo_step_num(self, step_num: int | None) -> int:
         step = self.config.servo_step_num if step_num is None else int(step_num)
@@ -837,12 +1251,13 @@ class JakaRobot(Robot):
         if not self.config.gripper_analog_input_enabled:
             return {"gripper.pos": self._last_gripper_position}
         assert self.rc is not None
-        values = self._call(
-            "get_analog_input",
-            self.rc.get_analog_input(
-                self.config.gripper_analog_input_iotype, self.config.gripper_analog_input_index
-            ),
-        )
+        with self._sdk_lock:
+            values = self._call(
+                "get_analog_input",
+                self.rc.get_analog_input(
+                    self.config.gripper_analog_input_iotype, self.config.gripper_analog_input_index
+                ),
+            )
         raw = float(values[0])
         position = (raw - self.config.gripper_analog_input_min) / (
             self.config.gripper_analog_input_max - self.config.gripper_analog_input_min
@@ -872,14 +1287,15 @@ class JakaRobot(Robot):
             self.config.gripper_analog_output_max - self.config.gripper_analog_output_min
         )
         assert self.rc is not None
-        self._call(
-            "set_analog_output",
-            self.rc.set_analog_output(
-                self.config.gripper_analog_output_iotype,
-                self.config.gripper_analog_output_index,
-                raw,
-            ),
-        )
+        with self._sdk_lock:
+            self._call(
+                "set_analog_output",
+                self.rc.set_analog_output(
+                    self.config.gripper_analog_output_iotype,
+                    self.config.gripper_analog_output_index,
+                    raw,
+                ),
+            )
         self._last_gripper_position = applied_position
         return applied_position
 

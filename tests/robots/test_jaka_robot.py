@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from robots.jaka_robot import jaka_robot as driver
@@ -78,6 +80,19 @@ class FakeRC:
         return self._call("linear_move", pose, mode, is_block, speed)
 
 
+def wait_until(predicate, *, timeout: float = 0.5) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.002)
+    raise AssertionError("condition was not met before timeout")
+
+
+def servo_calls(rc: FakeRC, operation: str) -> list[tuple]:
+    return [call for call in rc.calls if call[0] == operation]
+
+
 @pytest.fixture
 def robot(monkeypatch):
     rc = FakeRC()
@@ -94,15 +109,25 @@ def test_joint_action_is_servo_bounded_and_observation_uses_si_units(robot):
     assert observation["joint_2.pos"] == 0.1
     assert observation["ee.z"] == 0.3
 
+    before = len(servo_calls(rc, "servo_j"))
     applied = arm.send_action({"joint_1.pos": 1.0, "gripper.pos": 0.4})
     assert applied["joint_1.pos"] == pytest.approx(0.05)
     assert applied["ee.x"] == pytest.approx(0.1)
     assert set(applied) == set(arm.action_features)
-    assert rc.calls[-1] == ("servo_j", (0.05, 0.1, 0.2, 0.3, 0.4, 0.5), driver.ABS, 4)
+    wait_until(
+        lambda: len(servo_calls(rc, "servo_j")) > before and servo_calls(rc, "servo_j")[-1][1][0] > 0.0
+    )
+    first_target = next(call for call in servo_calls(rc, "servo_j")[before:] if call[1][0] > 0.0)
+    assert 0.0 < first_target[1][0] < 0.05
+    assert first_target[2:] == (driver.ABS, 1)
 
+    before = len(servo_calls(rc, "servo_j"))
     applied = arm.send_relative_action({"joint_2.pos": -0.02})
     assert applied["joint_2.pos"] == pytest.approx(0.08)
-    assert rc.calls[-1] == ("servo_j", (0.0, 0.08, 0.2, 0.3, 0.4, 0.5), driver.ABS, 4)
+    wait_until(
+        lambda: len(servo_calls(rc, "servo_j")) > before and servo_calls(rc, "servo_j")[-1][1][1] < 0.1
+    )
+    assert servo_calls(rc, "servo_j")[-1][1][1] < 0.1
 
     assert arm.send_relative_action({"gripper.pos": 0.1})["gripper.pos"] == pytest.approx(0.5)
     assert arm.send_relative_action({"gripper.pos": 0.1})["gripper.pos"] == pytest.approx(0.6)
@@ -114,19 +139,22 @@ def test_cartesian_action_is_servo_bounded_and_converted_to_mm(monkeypatch):
     arm = driver.JakaRobot(driver.JakaRobotConfig(ip="10.0.0.2", max_eef_step_m=0.01))
     arm.connect()
     try:
+        before = len(servo_calls(rc, "servo_p"))
         applied = arm.send_action({"ee.x": 1.0, "ee.roll": 1.0})
         assert applied["ee.x"] == pytest.approx(0.11)
         assert applied["ee.roll"] == pytest.approx(0.18)
         assert applied["joint_2.pos"] == pytest.approx(0.1)
         assert set(applied) == set(arm.action_features)
-        assert rc.calls[-1] == ("servo_p", (110.0, 200.0, 300.0, 0.18, 0.2, 0.3), driver.ABS, 4)
+        wait_until(
+            lambda: len(servo_calls(rc, "servo_p")) > before and servo_calls(rc, "servo_p")[-1][1][0] > 100.0
+        )
+        first_target = next(call for call in servo_calls(rc, "servo_p")[before:] if call[1][0] > 100.0)
+        assert 100.0 < first_target[1][0] < 110.0
+        assert 0.1 < first_target[1][3] < 0.18
+        assert first_target[2:] == (driver.ABS, 1)
 
-        rc.tcp_mm = (200.0, 200.0, 300.0, 0.1, 0.2, 0.3)
         applied = arm.send_relative_action({"ee.x": 0.005})
-        assert applied["ee.x"] == pytest.approx(0.205)
-        assert rc.calls[-1][0] == "servo_p"
-        assert rc.calls[-1][1] == pytest.approx((205.0, 200.0, 300.0, 0.1, 0.2, 0.3))
-        assert rc.calls[-1][2:] == (driver.ABS, 4)
+        assert applied["ee.x"] == pytest.approx(0.105)
     finally:
         arm.disconnect()
 
@@ -136,10 +164,7 @@ def test_action_representation_can_switch_and_mixed_frames_are_rejected(robot):
 
     arm.send_action({"joint_1.pos": 0.01})
     arm.send_action({"ee.x": 0.105})
-    assert [call[0] for call in rc.calls if call[0] in {"servo_j", "servo_p"}] == [
-        "servo_j",
-        "servo_p",
-    ]
+    wait_until(lambda: bool(servo_calls(rc, "servo_p")))
 
     servo_call_count = len([call for call in rc.calls if call[0] in {"servo_j", "servo_p"}])
     with pytest.raises(ValueError, match="cannot mix joint and EEF"):
@@ -202,9 +227,13 @@ def test_configured_joint_and_eef_position_limits_are_enforced(monkeypatch):
     )
     arm.connect()
     try:
+        before = len(servo_calls(rc, "servo_j"))
         applied = arm.send_relative_action({"joint_1.pos": 0.05})
         assert applied["joint_1.pos"] == pytest.approx(0.01)
-        assert rc.calls[-1][1][0] == pytest.approx(0.01)
+        wait_until(
+            lambda: len(servo_calls(rc, "servo_j")) > before and servo_calls(rc, "servo_j")[-1][1][0] > 0.0
+        )
+        assert 0.0 < servo_calls(rc, "servo_j")[-1][1][0] <= 0.01
     finally:
         arm.disconnect()
 
@@ -218,8 +247,57 @@ def test_configured_joint_and_eef_position_limits_are_enforced(monkeypatch):
     )
     arm.connect()
     try:
+        before = len(servo_calls(rc, "servo_p"))
         applied = arm.send_relative_action({"ee.x": 0.01})
         assert applied["ee.x"] == pytest.approx(0.103)
-        assert rc.calls[-1][1][0] == pytest.approx(103.0)
+        wait_until(
+            lambda: len(servo_calls(rc, "servo_p")) > before and servo_calls(rc, "servo_p")[-1][1][0] > 100.0
+        )
+        assert 100.0 < servo_calls(rc, "servo_p")[-1][1][0] <= 103.0
+    finally:
+        arm.disconnect()
+
+
+def test_servo_sender_continues_at_eight_ms_and_stops_before_controller_exit(robot):
+    arm, rc = robot
+    wait_until(lambda: len(servo_calls(rc, "servo_j")) >= 4)
+    count = len(servo_calls(rc, "servo_j"))
+    time.sleep(0.025)
+    assert len(servo_calls(rc, "servo_j")) > count
+
+    arm.servo_enable(False)
+    stopped_count = len(servo_calls(rc, "servo_j"))
+    time.sleep(0.025)
+    assert len(servo_calls(rc, "servo_j")) == stopped_count
+    assert rc.calls[-1] == ("servo_move_enable", False)
+
+
+def test_servo_target_timeout_disables_controller(monkeypatch):
+    rc = FakeRC()
+    monkeypatch.setattr(driver, "_create_rc", lambda _ip: rc)
+    arm = driver.JakaRobot(driver.JakaRobotConfig(ip="10.0.0.2", servo_target_timeout_s=0.025))
+    arm.connect()
+    try:
+        wait_until(lambda: not arm.get_servo_status()["worker_alive"])
+        status = arm.get_servo_status()
+        assert status["active"] is False
+        assert "target timeout" in status["watchdog"]
+        assert ("servo_move_enable", False) in rc.calls
+    finally:
+        arm.disconnect()
+
+
+def test_servo_sdk_failure_stops_sender_and_records_error(monkeypatch):
+    rc = FakeRC()
+    rc.servo_j = lambda _joints, _mode, _step: (-3,)
+    monkeypatch.setattr(driver, "_create_rc", lambda _ip: rc)
+    arm = driver.JakaRobot(driver.JakaRobotConfig(ip="10.0.0.2"))
+    arm.connect()
+    try:
+        wait_until(lambda: not arm.get_servo_status()["worker_alive"])
+        status = arm.get_servo_status()
+        assert status["active"] is False
+        assert "servo_j failed (-3)" in status["last_error"]
+        assert ("servo_move_enable", False) in rc.calls
     finally:
         arm.disconnect()

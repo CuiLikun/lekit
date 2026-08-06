@@ -26,7 +26,6 @@ Usage:
         --robot.type=jaka_robot \
         --robot.ip=192.168.1.31 \
         --robot.id=jaka_arm \
-        --robot.servo_step_num=4 \
         --teleop.type=xr_controller \
         --robot.cameras="{ hand: {type: intelrealsense, serial_number_or_name: '342522070741', width: 640, height: 480, fps: 30}}" \
         --dataset.repo_id=<hf_user>/<dataset_name> \
@@ -65,15 +64,15 @@ from lerobot.configs.dataset import DatasetRecordConfig
 from lerobot.datasets import (
     LeRobotDataset,
     VideoEncodingManager,
-    create_initial_features,
     safe_stop_image_writer,
 )
 from lerobot.robots import make_robot_from_config
 from lerobot.utils.constants import ACTION, OBS_STR
-from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dicts
+from lerobot.utils.feature_utils import build_dataset_frame
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging
 from robots.jaka_robot import JakaRobot, JakaRobotConfig
+from robots.jaka_robot.dataset_features import build_dataset_features
 
 from .xr import CLOUDXR_ENV_FILE, IsaacTeleopConfig, make_xr_device
 
@@ -315,15 +314,14 @@ def _record_loop(
 
         live.update(_control_panel(device.telemetry, action, obs), refresh=True)
 
-        sent_action = robot.send_action(action)
+        sent_action = robot.send_action(action, use_servo=False)
 
         if record_frames:
             action_frame = build_dataset_frame(dataset.features, sent_action, prefix=ACTION)
             dataset.add_frame({**obs_frame, **action_frame, "task": single_task})
 
-        # Work time of this iteration: obs read + compute + send + record. Excludes
-        # the panel render (sub-ms) and the precise_sleep. If frame_ms ≫ 33 ms the
-        # loop is missing servo ticks and the JAKA queue is growing.
+        # Work time of this iteration: obs read + compute + target update + record.
+        # The robot-owned 8 ms sender continues independently if this loop is late.
         frame_ms = (time.perf_counter() - loop_start) * 1000
         live.update(_control_panel(device.telemetry, action, obs, frame_ms), refresh=True)
 
@@ -336,28 +334,12 @@ def _record_loop(
 
 @parser.wrap()
 def record(cfg: RecordConfig) -> LeRobotDataset:
-    nominal_fps = 1.0 / (cfg.robot.servo_step_num * 0.008)
-    relative_fps_error = abs(float(cfg.dataset.fps) - nominal_fps) / nominal_fps
-    if relative_fps_error > 0.1:
-        raise ValueError(
-            f"--dataset.fps={cfg.dataset.fps} does not match JAKA Servo Move "
-            f"step_num={cfg.robot.servo_step_num} ({nominal_fps:.2f} Hz); "
-            "keep the difference within 10% (use fps=30 with step_num=4)."
-        )
-
     init_logging()
     logging.info(pformat(asdict(cfg)))
 
     robot, device = build_device(cfg)
 
-    # Dataset features: JAKA's fixed joint + gripper + EE action schema and
-    # joint + TCP + EE observation schema. No host-side IK processor, so the
-    # pipeline-aggregation step is a no-op and we can build the feature dict
-    # directly from the robot's schemas.
-    dataset_features = combine_feature_dicts(
-        create_initial_features(action=robot.action_features),
-        create_initial_features(observation=robot.observation_features),
-    )
+    dataset_features = build_dataset_features(robot, use_videos=cfg.dataset.video)
 
     num_cameras = len(robot.cameras) if hasattr(robot, "cameras") else 0
     image_writer_threads = cfg.dataset.num_image_writer_threads_per_camera * num_cameras

@@ -11,9 +11,9 @@ https://www.jaka.com/docs/guide/1.7.2/SDK/Python.html
 - SDK Cartesian units are millimetres and radians; the LeRobot-facing driver
   exposes metres and radians.
 - Servo Move must be enabled before servo_p and disabled during cleanup.
-- Targets must be sent continuously.
-- The command period is step_num times 8 ms; step_num=4 pairs with
-  dataset fps 30.
+- `JakaRobot` continuously feeds interpolated targets to the SDK at the
+  controller's 8 ms cycle. The XR loop only updates the desired target at the
+  dataset rate.
 - The controller reports a queue depth up to 100. The driver warns before the
   configured queue threshold and raises on SDK errors.
 - The default XR transform targets the robot base frame, so this recorder
@@ -34,7 +34,6 @@ python -m examples.isaac_teleop_to_jaka.record \
     --robot.type=jaka_robot \
     --robot.ip=192.168.1.31 \
     --robot.id=jaka_arm \
-    --robot.servo_step_num=4 \
     --teleop.type=xr_controller \
     --robot.cameras="{ hand: {type: intelrealsense, serial_number_or_name: '342522070741', width: 640, height: 480, fps: 30}}" \
     --dataset.repo_id="sorel/pick-cube" \

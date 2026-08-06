@@ -19,14 +19,18 @@ uv run python -m robots.jaka_robot.web_debug --ip 192.168.1.31
 
 Open `http://<controller-host-ip>:8000` from any device on the same LAN; the
 server listens on all local interfaces by default. State frames are delivered
-through one WebSocket at 30 Hz by default, and relative +/- commands are
-serialized with observation reads before reaching the robot SDK. Do not expose
-physical robot controls on an untrusted network.
+through WebSockets at 30 Hz by default. One shared observation loop reads the
+robot once per frame regardless of how many browsers are open. Relative +/-
+commands are serialized before reaching the robot SDK. Do not expose physical
+robot controls on an untrusted network.
 
 The web debugger selects motion automatically from the Servo button state.
-With Servo On, a relative arm command is streamed for 0.2 seconds by default;
-with Servo Off, it becomes one controller-planned joint or linear move. Adjust
-the Servo target hold interval with `--relative-action-hold-s` when needed.
+With Servo On, a relative arm command updates the target owned by
+`JakaRobot`; its internal sender plans bounded joint or Cartesian setpoints and
+feeds the controller continuously every 8 ms. With Servo Off, the click becomes
+one controller-planned joint or linear move. The Console reports the actual
+Servo frequency, timing jitter, overruns, queue depth, target age, and watchdog
+errors.
 
 To enter an already checked setup with power and servos enabled:
 
@@ -53,3 +57,43 @@ uv run python -m robots.jaka_robot.debug_ui \
     --joint-limits-json '{"joint_1.pos":[-3.14,3.14]}' \
     --eef-limits-json '{"ee.z":[0.10,0.80]}'
 ```
+
+## Isolated `servo_p` Diagnostic
+
+The raw diagnostic bypasses `JakaRobot`'s managed Servo thread and calls only
+`servo_move_enable()` plus `servo_p(..., ABS, 1)` at cumulative 8 ms
+deadlines. Start with a stationary hold; this sends the measured TCP pose
+without requesting any movement:
+
+```bash
+uv run python -m robots.jaka_robot.servo_p_debug \
+    --ip 192.168.1.31 \
+    --mode hold \
+    --duration-s 5 \
+    --csv artifacts/servo_p_hold.csv
+```
+
+If the hold is stable, run the precomputed 1 mm minimum-jerk Z bump:
+
+```bash
+uv run python -m robots.jaka_robot.servo_p_debug \
+    --ip 192.168.1.31 \
+    --mode z-bump \
+    --duration-s 4 \
+    --settle-s 1 \
+    --amplitude-mm 1 \
+    --csv artifacts/servo_p_z_bump.csv
+```
+
+Add `--power-on --enable` only when the controller is not already ready. By
+default, states changed by the script are restored after the test. The script
+always exits Servo Move in `finally`, aborts when queue depth reaches 80 or
+five timing periods overrun consecutively, and writes CSV only after the
+real-time loop has stopped.
+
+- A shaking hold points to SDK/network/controller timing rather than trajectory
+  interpolation.
+- A stable hold but shaking bump points to trajectory, units, frames, or robot
+  dynamics.
+- A send rate far below 125 Hz, large period p95/max, or rising queue depth
+  identifies host scheduling or communication as the primary problem.
