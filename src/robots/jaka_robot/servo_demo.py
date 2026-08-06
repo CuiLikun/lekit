@@ -1,129 +1,223 @@
-"""Manual JAKA Servo Move demonstration.
+"""Standalone JAKA ``servo_p`` Cartesian motion demo.
 
-WARNING: This script powers on, enables, and moves a real robot. Automation
-must not run it. Run it manually only after checking the workspace, tool and user
-frames, payload, collision settings, and emergency stop.
+This file intentionally does not import the LeRobot adapter or any other
+repository module.  It talks to the JAKA Python SDK directly and is intended
+to be run manually with a clear workspace and an accessible emergency stop::
+
+    python src/robots/jaka_robot/servo_demo.py --ip 192.168.1.31
+
+The SDK uses millimetres for Cartesian positions.  By default the TCP moves
+smoothly along base-frame Z by +/- 50 mm (about 5 cm from its measured start
+position) at the documented 8 ms ``servo_p`` period.
 """
 
 from __future__ import annotations
 
 import argparse
-import logging
+import ctypes
+import importlib
 import math
+import sys
 import time
+from pathlib import Path
+from typing import Any
 
-import numpy as np
+ABS = 0
+SERVO_PERIOD_S = 0.008
 
-from robots.jaka_robot.jaka_robot import JakaError, JakaRobot, JakaRobotConfig
+
+def _load_jkrc() -> Any:
+    """Load the SDK bundled next to this script, without repository imports."""
+
+    sdk_dir = Path(__file__).resolve().parent
+    api_library = sdk_dir / "libjakaAPI.so"
+    if api_library.is_file():
+        ctypes.CDLL(str(api_library), mode=ctypes.RTLD_GLOBAL)
+    if str(sdk_dir) not in sys.path:
+        sys.path.insert(0, str(sdk_dir))
+    try:
+        return importlib.import_module("jkrc")
+    except ImportError as exc:
+        raise RuntimeError(f"Unable to load JAKA Python SDK from {sdk_dir}: {exc}") from exc
+
+
+def _payload(operation: str, result: Any) -> tuple[Any, ...]:
+    """Validate an SDK return value and return its payload."""
+
+    if not isinstance(result, tuple) or not result:
+        raise RuntimeError(f"{operation} returned an invalid value: {result!r}")
+    try:
+        code = int(result[0])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{operation} returned an invalid status: {result!r}") from exc
+    if code != 0:
+        raise RuntimeError(f"{operation} failed with SDK error {code}: {result!r}")
+    values = tuple(result[1:])
+    if len(values) == 1 and isinstance(values[0], (list, tuple)):
+        values = tuple(values[0])
+    return values
+
+
+def _servo_p(robot: Any, pose: list[float]) -> int | None:
+    """Send one absolute Cartesian frame, accepting SDK 1.7.2 signatures."""
+
+    pose_tuple = tuple(float(value) for value in pose)
+    # SDK 1.7.2 documents do_info as an optional fourth argument.  Some
+    # installed Python bindings expose only the original three-argument form.
+    try:
+        result = robot.servo_p(pose_tuple, ABS, 1, None)
+    except TypeError:
+        result = robot.servo_p(pose_tuple, ABS, 1)
+    values = _payload("servo_p", result)
+    if not values:
+        return None
+    try:
+        queue_depth = int(values[0])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"servo_p returned an invalid queue depth: {result!r}") from exc
+    if not 0 <= queue_depth <= 100:
+        raise RuntimeError(f"servo_p returned an invalid queue depth: {result!r}")
+    return queue_depth
+
+
+def _controller_state(robot: Any) -> tuple[bool, bool]:
+    getter = getattr(robot, "get_robot_status_simple", None)
+    if getter is None:
+        # The demo can still run with older bindings; in that case the calls
+        # below are harmless and cleanup treats both states as script-owned.
+        return False, False
+    values = _payload("get_robot_status_simple", getter())
+    if len(values) < 2:
+        raise RuntimeError(f"get_robot_status_simple returned too few values: {values!r}")
+    return bool(values[-2]), bool(values[-1])
+
+
+def _get_tcp_pose(robot: Any) -> list[float]:
+    getter = getattr(robot, "get_tcp_position", None) or getattr(robot, "get_actual_tcp_position", None)
+    if getter is None:
+        raise RuntimeError("JAKA SDK does not expose get_tcp_position()")
+    pose = list(_payload("get_tcp_position", getter()))
+    if len(pose) != 6 or not all(math.isfinite(float(value)) for value in pose):
+        raise RuntimeError(f"get_tcp_position returned an invalid pose: {pose!r}")
+    return [float(value) for value in pose]
+
+
+def _wait_until(deadline: float) -> None:
+    """Sleep until a cumulative deadline, avoiding drift between frames."""
+
+    remaining = deadline - time.perf_counter()
+    if remaining > 0.0005:
+        time.sleep(remaining - 0.0005)
+    while time.perf_counter() < deadline:
+        pass
+
+
+def run_demo(robot: Any, *, duration_s: float, amplitude_mm: float, frequency_hz: float) -> int:
+    """Run the finite up/down trajectory and return the number of frames sent."""
+
+    if not all(
+        math.isfinite(float(value)) and float(value) > 0 for value in (duration_s, amplitude_mm, frequency_hz)
+    ):
+        raise ValueError("duration_s, amplitude_mm, and frequency_hz must be positive")
+
+    base_pose = _get_tcp_pose(robot)
+    frame_count = max(1, math.ceil(duration_s / SERVO_PERIOD_S))
+    print(f"base TCP pose [mm/rad]: {base_pose}")
+    print(
+        f"servo_p: {frame_count} frames at {SERVO_PERIOD_S * 1000:.1f} ms, "
+        f"Z amplitude +/-{amplitude_mm:.1f} mm, frequency {frequency_hz:.3f} Hz"
+    )
+
+    start = time.perf_counter()
+    for index in range(frame_count):
+        elapsed = index * SERVO_PERIOD_S
+        pose = base_pose.copy()
+        pose[2] += amplitude_mm * math.sin(2.0 * math.pi * frequency_hz * elapsed)
+        queue_depth = _servo_p(robot, pose)
+        if queue_depth is not None and queue_depth >= 80:
+            raise RuntimeError(f"servo_p queue is nearly full ({queue_depth}/100)")
+        _wait_until(start + (index + 1) * SERVO_PERIOD_S)
+    return frame_count
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Manually test managed JAKA Servo target tracking")
-    parser.add_argument("--ip", default="192.168.1.31", help="JAKA controller IP")
-    parser.add_argument("--mode", choices=("eef", "joint"), default="eef")
-    parser.add_argument("--duration", type=float, default=8.0, help="trajectory duration in seconds")
-    parser.add_argument("--target-hz", type=float, default=30.0, help="desired-target update rate")
-    return parser.parse_args()
-
-
-def _run_stream(robot: JakaRobot, mode: str, duration_s: float, target_hz: float) -> None:
-    if duration_s <= 0 or target_hz <= 0:
-        raise ValueError("duration and target_hz must be positive")
-
-    if mode == "eef":
-        initial = robot.get_eef_pose()
-        amplitude = 0.005  # 5 mm along base Z.
-        frequency_hz = 0.25
-
-        def send_target(elapsed_s: float) -> None:
-            target = initial.copy()
-            target[2] += amplitude * math.sin(2.0 * math.pi * frequency_hz * elapsed_s)
-            robot.send_action(
-                dict(zip(("ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw"), target, strict=True)),
-                use_servo=True,
-            )
-
-    else:
-        initial = robot.get_joint_positions()
-        amplitude = 0.01  # radians on joint 1.
-        frequency_hz = 0.25
-
-        def send_target(elapsed_s: float) -> None:
-            target = initial["joint_1.pos"] + amplitude * math.sin(2.0 * math.pi * frequency_hz * elapsed_s)
-            robot.send_action({"joint_1.pos": target}, use_servo=True)
-
-    latencies: list[float] = []
-    periods: list[float] = []
-    overruns = 0
-    period_s = 1.0 / target_hz
-    start = previous = time.perf_counter()
-    deadline = start
-    while True:
-        now = time.perf_counter()
-        elapsed = now - start
-        if elapsed >= duration_s:
-            break
-        periods.append(now - previous)
-        previous = now
-
-        call_start = time.perf_counter()
-        send_target(elapsed)
-        latencies.append(time.perf_counter() - call_start)
-
-        deadline += period_s
-        remaining = deadline - time.perf_counter()
-        if remaining > 0:
-            time.sleep(remaining)
-        else:
-            overruns += 1
-            deadline = time.perf_counter()
-
-    elapsed_total = time.perf_counter() - start
-    achieved_hz = len(latencies) / elapsed_total if elapsed_total else 0.0
-    latency_ms = np.asarray(latencies) * 1000.0
-    period_ms = np.asarray(periods[1:]) * 1000.0
-    print(f"targets updated: {len(latencies)}")
-    print(f"target update frequency: {achieved_hz:.2f} Hz")
-    print(f"target update overruns: {overruns}")
-    if latency_ms.size:
-        print(
-            f"SDK latency mean/p95/max: {latency_ms.mean():.2f}/{np.percentile(latency_ms, 95):.2f}/{latency_ms.max():.2f} ms"
-        )
-    if period_ms.size:
-        print(f"frame period mean/p95: {period_ms.mean():.2f}/{np.percentile(period_ms, 95):.2f} ms")
-    status = robot.get_servo_status()
-    print(
-        "managed sender frequency/p95/max: "
-        f"{status['send_rate_hz']:.2f} Hz/{status['period_p95_ms']:.2f} ms/"
-        f"{status['period_max_ms']:.2f} ms"
+    parser = argparse.ArgumentParser(description="Standalone JAKA servo_p TCP up/down test")
+    parser.add_argument("--ip", default="192.168.1.31", help="JAKA controller IP address")
+    parser.add_argument("--duration-s", type=float, default=20.0, help="test duration (default: 20 s)")
+    parser.add_argument(
+        "--amplitude-mm", type=float, default=50.0, help="peak Z displacement in mm (default: 50 mm)"
     )
-    print(f"managed sender overruns: {status['overruns']}; queue depth: {status['queue_depth']}")
+    parser.add_argument("--frequency-hz", type=float, default=0.1, help="up/down frequency (default: 0.1 Hz)")
+    parser.add_argument("--dry-run", action="store_true", help="validate arguments without connecting")
+    return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
-    logging.basicConfig(level=logging.INFO)
-    config = JakaRobotConfig(
-        ip=args.ip,
-        auto_power_on=True,
-        auto_enable=True,
-    )
-
-    print("WARNING: this program will power on, enable, and move a real JAKA robot.")
-    print(f"mode={args.mode}, duration={args.duration:.1f}s, target_hz={args.target_hz:.1f}")
-    if input("After checking the workspace and emergency stop, type SERVO: ").strip() != "SERVO":
-        print("Servo test cancelled before connecting to the robot.")
+    if not all(
+        math.isfinite(float(value)) and float(value) > 0
+        for value in (args.duration_s, args.amplitude_mm, args.frequency_hz)
+    ):
+        raise SystemExit("duration, amplitude, and frequency must be positive")
+    if args.dry_run:
+        print(
+            f"dry run: duration={args.duration_s:.1f}s, amplitude=+/-{args.amplitude_mm:.1f}mm, "
+            f"frequency={args.frequency_hz:.3f}Hz"
+        )
         return
 
-    robot = JakaRobot(config)
+    print("WARNING: this script controls a physical JAKA robot through servo_p.")
+    print("Check the workspace, tool/user frames, payload, limits, and emergency stop.")
+    if input("Type SERVO_P to connect and continue: ").strip() != "SERVO_P":
+        print("Cancelled before connecting.")
+        return
+
+    jkrc = _load_jkrc()
+    robot = jkrc.RC(args.ip)
+    powered_by_script = enabled_by_script = servo_enabled = False
     try:
-        with robot:
-            _run_stream(robot, args.mode, args.duration, args.target_hz)
-            robot.servo_enable(False)
-            print("Servo Move test complete; servo mode has been disabled.")
-    except (JakaError, KeyboardInterrupt) as e:
-        print(f"Servo Move test interrupted: {e}")
-        raise
+        _payload("login", robot.login())
+        initially_powered, initially_enabled = _controller_state(robot)
+        if not initially_powered:
+            _payload("power_on", robot.power_on())
+            powered_by_script = True
+        if not initially_enabled:
+            _payload("enable_robot", robot.enable_robot())
+            enabled_by_script = True
+
+        _payload("servo_move_enable", robot.servo_move_enable(True, True))
+        servo_enabled = True
+        frames = run_demo(
+            robot,
+            duration_s=args.duration_s,
+            amplitude_mm=args.amplitude_mm,
+            frequency_hz=args.frequency_hz,
+        )
+        print(f"Completed servo_p test ({frames} frames).")
+    except KeyboardInterrupt:
+        print("Interrupted by user.")
+    finally:
+        if servo_enabled:
+            try:
+                _payload("servo_move_enable", robot.servo_move_enable(False, True))
+            except Exception as exc:
+                print(f"Warning: could not disable servo mode: {exc}")
+        if enabled_by_script:
+            try:
+                _payload("disable_robot", robot.disable_robot())
+            except Exception as exc:
+                print(f"Warning: could not disable robot: {exc}")
+        if powered_by_script:
+            try:
+                _payload("power_off", robot.power_off())
+            except Exception as exc:
+                print(f"Warning: could not power off robot: {exc}")
+        logout = getattr(robot, "logout", None) or getattr(robot, "log_out", None)
+        if logout is not None:
+            try:
+                _payload("logout", logout())
+            except Exception as exc:
+                print(f"Warning: could not logout: {exc}")
 
 
 if __name__ == "__main__":

@@ -100,7 +100,7 @@ def _load_jkrc() -> Any:
         raise ImportError(f"Unable to import JAKA Python module from {sdk_dir}: {exc}") from exc
 
 
-def _create_rc(ip: str) -> Any:
+def create_rc(ip: str) -> Any:
     """Create a controller handle. Kept as an internal seam for tests."""
 
     return _load_jkrc().RC(ip)
@@ -214,6 +214,9 @@ class JakaRobotConfig(RobotConfig):
     auto_enable_servo: bool = True
     power_off_on_disconnect: bool = False
     use_grpc: bool = False
+    # Open a second SDK handle for feedback/auxiliary IO so state reads cannot
+    # interrupt the 8 ms Servo P command stream. Recorder workloads enable this.
+    separate_feedback_connection: bool = False
     tool_id: int = 0
     user_frame_id: int = 0
     collision_level: int = 3
@@ -386,7 +389,12 @@ class JakaRobot(Robot):
         self.config = config
         self.cameras = make_cameras_from_configs(config.cameras) if config.cameras else {}
         self.rc: Any | None = None
+        self._feedback_rc: Any | None = None
         self._sdk_lock = threading.RLock()
+        self._feedback_sdk_lock = threading.RLock()
+        self._observation_lock = threading.RLock()
+        self._last_arm_observation: dict[str, float] | None = None
+        self._last_arm_observation_at: float | None = None
         self._servo_state_lock = threading.RLock()
         self._servo_stop = threading.Event()
         self._servo_thread: threading.Thread | None = None
@@ -453,10 +461,14 @@ class JakaRobot(Robot):
         """Log in, apply configured controller settings, and attach cameras."""
 
         del calibrate
-        rc = _create_rc(self.config.ip)
+        rc = create_rc(self.config.ip)
         self._login(rc)
         self.rc = rc
         try:
+            if self.config.separate_feedback_connection:
+                feedback_rc = create_rc(self.config.ip)
+                self._login(feedback_rc)
+                self._feedback_rc = feedback_rc
             if self.config.auto_power_on:
                 self._call("power_on", rc.power_on())
                 self._powered_by_driver = True
@@ -489,6 +501,7 @@ class JakaRobot(Robot):
         rc = self.rc
         if rc is None:
             return
+        feedback_rc = self._feedback_rc
         try:
             if self._servo_active:
                 self._set_servo(False, suppress_errors=True)
@@ -496,6 +509,10 @@ class JakaRobot(Robot):
                 self._call("disable_robot", rc.disable_robot())
             if self._powered_by_driver and self.config.power_off_on_disconnect:
                 self._call("power_off", rc.power_off())
+            if feedback_rc is not None and feedback_rc is not rc:
+                logout_feedback = getattr(feedback_rc, "logout", None) or getattr(feedback_rc, "log_out", None)
+                if logout_feedback is not None:
+                    self._call("feedback_logout", logout_feedback())
             logout = getattr(rc, "logout", None) or getattr(rc, "log_out", None)
             if logout is not None:
                 self._call("logout", logout())
@@ -508,7 +525,11 @@ class JakaRobot(Robot):
                 except Exception as exc:  # nosec B110 - teardown is best effort
                     logger.warning("JAKA camera cleanup failed: %s", exc)
             self.rc = None
+            self._feedback_rc = None
             self._servo_active = False
+            with self._observation_lock:
+                self._last_arm_observation = None
+                self._last_observation_at = None
             self._last_eef_target = None
             self._powered_by_driver = False
             self._enabled_by_driver = False
@@ -528,22 +549,35 @@ class JakaRobot(Robot):
         return _payload(operation, result)
 
     def _read_joint_vector(self) -> np.ndarray:
-        assert self.rc is not None
-        with self._sdk_lock:
-            values = self._call("get_actual_joint_position", self.rc.get_actual_joint_position())
+        rc, lock = self._feedback_handle()
+        with lock:
+            values = self._call("get_actual_joint_position", rc.get_actual_joint_position())
         try:
             return _vector(values, name="actual joint position")
         except ValueError as exc:
             raise JakaError("get_actual_joint_position", -1, values) from exc
 
     def _read_tcp_vector_mm(self) -> np.ndarray:
-        assert self.rc is not None
-        with self._sdk_lock:
-            values = self._call("get_actual_tcp_position", self.rc.get_actual_tcp_position())
+        rc, lock = self._feedback_handle()
+        with lock:
+            values = self._call("get_actual_tcp_position", rc.get_actual_tcp_position())
         try:
             return _vector(values, name="actual TCP position")
         except ValueError as exc:
             raise JakaError("get_actual_tcp_position", -1, values) from exc
+
+    def _feedback_handle(self) -> tuple[Any, threading.RLock]:
+        """Return the auxiliary feedback/IO SDK handle and its lock.
+
+        A dedicated handle is optional for compatibility with existing clients,
+        but recorder workloads use it to keep feedback RPCs off the Servo handle.
+        """
+
+        if self.rc is None:
+            raise RuntimeError("Connect the JAKA robot before reading feedback.")
+        if self._feedback_rc is not None:
+            return self._feedback_rc, self._feedback_sdk_lock
+        return self.rc, self._sdk_lock
 
     @check_if_not_connected
     def get_joint_positions(self) -> dict[str, float]:
@@ -569,12 +603,27 @@ class JakaRobot(Robot):
         observation: dict[str, Any] = dict(joints)
         observation.update(zip(self._EEF_KEYS, map(float, eef), strict=True))
         observation.update(self.get_gripper_position())
+        with self._observation_lock:
+            self._last_arm_observation = {
+                key: float(value)
+                for key, value in observation.items()
+                if key in self._JOINT_KEYS or key in self._EEF_KEYS or key == "gripper.pos"
+            }
+            self._last_observation_at = time.monotonic()
         for name, camera in self.cameras.items():
             if getattr(camera, "use_rgb", True):
                 observation[name] = camera.read_latest()
             if getattr(camera, "use_depth", False):
                 observation[f"{name}_depth"] = camera.read_latest_depth()
         return observation
+
+    def _cached_arm_observation(self, *, max_age_s: float = 0.1) -> dict[str, float] | None:
+        with self._observation_lock:
+            if self._last_arm_observation is None or self._last_observation_at is None:
+                return None
+            if time.monotonic() - self._last_observation_at > max_age_s:
+                return None
+            return dict(self._last_arm_observation)
 
     @check_if_not_connected
     def send_action(self, action: RobotAction, *, use_servo: bool = True) -> RobotAction:
@@ -597,17 +646,39 @@ class JakaRobot(Robot):
             gripper = self.set_gripper_position(action["gripper.pos"])
         else:
             gripper = self.get_gripper_position()["gripper.pos"]
+        cached = self._cached_arm_observation()
 
         if representation == "joints":
-            applied = self._send_joint_action(action, use_servo=use_servo)
-            measured_eef = self.get_eef_pose()
+            applied = self._send_joint_action(action, use_servo=use_servo, current=cached)
+            measured_eef = (
+                np.asarray([cached[key] for key in self._EEF_KEYS], dtype=float)
+                if cached is not None and all(key in cached for key in self._EEF_KEYS)
+                else self.get_eef_pose()
+            )
             applied.update(zip(self._EEF_KEYS, map(float, measured_eef), strict=True))
         elif representation == "eef":
-            applied = self.get_joint_positions()
-            applied.update(self._send_eef_action(action, use_servo=use_servo))
+            applied = (
+                {key: cached[key] for key in self._JOINT_KEYS if key in cached}
+                if cached is not None
+                else self.get_joint_positions()
+            )
+            measured_eef = (
+                np.asarray([cached[key] for key in self._EEF_KEYS], dtype=float)
+                if cached is not None and all(key in cached for key in self._EEF_KEYS)
+                else None
+            )
+            applied.update(self._send_eef_action(action, use_servo=use_servo, measured_eef=measured_eef))
         else:
-            applied = self.get_joint_positions()
-            measured_eef = self.get_eef_pose()
+            applied = (
+                {key: cached[key] for key in self._JOINT_KEYS if key in cached}
+                if cached is not None and all(key in cached for key in self._JOINT_KEYS)
+                else self.get_joint_positions()
+            )
+            measured_eef = (
+                np.asarray([cached[key] for key in self._EEF_KEYS], dtype=float)
+                if cached is not None and all(key in cached for key in self._EEF_KEYS)
+                else self.get_eef_pose()
+            )
             applied.update(zip(self._EEF_KEYS, map(float, measured_eef), strict=True))
         applied["gripper.pos"] = gripper
         return applied
@@ -657,11 +728,20 @@ class JakaRobot(Robot):
             return "eef"
         return None
 
-    def _send_joint_action(self, action: RobotAction, *, use_servo: bool) -> RobotAction:
+    def _send_joint_action(
+        self,
+        action: RobotAction,
+        *,
+        use_servo: bool,
+        current: dict[str, float] | None = None,
+    ) -> RobotAction:
         # A following Cartesian action must start from measured feedback, not a
         # target cached before this joint-space command.
         self._last_eef_target = None
-        current = self.get_joint_positions()
+        if current is None or not all(key in current for key in self._JOINT_KEYS):
+            current = self.get_joint_positions()
+        else:
+            current = {key: float(current[key]) for key in self._JOINT_KEYS}
         requested = dict(current)
         for motor in self.motors:
             key = f"{motor}.pos"
@@ -687,10 +767,19 @@ class JakaRobot(Robot):
             self.move_j(target, is_block=True)
         return requested
 
-    def _send_eef_action(self, action: RobotAction, *, use_servo: bool) -> RobotAction:
-        reference = (
-            self._last_eef_target if use_servo and self._last_eef_target is not None else self.get_eef_pose()
-        )
+    def _send_eef_action(
+        self,
+        action: RobotAction,
+        *,
+        use_servo: bool,
+        measured_eef: np.ndarray | None = None,
+    ) -> RobotAction:
+        if use_servo and self._last_eef_target is not None:
+            reference = self._last_eef_target
+        elif measured_eef is not None:
+            reference = measured_eef.copy()
+        else:
+            reference = self.get_eef_pose()
         target = reference.copy()
         for index, key in enumerate(self._EEF_KEYS):
             if key in action:
@@ -705,9 +794,20 @@ class JakaRobot(Robot):
         translation = float(np.linalg.norm(delta[:3]))
         if translation > self.config.max_eef_step_m:
             target[:3] = reference[:3] + delta[:3] * (self.config.max_eef_step_m / translation)
-        target[3:] = reference[3:] + np.clip(
-            delta[3:], -self.config.max_eef_step_rad, self.config.max_eef_step_rad
-        )
+
+        # Limit orientation on SO(3), rather than clipping Euler components.
+        # Component-wise clipping turns a small +/-pi wrap into a long
+        # rotation and is especially visible with noisy XR RPY targets.
+        reference_q = _euler_to_quaternion(reference[3:])
+        target_q = _euler_to_quaternion(target[3:])
+        target_q, angle = _quaternion_distance(reference_q, target_q)
+        if angle > self.config.max_eef_step_rad:
+            target_q = _quaternion_slerp(
+                reference_q,
+                target_q,
+                self.config.max_eef_step_rad / angle,
+            )
+            target[3:] = _quaternion_to_euler(target_q)
         for index, key in enumerate(self._EEF_KEYS):
             if key in self.config.eef_pose_limits:
                 target[index] = np.clip(target[index], *self.config.eef_pose_limits[key])
@@ -1010,6 +1110,9 @@ class JakaRobot(Robot):
                             )
                 last_frame_at = frame_at
 
+                # Compute the next frame while holding state, but never hold
+                # it across the blocking SDK call. A foreground action update
+                # must be able to replace the target while servo_p is in flight.
                 with self._servo_state_lock:
                     self._check_servo_target_timeout(frame_at)
                     representation = self._servo_representation
@@ -1017,10 +1120,15 @@ class JakaRobot(Robot):
                         raise RuntimeError("Servo sender has no initialized target")
                     if representation == "joints":
                         frame = self._step_servo_joints(period_s)
-                        queue_depth = self._send_servo_joint_frame(frame, step_num=1)
                     else:
                         frame = self._step_servo_eef(period_s)
-                        queue_depth = self._send_servo_eef_frame(frame, step_num=1)
+
+                if representation == "joints":
+                    queue_depth = self._send_servo_joint_frame(frame, step_num=1)
+                else:
+                    queue_depth = self._send_servo_eef_frame(frame, step_num=1)
+
+                with self._servo_state_lock:
                     self._servo_frames_sent += 1
                     self._servo_queue_depth = queue_depth
 
@@ -1250,11 +1358,11 @@ class JakaRobot(Robot):
 
         if not self.config.gripper_analog_input_enabled:
             return {"gripper.pos": self._last_gripper_position}
-        assert self.rc is not None
-        with self._sdk_lock:
+        rc, lock = self._feedback_handle()
+        with lock:
             values = self._call(
                 "get_analog_input",
-                self.rc.get_analog_input(
+                rc.get_analog_input(
                     self.config.gripper_analog_input_iotype, self.config.gripper_analog_input_index
                 ),
             )
@@ -1286,11 +1394,11 @@ class JakaRobot(Robot):
         raw = self.config.gripper_analog_output_min + normalized * (
             self.config.gripper_analog_output_max - self.config.gripper_analog_output_min
         )
-        assert self.rc is not None
-        with self._sdk_lock:
+        rc, lock = self._feedback_handle()
+        with lock:
             self._call(
                 "set_analog_output",
-                self.rc.set_analog_output(
+                rc.set_analog_output(
                     self.config.gripper_analog_output_iotype,
                     self.config.gripper_analog_output_index,
                     raw,

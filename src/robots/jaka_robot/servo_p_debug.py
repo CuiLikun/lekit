@@ -7,6 +7,26 @@ network, and controller-queue problems.
 
 It controls physical hardware. Run it only with a clear workspace and an
 accessible emergency stop.
+
+# Run hold mode for 5 seconds and write CSV:
+
+uv run python -m robots.jaka_robot.servo_p_debug \
+  --ip 192.168.1.31 \
+  --mode hold \
+  --duration-s 5 \
+  --csv artifacts/servo_p_hold.csv
+
+
+# Move the TCP in a 1 mm Z bump over 4 seconds, with 1 second of settling before and after, and write CSV:
+
+uv run python -m robots.jaka_robot.servo_p_debug \
+  --ip 192.168.1.31 \
+  --mode z-bump \
+  --duration-s 4 \
+  --settle-s 1 \
+  --amplitude-mm 1 \
+  --csv artifacts/servo_p_z_bump.csv
+
 """
 
 from __future__ import annotations
@@ -24,7 +44,7 @@ from typing import Any, Literal
 
 import numpy as np
 
-from .jaka_robot import ABS, SERVO_CYCLE_S, JakaError, _create_rc, _payload, _vector
+from .jaka_robot import ABS, SERVO_CYCLE_S, JakaError, _payload, _vector, create_rc
 
 logger = logging.getLogger(__name__)
 
@@ -185,9 +205,8 @@ def run_stream(
             raise ServoPDiagnosticError(f"frame {index} servo_p failed: {exc}", samples) from exc
         sdk_latency = clock() - sdk_started
 
-        overrun = index > 0 and (
-            period > settings.period_s * settings.overrun_factor or sdk_latency > settings.period_s
-        )
+        overrun_threshold = settings.period_s * settings.overrun_factor
+        overrun = index > 0 and (period > overrun_threshold or sdk_latency > overrun_threshold)
         consecutive_overruns = consecutive_overruns + 1 if overrun else 0
         sample = ServoSample(
             index=index,
@@ -208,7 +227,10 @@ def run_stream(
             )
         if consecutive_overruns >= settings.max_consecutive_overruns:
             raise ServoPDiagnosticError(
-                f"servo_p timing watchdog saw {consecutive_overruns} consecutive overruns",
+                "servo_p timing watchdog saw "
+                f"{consecutive_overruns} consecutive overruns at frame {index} "
+                f"(period={period * 1000.0:.3f}ms, SDK latency={sdk_latency * 1000.0:.3f}ms, "
+                f"threshold={overrun_threshold * 1000.0:.3f}ms)",
                 samples,
             )
     return samples
@@ -361,7 +383,7 @@ def main() -> None:
         raise SystemExit("cancelled before connecting")
 
     logging.basicConfig(level=logging.INFO)
-    rc = _create_rc(args.ip)
+    rc = create_rc(args.ip)
     initial_powered = initial_enabled = False
     powered_by_script = enabled_by_script = False
     servo_entered = False

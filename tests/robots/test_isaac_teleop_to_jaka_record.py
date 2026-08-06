@@ -1,3 +1,8 @@
+import ast
+import importlib
+from pathlib import Path
+from types import SimpleNamespace
+
 from lerobot.datasets import LeRobotDatasetMetadata
 from robots.jaka_robot.dataset_features import build_dataset_features
 from robots.jaka_robot.jaka_robot import JakaRobot, JakaRobotConfig
@@ -19,3 +24,74 @@ def test_dataset_features_are_lerobot_metadata_compatible(tmp_path):
         use_videos=True,
     )
     assert features.items() <= metadata.features.items()
+
+
+def test_control_panel_calls_pass_frame_duration():
+    source_path = Path(__file__).parents[2] / "examples/isaac_teleop_to_jaka/record.py"
+    tree = ast.parse(source_path.read_text())
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_control_panel"
+    ]
+
+    assert calls
+    assert all(len(call.args) == 4 for call in calls)
+
+
+def test_build_device_isolates_feedback_and_defers_servo_start(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+
+    observed_config: dict[str, bool] = {}
+
+    class FakeRobot:
+        name = "jaka_robot"
+
+        def __init__(self, config):
+            self.config = config
+            self.connected = False
+
+        def connect(self):
+            self.connected = True
+
+        def disconnect(self):
+            self.connected = False
+
+    def make_robot(config):
+        observed_config["auto_enable_servo"] = config.auto_enable_servo
+        observed_config["separate_feedback_connection"] = config.separate_feedback_connection
+        return FakeRobot(config)
+
+    startup_calls: list[bool] = []
+    monkeypatch.setattr(record_module, "JakaRobot", FakeRobot)
+    monkeypatch.setattr(record_module, "make_robot_from_config", make_robot)
+    monkeypatch.setattr(
+        record_module,
+        "make_xr_device",
+        lambda _robot, _teleop: {
+            "compute": lambda _obs: None,
+            "startup": lambda: startup_calls.append(True),
+            "cleanup": lambda: None,
+            "telemetry": {},
+        },
+    )
+    cfg = SimpleNamespace(
+        robot=SimpleNamespace(
+            auto_enable_servo=True,
+            separate_feedback_connection=False,
+            user_frame_id=0,
+        ),
+        teleop=SimpleNamespace(cloudxr_env_file=None),
+    )
+
+    robot, _device = record_module.build_device(cfg)
+
+    assert robot.connected
+    assert observed_config == {
+        "auto_enable_servo": False,
+        "separate_feedback_connection": True,
+    }
+    assert startup_calls == [True]

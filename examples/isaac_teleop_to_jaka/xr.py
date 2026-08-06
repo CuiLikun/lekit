@@ -415,7 +415,7 @@ class XRController(IsaacTeleopTeleoperator):
 # ======================================================================================
 
 
-def _pose6_to_base_T_ee(pose: tuple[float, float, float, float, float, float]) -> np.ndarray:
+def _pose6_to_base_t_ee(pose: tuple[float, float, float, float, float, float]) -> np.ndarray:
     """Convert a JAKA ``(x, y, z, roll, pitch, yaw)`` pose to a 4x4 base_T_ee matrix.
 
     XYZ-Euler radians, intrinsic rotations: ``R = Rz(yaw) @ Ry(pitch) @ Rx(roll)``.
@@ -567,8 +567,8 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
         # Seed the clutch home from the arm's measured EE pose so the first engage
         # is jump-free.
         measured_pose = tuple(float(v) for v in robot.get_eef_pose())
-        home_base_T_ee = _pose6_to_base_T_ee(measured_pose)  # noqa: N806
-        clutch = Clutch(home_base_T_ee)
+        home_base_t_ee = _pose6_to_base_t_ee(measured_pose)
+        clutch = Clutch(home_base_t_ee)
 
         if robot.name == "jaka_robot":
             robot.servo_enable(True)
@@ -600,8 +600,12 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
         # (gravity sag, external contact).
         is_engage_frame = enabled and not prev_enabled
         if is_engage_frame:
-            measured_base_T_ee = _pose6_to_base_T_ee(tuple(float(v) for v in robot.get_eef_pose()))  # noqa: N806
-            clutch.engage(grip_pos, grip_quat, home_base_T_ee=measured_base_T_ee)
+            eef_keys = ("ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw")
+            if robot_obs is None or not all(key in robot_obs for key in eef_keys):
+                raise RuntimeError("XR clutch engage requires a complete measured EEF observation")
+            measured_pose = tuple(float(robot_obs[key]) for key in eef_keys)
+            measured_base_t_ee = _pose6_to_base_t_ee(measured_pose)
+            clutch.engage(grip_pos, grip_quat, home_base_T_ee=measured_base_t_ee)
             last_pos = None  # drop the rate-limit reference so we don't fight the new home
         prev_enabled = enabled
 

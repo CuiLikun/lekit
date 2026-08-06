@@ -162,6 +162,12 @@ def build_device(cfg: "RecordConfig") -> tuple[JakaRobot, Device]:
     if cfg.teleop.cloudxr_env_file is None:
         cfg.teleop.cloudxr_env_file = CLOUDXR_ENV_FILE
 
+    # The recorder owns Servo Move startup: wait until XR is ready and the
+    # clutch home has been measured. Feedback uses a separate SDK handle so
+    # 30 Hz observations cannot interrupt the controller's 8 ms command stream.
+    cfg.robot.auto_enable_servo = False
+    cfg.robot.separate_feedback_connection = True
+
     robot = make_robot_from_config(cfg.robot)
     robot.connect()
     device: Device | None = None
@@ -312,9 +318,7 @@ def _record_loop(
         raw = device.compute(obs)
         action = hold.resolve(raw, obs)
 
-        live.update(_control_panel(device.telemetry, action, obs), refresh=True)
-
-        sent_action = robot.send_action(action, use_servo=False)
+        sent_action = robot.send_action(action)
 
         if record_frames:
             action_frame = build_dataset_frame(dataset.features, sent_action, prefix=ACTION)

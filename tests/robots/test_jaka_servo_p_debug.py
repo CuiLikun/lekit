@@ -91,3 +91,19 @@ def test_stream_aborts_on_queue_growth_or_repeated_timing_overruns():
     targets = build_targets((100.0, 200.0, 300.0, 0.1, 0.2, 0.3), overrun_settings)
     with pytest.raises(RuntimeError, match="2 consecutive overruns"):
         run_stream(slow_rc, targets, overrun_settings, clock=clock, sleep=clock.sleep)
+
+
+def test_stream_allows_sdk_latency_between_period_and_overrun_threshold():
+    clock = FakeClock()
+    rc = FakeRC(clock, latency_s=0.009)
+    settings = DiagnosticSettings(
+        mode="hold",
+        duration_s=0.050,
+        max_consecutive_overruns=2,
+        spin_threshold_s=0.0,
+    )
+    targets = build_targets((100.0, 200.0, 300.0, 0.1, 0.2, 0.3), settings)
+
+    samples = run_stream(rc, targets, settings, clock=clock, sleep=clock.sleep)
+
+    assert len(samples) == len(targets)

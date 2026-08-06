@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 
 import pytest
@@ -14,6 +15,8 @@ class FakeRC:
         self.tcp_mm = (100.0, 200.0, 300.0, 0.1, 0.2, 0.3)
         self.powered_on = False
         self.enabled = False
+        self.joint_reads = 0
+        self.tcp_reads = 0
 
     def _call(self, name, *args):
         self.calls.append((name, *args))
@@ -60,9 +63,11 @@ class FakeRC:
         return self._call("servo_move_enable", value)
 
     def get_actual_joint_position(self):
+        self.joint_reads += 1
         return (0, self.joints)
 
     def get_actual_tcp_position(self):
+        self.tcp_reads += 1
         return (0, self.tcp_mm)
 
     def servo_j(self, joints, mode, step):
@@ -96,7 +101,7 @@ def servo_calls(rc: FakeRC, operation: str) -> list[tuple]:
 @pytest.fixture
 def robot(monkeypatch):
     rc = FakeRC()
-    monkeypatch.setattr(driver, "_create_rc", lambda _ip: rc)
+    monkeypatch.setattr(driver, "create_rc", lambda _ip: rc)
     robot = driver.JakaRobot(driver.JakaRobotConfig(ip="10.0.0.2"))
     robot.connect()
     yield robot, rc
@@ -135,7 +140,7 @@ def test_joint_action_is_servo_bounded_and_observation_uses_si_units(robot):
 
 def test_cartesian_action_is_servo_bounded_and_converted_to_mm(monkeypatch):
     rc = FakeRC()
-    monkeypatch.setattr(driver, "_create_rc", lambda _ip: rc)
+    monkeypatch.setattr(driver, "create_rc", lambda _ip: rc)
     arm = driver.JakaRobot(driver.JakaRobotConfig(ip="10.0.0.2", max_eef_step_m=0.01))
     arm.connect()
     try:
@@ -156,6 +161,85 @@ def test_cartesian_action_is_servo_bounded_and_converted_to_mm(monkeypatch):
         applied = arm.send_relative_action({"ee.x": 0.005})
         assert applied["ee.x"] == pytest.approx(0.105)
     finally:
+        arm.disconnect()
+
+
+def test_recent_observation_is_reused_by_eef_action(robot):
+    arm, rc = robot
+    arm.get_observation()
+    before = (rc.joint_reads, rc.tcp_reads)
+
+    applied = arm.send_action({"ee.x": 0.105})
+
+    assert applied["ee.x"] == pytest.approx(0.105)
+    assert (rc.joint_reads, rc.tcp_reads) == before
+
+
+def test_eef_orientation_limit_handles_rpy_wrap(monkeypatch):
+    rc = FakeRC()
+    rc.tcp_mm = (100.0, 200.0, 300.0, 0.1, 0.2, -3.13)
+    monkeypatch.setattr(driver, "create_rc", lambda _ip: rc)
+    arm = driver.JakaRobot(driver.JakaRobotConfig(ip="10.0.0.2"))
+    arm.connect()
+    try:
+        arm.get_observation()
+        applied = arm.send_action({"ee.yaw": 3.14})
+        assert applied["ee.yaw"] == pytest.approx(3.14)
+    finally:
+        arm.disconnect()
+
+
+def test_feedback_connection_keeps_state_reads_off_servo_handle(monkeypatch):
+    control_rc, feedback_rc = FakeRC(), FakeRC()
+    handles = iter((control_rc, feedback_rc))
+    monkeypatch.setattr(driver, "create_rc", lambda _ip: next(handles))
+    arm = driver.JakaRobot(
+        driver.JakaRobotConfig(
+            ip="10.0.0.2",
+            auto_enable_servo=False,
+            separate_feedback_connection=True,
+        )
+    )
+    arm.connect()
+    try:
+        arm.get_observation()
+        assert control_rc.joint_reads == 0
+        assert control_rc.tcp_reads == 0
+        assert feedback_rc.joint_reads == 1
+        assert feedback_rc.tcp_reads == 1
+    finally:
+        arm.disconnect()
+
+
+def test_blocking_servo_p_does_not_block_target_updates(monkeypatch):
+    rc = FakeRC()
+    servo_p_started = threading.Event()
+    release_servo_p = threading.Event()
+
+    def blocking_servo_p(pose, mode, step):
+        servo_p_started.set()
+        release_servo_p.wait(timeout=1.0)
+        rc.calls.append(("servo_p", pose, mode, step))
+        return (0, 1)
+
+    rc.servo_p = blocking_servo_p
+    monkeypatch.setattr(driver, "create_rc", lambda _ip: rc)
+    arm = driver.JakaRobot(driver.JakaRobotConfig(ip="10.0.0.2"))
+    arm.connect()
+    update_thread: threading.Thread | None = None
+    try:
+        arm.get_observation()
+        arm.send_action({"ee.x": 0.105})
+        assert servo_p_started.wait(timeout=0.5)
+
+        update_thread = threading.Thread(target=lambda: arm.send_action({"ee.x": 0.106}))
+        update_thread.start()
+        update_thread.join(timeout=0.1)
+        assert not update_thread.is_alive()
+    finally:
+        release_servo_p.set()
+        if update_thread is not None:
+            update_thread.join(timeout=0.5)
         arm.disconnect()
 
 
@@ -203,7 +287,7 @@ def test_non_servo_actions_use_controller_planned_moves(robot):
 def test_failed_sdk_result_has_operation_and_code(monkeypatch):
     rc = FakeRC()
     rc.set_collision_level = lambda _value: (-7,)
-    monkeypatch.setattr(driver, "_create_rc", lambda _ip: rc)
+    monkeypatch.setattr(driver, "create_rc", lambda _ip: rc)
     arm = driver.JakaRobot(driver.JakaRobotConfig(ip="10.0.0.2"))
     with pytest.raises(driver.JakaError, match="set_collision_level failed \\(-7\\)"):
         arm.connect()
@@ -218,7 +302,7 @@ def test_config_normalizes_scalar_safety_limit_and_rejects_incomplete_joint_mapp
 
 def test_configured_joint_and_eef_position_limits_are_enforced(monkeypatch):
     rc = FakeRC()
-    monkeypatch.setattr(driver, "_create_rc", lambda _ip: rc)
+    monkeypatch.setattr(driver, "create_rc", lambda _ip: rc)
     arm = driver.JakaRobot(
         driver.JakaRobotConfig(
             ip="10.0.0.2",
@@ -238,7 +322,7 @@ def test_configured_joint_and_eef_position_limits_are_enforced(monkeypatch):
         arm.disconnect()
 
     rc = FakeRC()
-    monkeypatch.setattr(driver, "_create_rc", lambda _ip: rc)
+    monkeypatch.setattr(driver, "create_rc", lambda _ip: rc)
     arm = driver.JakaRobot(
         driver.JakaRobotConfig(
             ip="10.0.0.2",
@@ -274,7 +358,7 @@ def test_servo_sender_continues_at_eight_ms_and_stops_before_controller_exit(rob
 
 def test_servo_target_timeout_disables_controller(monkeypatch):
     rc = FakeRC()
-    monkeypatch.setattr(driver, "_create_rc", lambda _ip: rc)
+    monkeypatch.setattr(driver, "create_rc", lambda _ip: rc)
     arm = driver.JakaRobot(driver.JakaRobotConfig(ip="10.0.0.2", servo_target_timeout_s=0.025))
     arm.connect()
     try:
@@ -290,7 +374,7 @@ def test_servo_target_timeout_disables_controller(monkeypatch):
 def test_servo_sdk_failure_stops_sender_and_records_error(monkeypatch):
     rc = FakeRC()
     rc.servo_j = lambda _joints, _mode, _step: (-3,)
-    monkeypatch.setattr(driver, "_create_rc", lambda _ip: rc)
+    monkeypatch.setattr(driver, "create_rc", lambda _ip: rc)
     arm = driver.JakaRobot(driver.JakaRobotConfig(ip="10.0.0.2"))
     arm.connect()
     try:

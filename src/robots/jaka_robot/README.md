@@ -47,6 +47,12 @@ and gripper controls are shown beside their live values and limits; all groups
 can be used without selecting a control mode. Each +/- click reads the latest
 measured value and sends one bounded relative action.
 
+The Isaac XR recorder enables `separate_feedback_connection` automatically and
+delays Servo Move startup until XR tracking is ready. This is important for
+continuous Servo P control: JAKA `servo_p` occupies the control SDK handle for
+almost the full 8 ms cycle, so synchronous feedback reads on that same handle
+can starve the command stream.
+
 JAKA SDK 1.7.2 does not expose model-specific joint or Cartesian position
 bounds. When known, pass them explicitly; the debugger displays and enforces
 the configured values:
