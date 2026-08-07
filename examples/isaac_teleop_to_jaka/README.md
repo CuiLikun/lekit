@@ -49,10 +49,11 @@ commanded TCP target, so a lagging feedback sample cannot pull the arm backward.
 Each trigger press toggles the normalized `gripper.pos` command
 between closed (`0`) and open (`1`).
 
-The default operator mapping is hand forward/right/up to JAKA base
-`+X/-Y/+Z`. It includes the 33.635 degree horizontal CloudXR-anchor offset
-measured for this operator station. Override `--teleop.base_T_anchor` when the
-robot or operator station is mounted in a different orientation.
+The default operator mapping rebases OpenXR (X=Right, Y=Up, Z=Backward) into the JAKA
+base frame (X=Forward, Y=Left, Z=Up): hand forward drives the robot forward, hand right
+drives the robot right, hand up drives the robot up. A rotated operator station (CCW
+yaw viewed from above) can be compensated with `--teleop.operator_yaw_deg`, or the
+rebase can be overridden entirely with `--teleop.base_T_anchor`.
 
 To control translation without rotating the tool, pass `--teleop.lock_pose=true`.
 The current measured roll/pitch/yaw is captured when the clutch engages and held

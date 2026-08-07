@@ -105,21 +105,30 @@ else:
     TeleopSession = None
     TeleopSessionConfig = None
 
-# Static rebase from the CloudXR controller anchor frame into the JAKA base frame.
-# A control trace measured the operator's horizontal forward axis 33.635 degrees
-# from the CloudXR anchor. After compensating that yaw, operator right/forward/up
-# map to JAKA -Y/+X/+Z respectively. ``base_T_anchor`` remains configurable for
-# a differently mounted arm or operator station.
-DEFAULT_OPERATOR_YAW_DEG = 33.635
-_operator_yaw_rad = np.deg2rad(DEFAULT_OPERATOR_YAW_DEG)
-_operator_yaw_sin = float(np.sin(_operator_yaw_rad))
-_operator_yaw_cos = float(np.cos(_operator_yaw_rad))
-_DEFAULT_BASE_T_ANCHOR: list[list[float]] = [
-    [_operator_yaw_sin, 0.0, -_operator_yaw_cos, 0.0],
-    [-_operator_yaw_cos, 0.0, -_operator_yaw_sin, 0.0],
-    [0.0, 1.0, 0.0, 0.0],
-    [0.0, 0.0, 0.0, 1.0],
-]
+# Static rebase from the CloudXR controller anchor frame (X=Right, Y=Up, Z=Backward)
+# into the JAKA base frame (X=Forward, Y=Left, Z=Up). The default rotation maps
+# controller forward -> robot +X, right -> robot -Y (i.e. rightward), up -> robot +Z.
+# A rotated operator station can set ``operator_yaw_deg`` or provide ``base_T_anchor``.
+DEFAULT_OPERATOR_YAW_DEG = 0.0
+
+
+def _base_t_anchor_for_yaw(yaw_deg: float) -> list[list[float]]:
+    """Build the OpenXR -> JAKA rebase for an operator station yawed CCW (from above)
+    by ``yaw_deg`` around the vertical axis.
+
+    At ``yaw_deg=0`` this matches the SO101 ``_DEFAULT_BASE_T_ANCHOR``: hand
+    forward -> robot +X (forward), right -> robot -Y (rightward), up -> robot +Z.
+    """
+    yaw_rad = np.deg2rad(float(yaw_deg))
+    yaw_sin = float(np.sin(yaw_rad))
+    yaw_cos = float(np.cos(yaw_rad))
+    return [
+        [yaw_sin, 0.0, -yaw_cos, 0.0],
+        [-yaw_cos, 0.0, -yaw_sin, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
 
 # Source-node name for the static base_T_anchor rebase input fed via TeleopSession.step.
 _BASE_T_ANCHOR_INPUT = "base_T_anchor"
@@ -173,6 +182,9 @@ class XRControllerConfig(IsaacTeleopConfig):
     position_deadband_m: float = 0.0002
     """Ignore Cartesian controller drift up to this distance from the last target."""
 
+    operator_yaw_deg: float = DEFAULT_OPERATOR_YAW_DEG
+    """Horizontal yaw from the operator station to the JAKA base frame."""
+
     servo_linear_velocity_m_s: float = 0.15
     """Maximum linear Servo P velocity used by the teleoperation profile."""
 
@@ -191,9 +203,7 @@ class XRControllerConfig(IsaacTeleopConfig):
     servo_angular_jerk_rad_s3: float = 20.0
     """Cartesian NLF angular jerk used by the teleoperation profile."""
 
-    base_T_anchor: list[list[float]] = field(  # noqa: N815
-        default_factory=lambda: [row.copy() for row in _DEFAULT_BASE_T_ANCHOR]
-    )
+    base_T_anchor: list[list[float]] | None = field(default=None)  # noqa: N815
     """Static 4x4 transform rebasing the OpenXR anchor frame into the robot base frame."""
 
     def __post_init__(self):
@@ -203,6 +213,10 @@ class XRControllerConfig(IsaacTeleopConfig):
             raise ValueError("lock_pose must be a boolean")
         if not np.isfinite(self.position_deadband_m) or self.position_deadband_m < 0:
             raise ValueError("position_deadband_m must be finite and non-negative")
+        if not np.isfinite(self.operator_yaw_deg):
+            raise ValueError("operator_yaw_deg must be finite")
+        if self.base_T_anchor is None:
+            self.base_T_anchor = _base_t_anchor_for_yaw(self.operator_yaw_deg)
         for name in (
             "servo_linear_velocity_m_s",
             "servo_linear_acceleration_m_s2",
@@ -473,9 +487,7 @@ class XRController(IsaacTeleopTeleoperator):
             try:
                 raw_is_valid = bool(raw_controller[ControllerInputIndex.GRIP_IS_VALID])
                 raw_pos = np.asarray(raw_controller[ControllerInputIndex.GRIP_POSITION], dtype=np.float32)
-                raw_quat = np.asarray(
-                    raw_controller[ControllerInputIndex.GRIP_ORIENTATION], dtype=np.float32
-                )
+                raw_quat = np.asarray(raw_controller[ControllerInputIndex.GRIP_ORIENTATION], dtype=np.float32)
             except (IndexError, KeyError, TypeError, ValueError):
                 pass
             else:

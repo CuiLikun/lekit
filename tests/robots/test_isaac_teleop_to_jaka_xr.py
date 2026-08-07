@@ -16,18 +16,35 @@ def _wrap_angles(angles: np.ndarray) -> np.ndarray:
 
 
 def test_default_xr_base_transform_matches_jaka_operator_axes():
-    """Right/forward/up controller motion must map to the matching robot axes."""
+    """Right/forward/up controller motion must map to the matching robot axes.
+
+    Conventions:
+      - OpenXR controller: X=Right, Y=Up, Z=Backward (toward operator).
+      - JAKA base frame:   X=Forward, Y=Left, Z=Up.
+    """
     xr = _xr_module()
     rotation = np.asarray(xr.XRControllerConfig().base_T_anchor, dtype=float)[:3, :3]
     yaw = np.deg2rad(xr.DEFAULT_OPERATOR_YAW_DEG)
     operator_right = np.array([np.cos(yaw), 0.0, np.sin(yaw)])
     operator_forward = np.array([np.sin(yaw), 0.0, -np.cos(yaw)])
 
+    # Right -> robot right (-Y), forward -> robot forward (+X), up -> robot up (+Z).
     assert rotation @ operator_right == pytest.approx([0.0, -1.0, 0.0])
     assert rotation @ operator_forward == pytest.approx([1.0, 0.0, 0.0])
     assert rotation @ np.array([0.0, 1.0, 0.0]) == pytest.approx([0.0, 0.0, 1.0])
     assert rotation.T @ rotation == pytest.approx(np.eye(3))
     assert np.linalg.det(rotation) == pytest.approx(1.0)
+
+
+def test_operator_yaw_generates_requested_transform():
+    """Rotating the operator CCW by ``yaw`` in OpenXR's horizontal plane keeps the
+    operator's right direction aligned with the robot's right axis (-Y)."""
+    xr = _xr_module()
+    yaw = np.deg2rad(33.635)
+    rotation = np.asarray(xr.XRControllerConfig(operator_yaw_deg=33.635).base_T_anchor)[:3, :3]
+    # The OpenXR +X axis rotated CCW by `yaw` around OpenXR +Y: still the operator's
+    # right direction expressed in OpenXR's frame; must map to robot right (-Y).
+    assert rotation @ np.array([np.cos(yaw), 0.0, np.sin(yaw)]) == pytest.approx([0.0, -1.0, 0.0])
 
 
 def test_lock_pose_holds_measured_orientation_while_translation_follows_controller(monkeypatch):
