@@ -251,6 +251,14 @@ def _set_servo_move(rc: Any, enabled: bool, *, robot_id: int) -> None:
     _payload("servo_move_enable", result)
 
 
+def _set_cartesian_nlf(rc: Any, enabled: bool) -> None:
+    if enabled:
+        result = rc.servo_move_use_carte_NLF(50.0, 200.0, 1000.0, 0.5, 1.0, 10.0)
+        _payload("servo_move_use_carte_NLF", result)
+    else:
+        _payload("servo_move_use_none_filter", rc.servo_move_use_none_filter())
+
+
 def _login(rc: Any) -> None:
     login = getattr(rc, "login", None) or getattr(rc, "log_in", None)
     if login is None:
@@ -344,6 +352,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--robot-id", type=int, default=0)
     parser.add_argument("--queue-abort-depth", type=int, default=80)
     parser.add_argument("--max-consecutive-overruns", type=int, default=5)
+    parser.add_argument(
+        "--cartesian-nlf",
+        action="store_true",
+        help="enable JAKA Cartesian NLF for this run, then restore no-filter mode",
+    )
     parser.add_argument("--power-on", action="store_true", help="power on when currently off")
     parser.add_argument("--enable", action="store_true", help="enable when currently disabled")
     parser.add_argument(
@@ -377,7 +390,8 @@ def main() -> None:
     print("Verify the tool/user frame, payload, workspace, and emergency stop before continuing.")
     print(
         f"mode={settings.mode}, duration={settings.duration_s:.3f}s, "
-        f"amplitude={settings.amplitude_mm:.3f}mm, period={settings.period_s * 1000:.1f}ms"
+        f"amplitude={settings.amplitude_mm:.3f}mm, period={settings.period_s * 1000:.1f}ms, "
+        f"cartesian_nlf={args.cartesian_nlf}"
     )
     if input("Type SERVO_P to connect and continue: ").strip() != "SERVO_P":
         raise SystemExit("cancelled before connecting")
@@ -387,10 +401,14 @@ def main() -> None:
     initial_powered = initial_enabled = False
     powered_by_script = enabled_by_script = False
     servo_entered = False
+    filter_configured = False
     samples: list[ServoSample] = []
     stream_failure: ServoPDiagnosticError | None = None
     try:
         _login(rc)
+        if args.cartesian_nlf:
+            _set_cartesian_nlf(rc, True)
+            filter_configured = True
         initial_powered, initial_enabled = _controller_state(rc)
         if not initial_powered:
             if not args.power_on:
@@ -434,6 +452,11 @@ def main() -> None:
                 _set_servo_move(rc, False, robot_id=args.robot_id)
             except Exception:
                 logger.exception("Failed to exit Servo Move during cleanup")
+        if filter_configured:
+            try:
+                _set_cartesian_nlf(rc, False)
+            except Exception:
+                logger.exception("Failed to restore no-filter Servo Move mode")
         if not args.leave_powered_enabled:
             if enabled_by_script:
                 try:

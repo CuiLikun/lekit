@@ -19,10 +19,15 @@ def test_default_xr_base_transform_matches_jaka_operator_axes():
     """Right/forward/up controller motion must map to the matching robot axes."""
     xr = _xr_module()
     rotation = np.asarray(xr.XRControllerConfig().base_T_anchor, dtype=float)[:3, :3]
+    yaw = np.deg2rad(xr.DEFAULT_OPERATOR_YAW_DEG)
+    operator_right = np.array([np.cos(yaw), 0.0, np.sin(yaw)])
+    operator_forward = np.array([np.sin(yaw), 0.0, -np.cos(yaw)])
 
-    assert rotation @ np.array([1.0, 0.0, 0.0]) == pytest.approx([0.0, 1.0, 0.0])
-    assert rotation @ np.array([0.0, 0.0, -1.0]) == pytest.approx([-1.0, 0.0, 0.0])
+    assert rotation @ operator_right == pytest.approx([0.0, -1.0, 0.0])
+    assert rotation @ operator_forward == pytest.approx([1.0, 0.0, 0.0])
     assert rotation @ np.array([0.0, 1.0, 0.0]) == pytest.approx([0.0, 0.0, 1.0])
+    assert rotation.T @ rotation == pytest.approx(np.eye(3))
+    assert np.linalg.det(rotation) == pytest.approx(1.0)
 
 
 def test_lock_pose_holds_measured_orientation_while_translation_follows_controller(monkeypatch):
@@ -200,6 +205,41 @@ def test_xr_controller_discards_invalid_grip_pose():
     assert action["grip_quat"] == pytest.approx([0.0, 0.0, 0.0, 1.0])
     assert action["squeeze"] == 0.0
     assert action["trigger"] == 0.0
+
+
+def test_xr_controller_reports_raw_and_transformed_grip_pose():
+    xr = _xr_module()
+
+    class Controller:
+        is_none = False
+
+        def __init__(self, position):
+            self.position = np.asarray(position, dtype=float)
+
+        def __getitem__(self, index):
+            values = {
+                xr.ControllerInputIndex.GRIP_POSITION: self.position,
+                xr.ControllerInputIndex.GRIP_ORIENTATION: np.array([0.0, 0.0, 0.0, 1.0]),
+                xr.ControllerInputIndex.GRIP_IS_VALID: True,
+                xr.ControllerInputIndex.SQUEEZE_VALUE: 0.75,
+                xr.ControllerInputIndex.TRIGGER_VALUE: 0.25,
+            }
+            return values[index]
+
+    controller = object.__new__(xr.XRController)
+    controller._external_inputs = None
+    controller._is_tracking = False
+    controller._step = lambda **_kwargs: {
+        "controller": Controller([4.0, 5.0, 6.0]),
+        "controller_raw": Controller([1.0, 2.0, 3.0]),
+    }
+
+    action = controller.get_action()
+
+    assert action["grip_pos"] == pytest.approx([4.0, 5.0, 6.0])
+    assert action["raw_grip_pos"] == pytest.approx([1.0, 2.0, 3.0])
+    assert action["grip_quat"] == pytest.approx([0.0, 0.0, 0.0, 1.0])
+    assert action["raw_grip_quat"] == pytest.approx([0.0, 0.0, 0.0, 1.0])
 
 
 def test_rpy_conversion_preserves_a_near_gimbal_lock_reference():

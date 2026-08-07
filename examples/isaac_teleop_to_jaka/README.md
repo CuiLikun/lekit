@@ -44,15 +44,39 @@ python -m examples.isaac_teleop_to_jaka.record \
     --dataset.reset_time_s=5
 ~~~
 
-Hold the controller squeeze to engage motion. Releasing it holds the measured
-TCP pose. Each trigger press toggles the normalized `gripper.pos` command
+Hold the controller squeeze to engage motion. Releasing it holds the last
+commanded TCP target, so a lagging feedback sample cannot pull the arm backward.
+Each trigger press toggles the normalized `gripper.pos` command
 between closed (`0`) and open (`1`).
+
+The default operator mapping is hand forward/right/up to JAKA base
+`+X/-Y/+Z`. It includes the 33.635 degree horizontal CloudXR-anchor offset
+measured for this operator station. Override `--teleop.base_T_anchor` when the
+robot or operator station is mounted in a different orientation.
 
 To control translation without rotating the tool, pass `--teleop.lock_pose=true`.
 The current measured roll/pitch/yaw is captured when the clutch engages and held
 while it remains engaged. `false` (the default) follows the XR controller's orientation.
 Cartesian controller drift up to 0.2 mm is ignored by default; adjust it with
 `--teleop.position_deadband_m` when the tracking noise or precision requirement differs.
+The recorder also enables JAKA's `cartesian_nlf` automatically. Hardware hold
+testing showed that unfiltered Servo P produced a fixed-target limit cycle,
+while the same target was stable with the Cartesian nonlinear filter enabled.
+The XR profile defaults to `0.15 m/s`, `0.8 m/s²`, and `8 m/s³` for linear Servo P
+velocity, acceleration, and jerk to keep the control responsive while retaining
+the nonlinear filter. Tune these with `--teleop.servo_linear_velocity_m_s`,
+`--teleop.servo_linear_acceleration_m_s2`, and `--teleop.servo_linear_jerk_m_s3`.
+
+To capture a synchronized control trace while reproducing motion or hold jitter, add:
+
+~~~bash
+    --control_trace_csv=artifacts/jaka_control_trace.csv
+~~~
+
+The CSV records raw OpenXR and transformed grip positions, whether each frame
+came from XR or the disengaged hold latch, requested/applied/actual TCP poses,
+target steps, tracking errors, and the managed Servo sender's internal target,
+interpolated command, timing, overruns, and queue depth.
 
 The driver always records `gripper.pos`. By default, gripper commands are sent
 to JAKA extension analog output channel 3, with a width range of 0-1000 (0

@@ -50,8 +50,9 @@ import math
 import sys
 import time
 from collections.abc import Callable
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from pprint import pformat
 from threading import Lock
 from typing import Any
@@ -81,32 +82,41 @@ from lerobot.utils.utils import init_logging
 from robots.jaka_robot import JakaRobot, JakaRobotConfig
 from robots.jaka_robot.dataset_features import build_dataset_features
 
+from .control_trace import ControlTraceWriter
 from .xr import CLOUDXR_ENV_FILE, IsaacTeleopConfig, make_xr_device
 
 DELTA_POSITION_BAR_SPAN_M = 0.05
 DELTA_POSITION_BAR_WIDTH = 31
+DELTA_POSITION_DISPLAY_DEADBAND_M = 0.0002
 
 # ── Hold latch ──────────────────────────────────────────────────────────────
 
 
 class HoldLatch:
-    """Re-send the measured action while the device is idle.
+    """Hold the last commanded action while the device is idle.
 
-    Latching (instead of re-reading each idle frame) prevents a steady-state
-    servo error from compounding downward under gravity: a fresh re-command of
-    the measurement would lower the goal by that error on every frame.
+    The first idle frame has no prior command, so it is initialized from measured
+    feedback. Once control has started, however, the last command is the stable
+    hold target. Re-reading feedback at the engage-release edge would replace a
+    still-tracking target with the lagging measured pose and make the arm visibly
+    retract.
     """
 
     def __init__(self, action_keys: list[str]):
         self._action_keys = action_keys
+        self._last_action: dict[str, float] | None = None
         self._held: dict[str, float] | None = None
 
     def resolve(self, action: dict | None, obs: dict) -> dict:
         if action is not None:
+            self._last_action = dict(action)
             self._held = None
-            return action
+            return self._last_action
         if self._held is None:
-            self._held = {k: float(obs[k]) for k in self._action_keys if k in obs}
+            if self._last_action is not None:
+                self._held = dict(self._last_action)
+            else:
+                self._held = {k: float(obs[k]) for k in self._action_keys if k in obs}
         return self._held
 
 
@@ -240,6 +250,24 @@ def build_device(cfg: "RecordConfig") -> tuple[JakaRobot, Device]:
     # 30 Hz observations cannot interrupt the controller's 8 ms command stream.
     cfg.robot.auto_enable_servo = False
     cfg.robot.separate_feedback_connection = True
+    # The recorder uses the XR teleoperator's responsive Cartesian profile. JAKA's
+    # controller-side Cartesian NLF remains enabled below for jitter suppression.
+    for robot_name, teleop_name in (
+        ("servo_eef_max_velocity_m_s", "servo_linear_velocity_m_s"),
+        ("servo_eef_max_acceleration_m_s2", "servo_linear_acceleration_m_s2"),
+        ("servo_filter_eef_max_jerk_m_s3", "servo_linear_jerk_m_s3"),
+        ("servo_eef_max_angular_velocity_rad_s", "servo_angular_velocity_rad_s"),
+        ("servo_eef_max_angular_acceleration_rad_s2", "servo_angular_acceleration_rad_s2"),
+        ("servo_filter_eef_max_angular_jerk_rad_s3", "servo_angular_jerk_rad_s3"),
+    ):
+        if hasattr(cfg.teleop, teleop_name):
+            setattr(cfg.robot, robot_name, getattr(cfg.teleop, teleop_name))
+    if cfg.robot.servo_filter_mode == "none":
+        cfg.robot.servo_filter_mode = "cartesian_nlf"
+    elif cfg.robot.servo_filter_mode != "cartesian_nlf":
+        raise ValueError(
+            "isaac_teleop_to_jaka.record requires cartesian_nlf for Cartesian Servo P control"
+        )
 
     robot = make_robot_from_config(cfg.robot)
     robot.connect()
@@ -385,7 +413,12 @@ def _control_panel(
         for axis in ("x", "y", "z"):
             if axis not in pos_delta:
                 continue
+            # JAKA TCP feedback is quantized/noisy by roughly a tenth of a
+            # millimetre at rest. Keep that measurement noise from making the
+            # live panel flicker while retaining larger tracking errors.
             delta = pos_delta[axis]
+            if abs(delta) < DELTA_POSITION_DISPLAY_DEADBAND_M:
+                delta = 0.0
             table.add_row(
                 f"{axis.upper()} {delta:+.4f} m",
                 _signed_horizontal_bar(delta, DELTA_POSITION_BAR_SPAN_M),
@@ -419,6 +452,8 @@ class RecordConfig:
 
     # Resume recording on an existing (previously interrupted) dataset.
     resume: bool = False
+    control_trace_csv: Path | None = None
+    control_trace_flush_frames: int = 30
 
 
 # ── Record loop ─────────────────────────────────────────────────────────────
@@ -436,6 +471,7 @@ def _record_loop(
     control_time_s: float = 0.0,
     single_task: str | None = None,
     gripper_toggle: TriggerGripperToggle | None = None,
+    control_trace: ControlTraceWriter | None = None,
 ) -> None:
     """Run one episode or reset phase of the Cartesian control loop.
 
@@ -505,6 +541,17 @@ def _record_loop(
         # Work time of this iteration: obs read + compute + target update + record.
         # The robot-owned 8 ms sender continues independently if this loop is late.
         frame_ms = (time.perf_counter() - loop_start) * 1000
+        if control_trace is not None:
+            control_trace.write_frame(
+                phase="record" if record_frames else "reset",
+                raw_action=raw,
+                action=action,
+                sent_action=sent_action,
+                observation=obs,
+                telemetry=device.telemetry,
+                servo_status=robot.get_servo_status(),
+                frame_ms=frame_ms,
+            )
         live.update(
             _control_panel(
                 device.telemetry,
@@ -597,11 +644,23 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             title="[bold cyan]Control frame[/bold cyan]",
             border_style="cyan",
         )
+        trace_context = (
+            ControlTraceWriter(
+                cfg.control_trace_csv,
+                flush_every=cfg.control_trace_flush_frames,
+            )
+            if cfg.control_trace_csv is not None
+            else nullcontext(None)
+        )
         with (
             Live(initial_panel, refresh_per_second=max(cfg.dataset.fps, 1), transient=False) as live,
             VideoEncodingManager(dataset),
+            trace_context as control_trace,
         ):
+            if control_trace is not None:
+                logging.info("[JAKA-TRACE] Writing control trace to %s", control_trace.path)
             loop_kwargs["live"] = live
+            loop_kwargs["control_trace"] = control_trace
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 logging.info(f"Recording episode {dataset.num_episodes}")

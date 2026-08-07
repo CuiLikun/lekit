@@ -91,6 +91,21 @@ uv run python -m robots.jaka_robot.servo_p_debug \
     --csv artifacts/servo_p_z_bump.csv
 ```
 
+When a fixed-target hold still shakes, repeat the same hold with only JAKA's
+Cartesian nonlinear filter changed:
+
+```bash
+uv run python -m robots.jaka_robot.servo_p_debug \
+    --ip 192.168.1.31 \
+    --mode hold \
+    --duration-s 8 \
+    --cartesian-nlf \
+    --csv artifacts/servo_p_hold_nlf.csv
+```
+
+The diagnostic checks the filter call's SDK return code and restores no-filter
+mode during cleanup.
+
 Add `--power-on --enable` only when the controller is not already ready. By
 default, states changed by the script are restored after the test. The script
 always exits Servo Move in `finally`, aborts when queue depth reaches 80 or

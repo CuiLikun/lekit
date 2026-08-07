@@ -105,13 +105,18 @@ else:
     TeleopSession = None
     TeleopSessionConfig = None
 
-# Static rebase from the CloudXR controller anchor frame into the JAKA base frame used by
-# this setup. The X/Y signs are selected for the physical arm mounting: lateral hand motion
-# maps to lateral EE motion, and forward/backward hand motion maps to EE X. ``base_T_anchor``
-# remains configurable for a differently mounted arm.
+# Static rebase from the CloudXR controller anchor frame into the JAKA base frame.
+# A control trace measured the operator's horizontal forward axis 33.635 degrees
+# from the CloudXR anchor. After compensating that yaw, operator right/forward/up
+# map to JAKA -Y/+X/+Z respectively. ``base_T_anchor`` remains configurable for
+# a differently mounted arm or operator station.
+DEFAULT_OPERATOR_YAW_DEG = 33.635
+_operator_yaw_rad = np.deg2rad(DEFAULT_OPERATOR_YAW_DEG)
+_operator_yaw_sin = float(np.sin(_operator_yaw_rad))
+_operator_yaw_cos = float(np.cos(_operator_yaw_rad))
 _DEFAULT_BASE_T_ANCHOR: list[list[float]] = [
-    [0.0, 0.0, 1.0, 0.0],
-    [1.0, 0.0, 0.0, 0.0],
+    [_operator_yaw_sin, 0.0, -_operator_yaw_cos, 0.0],
+    [-_operator_yaw_cos, 0.0, -_operator_yaw_sin, 0.0],
     [0.0, 1.0, 0.0, 0.0],
     [0.0, 0.0, 0.0, 1.0],
 ]
@@ -168,6 +173,24 @@ class XRControllerConfig(IsaacTeleopConfig):
     position_deadband_m: float = 0.0002
     """Ignore Cartesian controller drift up to this distance from the last target."""
 
+    servo_linear_velocity_m_s: float = 0.15
+    """Maximum linear Servo P velocity used by the teleoperation profile."""
+
+    servo_linear_acceleration_m_s2: float = 0.8
+    """Maximum linear Servo P acceleration used by the teleoperation profile."""
+
+    servo_linear_jerk_m_s3: float = 8.0
+    """Cartesian NLF linear jerk used by the teleoperation profile."""
+
+    servo_angular_velocity_rad_s: float = 1.0
+    """Maximum angular Servo P velocity used by the teleoperation profile."""
+
+    servo_angular_acceleration_rad_s2: float = 2.0
+    """Maximum angular Servo P acceleration used by the teleoperation profile."""
+
+    servo_angular_jerk_rad_s3: float = 20.0
+    """Cartesian NLF angular jerk used by the teleoperation profile."""
+
     base_T_anchor: list[list[float]] = field(  # noqa: N815
         default_factory=lambda: [row.copy() for row in _DEFAULT_BASE_T_ANCHOR]
     )
@@ -180,6 +203,17 @@ class XRControllerConfig(IsaacTeleopConfig):
             raise ValueError("lock_pose must be a boolean")
         if not np.isfinite(self.position_deadband_m) or self.position_deadband_m < 0:
             raise ValueError("position_deadband_m must be finite and non-negative")
+        for name in (
+            "servo_linear_velocity_m_s",
+            "servo_linear_acceleration_m_s2",
+            "servo_linear_jerk_m_s3",
+            "servo_angular_velocity_rad_s",
+            "servo_angular_acceleration_rad_s2",
+            "servo_angular_jerk_rad_s3",
+        ):
+            value = float(getattr(self, name))
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be positive and finite")
 
 
 # ======================================================================================
@@ -348,11 +382,12 @@ class XRController(IsaacTeleopTeleoperator):
         controller_key = f"controller_{side}"
 
         controllers = ControllersSource(name="controllers")
+        raw_ctrl = controllers.output(controller_key)
         xform = ValueInput(_BASE_T_ANCHOR_INPUT, TransformMatrix())
         transformed = controllers.transformed(xform.output("value"))
         ctrl = transformed.output(controller_key)
 
-        return OutputCombiner({"controller": ctrl})
+        return OutputCombiner({"controller": ctrl, "controller_raw": raw_ctrl})
 
     def _build_external_inputs(self) -> dict[str, Any]:
         """Materialize the constant ``base_T_anchor`` external input (once, in connect)."""
@@ -375,6 +410,8 @@ class XRController(IsaacTeleopTeleoperator):
         return {
             "grip_pos": {"dtype": "float32", "shape": (3,)},
             "grip_quat": {"dtype": "float32", "shape": (4,)},
+            "raw_grip_pos": {"dtype": "float32", "shape": (3,)},
+            "raw_grip_quat": {"dtype": "float32", "shape": (4,)},
             "squeeze": {"dtype": "float32", "shape": ()},
             "trigger": {"dtype": "float32", "shape": ()},
         }
@@ -429,9 +466,36 @@ class XRController(IsaacTeleopTeleoperator):
                     grip_pos, grip_quat = pos, quat / quat_norm
                     squeeze, trigger = squeeze_val, trigger_val
 
+        raw_grip_pos = grip_pos.copy()
+        raw_grip_quat = grip_quat.copy()
+        raw_controller = result.get("controller_raw")
+        if self._is_tracking and raw_controller is not None and not getattr(raw_controller, "is_none", False):
+            try:
+                raw_is_valid = bool(raw_controller[ControllerInputIndex.GRIP_IS_VALID])
+                raw_pos = np.asarray(raw_controller[ControllerInputIndex.GRIP_POSITION], dtype=np.float32)
+                raw_quat = np.asarray(
+                    raw_controller[ControllerInputIndex.GRIP_ORIENTATION], dtype=np.float32
+                )
+            except (IndexError, KeyError, TypeError, ValueError):
+                pass
+            else:
+                raw_quat_norm = float(np.linalg.norm(raw_quat))
+                if (
+                    raw_is_valid
+                    and raw_pos.shape == (3,)
+                    and raw_quat.shape == (4,)
+                    and np.all(np.isfinite(raw_pos))
+                    and np.all(np.isfinite(raw_quat))
+                    and raw_quat_norm > 1e-6
+                ):
+                    raw_grip_pos = raw_pos
+                    raw_grip_quat = raw_quat / raw_quat_norm
+
         return {
             "grip_pos": grip_pos,
             "grip_quat": grip_quat,
+            "raw_grip_pos": raw_grip_pos,
+            "raw_grip_quat": raw_grip_quat,
             "squeeze": squeeze,
             "trigger": trigger,
         }
@@ -599,12 +663,14 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
         xr_action = teleop.get_action()
         grip_pos = np.asarray(xr_action["grip_pos"], dtype=float)
         grip_quat = np.asarray(xr_action["grip_quat"], dtype=float)
+        raw_grip_pos = np.asarray(xr_action.get("raw_grip_pos", grip_pos), dtype=float)
         squeeze = float(xr_action["squeeze"])
         trigger = float(xr_action["trigger"])
         enabled = squeeze > teleop_config.clutch_threshold
         telemetry.update(
             grip_pos=tuple(float(v) for v in grip_pos),
             grip_quat=tuple(float(v) for v in grip_quat),
+            raw_grip_pos=tuple(float(v) for v in raw_grip_pos),
             squeeze=squeeze,
             trigger=trigger,
             clutch_engaged=enabled,

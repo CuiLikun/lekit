@@ -22,6 +22,7 @@ _TRACE_FIELDS = (
     "trigger",
     "frame_ms",
     *(f"grip_{axis}_m" for axis in ("x", "y", "z")),
+    *(f"raw_grip_{axis}_m" for axis in ("x", "y", "z")),
     *(f"actual_{axis}" for axis in _EEF_AXES),
     *(f"requested_{axis}" for axis in _EEF_AXES),
     *(f"applied_{axis}" for axis in _EEF_AXES),
@@ -34,6 +35,7 @@ _TRACE_FIELDS = (
     "servo_active",
     "servo_worker_alive",
     "servo_representation",
+    "servo_filter_mode",
     "servo_target_age_s",
     "servo_send_rate_hz",
     "servo_period_p95_ms",
@@ -58,10 +60,14 @@ def _mapping_pose(values: Mapping[str, Any]) -> tuple[float | None, ...]:
     return tuple(_number(values.get(key)) for key in _EEF_KEYS)
 
 
-def _sequence_pose(values: object) -> tuple[float | None, ...]:
-    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)) or len(values) != 6:
-        return (None,) * 6
+def _sequence(values: object, length: int) -> tuple[float | None, ...]:
+    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)) or len(values) != length:
+        return (None,) * length
     return tuple(_number(value) for value in values)
+
+
+def _sequence_pose(values: object) -> tuple[float | None, ...]:
+    return _sequence(values, 6)
 
 
 def _pose_delta(
@@ -147,7 +153,8 @@ class ControlTraceWriter:
             self._previous_applied = None
         tracking_error = _pose_delta(applied, actual)
         target_step = _pose_delta(applied, self._previous_applied)
-        grip_pos = _sequence_pose(telemetry.get("grip_pos"))[:3]
+        grip_pos = _sequence(telemetry.get("grip_pos"), 3)
+        raw_grip_pos = _sequence(telemetry.get("raw_grip_pos"), 3)
 
         row: dict[str, object] = {
             "time_s": time.monotonic() - self._started_at,
@@ -161,6 +168,9 @@ class ControlTraceWriter:
             "grip_x_m": grip_pos[0],
             "grip_y_m": grip_pos[1],
             "grip_z_m": grip_pos[2],
+            "raw_grip_x_m": raw_grip_pos[0],
+            "raw_grip_y_m": raw_grip_pos[1],
+            "raw_grip_z_m": raw_grip_pos[2],
             "tracking_error_norm_m": _translation_norm(tracking_error),
             "tracking_error_angle_rad": _angle_norm(tracking_error),
             "target_step_norm_m": _translation_norm(target_step),
@@ -168,6 +178,7 @@ class ControlTraceWriter:
             "servo_active": servo_status.get("active"),
             "servo_worker_alive": servo_status.get("worker_alive"),
             "servo_representation": servo_status.get("representation"),
+            "servo_filter_mode": servo_status.get("filter_mode"),
             "servo_target_age_s": servo_status.get("target_age_s"),
             "servo_send_rate_hz": servo_status.get("send_rate_hz"),
             "servo_period_p95_ms": servo_status.get("period_p95_ms"),

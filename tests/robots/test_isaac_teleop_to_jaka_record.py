@@ -1,9 +1,11 @@
 import ast
+import csv
 import importlib
 import io
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from rich.console import Console
 
 from lerobot.datasets import LeRobotDatasetMetadata
@@ -23,6 +25,20 @@ def test_trigger_gripper_toggle_changes_state_only_on_press_edges(monkeypatch):
     assert "gripper.pos" not in toggle.apply(action, observation, 0.8)
     assert "gripper.pos" not in toggle.apply(action, observation, 0.0)
     assert toggle.apply(action, observation, 0.8)["gripper.pos"] == 0.0
+
+
+def test_hold_latch_keeps_last_command_on_engage_release(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+    latch = record_module.HoldLatch(["ee.x", "ee.y", "ee.z"])
+    measured = {"ee.x": 0.10, "ee.y": 0.20, "ee.z": 0.30}
+    commanded = {"ee.x": 0.30, "ee.y": 0.20, "ee.z": 0.30}
+
+    assert latch.resolve(None, measured) == measured
+    assert latch.resolve(commanded, measured) == commanded
+    # Feedback is still lagging at the release edge; the commanded target must hold.
+    lagging_feedback = {"ee.x": 0.24, "ee.y": 0.20, "ee.z": 0.30}
+    assert latch.resolve(None, lagging_feedback) == commanded
 
 
 def test_dataset_features_are_lerobot_metadata_compatible(tmp_path):
@@ -97,6 +113,28 @@ def test_control_panel_visualizes_only_position_delta(monkeypatch):
     assert "█" in rendered
 
 
+def test_control_panel_deadbands_submillimetre_feedback_noise(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+    output = io.StringIO()
+    console = Console(file=output, width=100, color_system=None)
+
+    console.print(
+        record_module._control_panel(
+            {},
+            {"ee.x": 0.1, "ee.y": 0.2, "ee.z": 0.3},
+            {"ee.x": 0.1001, "ee.y": 0.1999, "ee.z": 0.30015},
+            {},
+            8.0,
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "X +0.0000 m" in rendered
+    assert "Y +0.0000 m" in rendered
+    assert "Z +0.0000 m" in rendered
+
+
 def test_jaka_status_contains_controller_and_servo_details(monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
     record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
@@ -147,11 +185,70 @@ def test_jaka_status_line_shows_only_three_color_coded_states(monkeypatch):
     assert [span.style for span in line.spans] == ["green", "white", "green"]
 
 
+def test_control_trace_records_disengaged_hold_and_servo_targets(monkeypatch, tmp_path):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    trace_module = importlib.import_module("examples.isaac_teleop_to_jaka.control_trace")
+    path = tmp_path / "control.csv"
+    target = {
+        "ee.x": 0.4,
+        "ee.y": -0.1,
+        "ee.z": 0.3,
+        "ee.roll": 0.1,
+        "ee.pitch": -0.2,
+        "ee.yaw": 0.3,
+    }
+
+    with trace_module.ControlTraceWriter(path, flush_every=1) as trace:
+        for actual_x in (0.4001, 0.3999):
+            trace.write_frame(
+                phase="record",
+                raw_action=None,
+                action=target,
+                sent_action=target,
+                observation={**target, "ee.x": actual_x},
+                telemetry={
+                    "clutch_engaged": False,
+                    "squeeze": 0.0,
+                    "trigger": 0.0,
+                    "grip_pos": (0.1, 0.2, 0.3),
+                    "raw_grip_pos": (0.4, 0.5, 0.6),
+                },
+                servo_status={
+                    "active": True,
+                    "worker_alive": True,
+                    "representation": "eef",
+                    "filter_mode": "none",
+                    "target": tuple(target.values()),
+                    "commanded_position": tuple(target.values()),
+                    "send_rate_hz": 125.0,
+                },
+                frame_ms=8.0,
+            )
+
+    with path.open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+
+    assert len(rows) == 2
+    assert rows[1]["action_source"] == "hold"
+    assert rows[1]["clutch_engaged"] == "False"
+    assert float(rows[1]["target_step_norm_m"]) == 0.0
+    assert float(rows[1]["tracking_error_x"]) == pytest.approx(0.0001)
+    assert float(rows[1]["servo_target_x"]) == pytest.approx(0.4)
+    assert float(rows[1]["servo_commanded_x"]) == pytest.approx(0.4)
+    assert rows[1]["servo_filter_mode"] == "none"
+    assert [float(rows[1][f"grip_{axis}_m"]) for axis in ("x", "y", "z")] == pytest.approx(
+        [0.1, 0.2, 0.3]
+    )
+    assert [
+        float(rows[1][f"raw_grip_{axis}_m"]) for axis in ("x", "y", "z")
+    ] == pytest.approx([0.4, 0.5, 0.6])
+
+
 def test_build_device_isolates_feedback_and_defers_servo_start(monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
     record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
 
-    observed_config: dict[str, bool] = {}
+    observed_config: dict[str, object] = {}
 
     class FakeRobot:
         name = "jaka_robot"
@@ -169,6 +266,7 @@ def test_build_device_isolates_feedback_and_defers_servo_start(monkeypatch):
     def make_robot(config):
         observed_config["auto_enable_servo"] = config.auto_enable_servo
         observed_config["separate_feedback_connection"] = config.separate_feedback_connection
+        observed_config["servo_filter_mode"] = config.servo_filter_mode
         return FakeRobot(config)
 
     startup_calls: list[bool] = []
@@ -188,6 +286,7 @@ def test_build_device_isolates_feedback_and_defers_servo_start(monkeypatch):
         robot=SimpleNamespace(
             auto_enable_servo=True,
             separate_feedback_connection=False,
+            servo_filter_mode="none",
             user_frame_id=0,
         ),
         teleop=SimpleNamespace(cloudxr_env_file=None),
@@ -199,8 +298,101 @@ def test_build_device_isolates_feedback_and_defers_servo_start(monkeypatch):
     assert observed_config == {
         "auto_enable_servo": False,
         "separate_feedback_connection": True,
+        "servo_filter_mode": "cartesian_nlf",
     }
     assert startup_calls == [True]
+
+
+def test_build_device_applies_xr_servo_profile(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+    cfg = SimpleNamespace(
+        robot=SimpleNamespace(
+            auto_enable_servo=True,
+            separate_feedback_connection=False,
+            servo_filter_mode="none",
+            user_frame_id=0,
+        ),
+        teleop=SimpleNamespace(
+            cloudxr_env_file=None,
+            servo_linear_velocity_m_s=0.15,
+            servo_linear_acceleration_m_s2=0.8,
+            servo_linear_jerk_m_s3=8.0,
+            servo_angular_velocity_rad_s=1.0,
+            servo_angular_acceleration_rad_s2=2.0,
+            servo_angular_jerk_rad_s3=20.0,
+        ),
+    )
+    observed: dict[str, float] = {}
+
+    class FakeRobot:
+        name = "jaka_robot"
+        is_connected = False
+
+        def __init__(self):
+            self.config = SimpleNamespace(user_frame_id=0)
+
+        def connect(self):
+            self.is_connected = True
+
+        def disconnect(self):
+            self.is_connected = False
+
+    def make_robot(config):
+        for key in (
+            "servo_eef_max_velocity_m_s",
+            "servo_eef_max_acceleration_m_s2",
+            "servo_filter_eef_max_jerk_m_s3",
+            "servo_eef_max_angular_velocity_rad_s",
+            "servo_eef_max_angular_acceleration_rad_s2",
+            "servo_filter_eef_max_angular_jerk_rad_s3",
+        ):
+            observed[key] = getattr(config, key)
+        return FakeRobot()
+
+    monkeypatch.setattr(record_module, "JakaRobot", FakeRobot)
+    monkeypatch.setattr(record_module, "make_robot_from_config", make_robot)
+    monkeypatch.setattr(
+        record_module,
+        "make_xr_device",
+        lambda _robot, _teleop: {
+            "compute": lambda _obs: None,
+            "startup": lambda: None,
+            "cleanup": lambda: None,
+            "telemetry": {},
+        },
+    )
+    record_module.build_device(cfg)
+
+    assert observed == {
+        "servo_eef_max_velocity_m_s": 0.15,
+        "servo_eef_max_acceleration_m_s2": 0.8,
+        "servo_filter_eef_max_jerk_m_s3": 8.0,
+        "servo_eef_max_angular_velocity_rad_s": 1.0,
+        "servo_eef_max_angular_acceleration_rad_s2": 2.0,
+        "servo_filter_eef_max_angular_jerk_rad_s3": 20.0,
+    }
+
+
+def test_build_device_rejects_non_cartesian_servo_filter(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+    cfg = SimpleNamespace(
+        robot=SimpleNamespace(
+            auto_enable_servo=True,
+            separate_feedback_connection=False,
+            servo_filter_mode="joint_lpf",
+        ),
+        teleop=SimpleNamespace(cloudxr_env_file=None),
+    )
+    monkeypatch.setattr(
+        record_module,
+        "make_robot_from_config",
+        lambda _config: pytest.fail("invalid filter must fail before connecting"),
+    )
+
+    with pytest.raises(ValueError, match="requires cartesian_nlf"):
+        record_module.build_device(cfg)
 
 
 def test_hardware_stop_callback_is_idempotent_and_orders_teardown():

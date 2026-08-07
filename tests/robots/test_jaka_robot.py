@@ -63,6 +63,9 @@ class FakeRC:
     def set_vibsuppress_mode(self, value):
         return self._call("set_vibsuppress_mode", value)
 
+    def vibsuppress_on(self, frequency):
+        return self._call("vibsuppress_on", frequency)
+
     def servo_move_use_joint_LPF(self, cutoff):  # noqa: N802
         return self._call("servo_move_use_joint_LPF", cutoff)
 
@@ -212,6 +215,16 @@ def test_recent_observation_is_reused_by_eef_action(robot):
 
     assert applied["ee.x"] == pytest.approx(0.105)
     assert (rc.joint_reads, rc.tcp_reads) == before
+
+
+def test_servo_status_exposes_target_and_commanded_position(robot):
+    arm, rc = robot
+
+    status = arm.get_servo_status()
+
+    assert status["filter_mode"] == "none"
+    assert status["target"] == pytest.approx(rc.joints)
+    assert status["commanded_position"] == pytest.approx(rc.joints)
 
 
 def test_eef_orientation_limit_handles_rpy_wrap(monkeypatch):

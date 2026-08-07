@@ -3,7 +3,12 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from robots.jaka_robot.servo_p_debug import DiagnosticSettings, build_targets, run_stream
+from robots.jaka_robot.servo_p_debug import (
+    DiagnosticSettings,
+    _set_cartesian_nlf,
+    build_targets,
+    run_stream,
+)
 
 
 class FakeClock:
@@ -28,6 +33,28 @@ class FakeRC:
         self.calls.append((pose, move_mode, step_num))
         self.clock.now += self.latency_s
         return (0, self.queue_depth)
+
+
+def test_cartesian_nlf_uses_jaka_sdk_units_and_can_be_restored():
+    calls = []
+
+    class FilterRC:
+        def servo_move_use_carte_NLF(self, *args):  # noqa: N802
+            calls.append(("cartesian_nlf", *args))
+            return (0,)
+
+        def servo_move_use_none_filter(self):
+            calls.append(("none",))
+            return (0,)
+
+    rc = FilterRC()
+    _set_cartesian_nlf(rc, True)
+    _set_cartesian_nlf(rc, False)
+
+    assert calls == [
+        ("cartesian_nlf", 50.0, 200.0, 1000.0, 0.5, 1.0, 10.0),
+        ("none",),
+    ]
 
 
 def test_hold_and_z_bump_targets_are_precomputed_and_return_to_start():

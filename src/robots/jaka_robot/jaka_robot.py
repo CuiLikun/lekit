@@ -1361,6 +1361,7 @@ class JakaRobot(Robot):
                 "active": self._servo_active,
                 "worker_alive": self._servo_thread is not None and self._servo_thread.is_alive(),
                 "representation": self._servo_representation,
+                "filter_mode": self.config.servo_filter_mode,
                 "target": target,
                 "commanded_position": commanded_position,
                 "target_age_s": target_age,
