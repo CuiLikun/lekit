@@ -217,6 +217,9 @@ class JakaRobotConfig(RobotConfig):
     auto_power_on: bool = True
     auto_enable: bool = True
     auto_enable_servo: bool = True
+    # Preserve the controller's servo-enable state across SDK reconnects by
+    # default. Continuous Servo Move is still always exited on disconnect.
+    disable_on_disconnect: bool = False
     power_off_on_disconnect: bool = False
     use_grpc: bool = False
     # Open a second SDK handle for feedback/auxiliary IO so state reads cannot
@@ -255,17 +258,20 @@ class JakaRobotConfig(RobotConfig):
     servo_max_consecutive_overruns: int = 20
     servo_shutdown_timeout_s: float = 2.0
 
-    # Optional analog gripper mapping. Disabled mappings never read/write IO.
+    # The JAKA gripper controller accepts its opening width through extension
+    # analog-output channel 3: 0 is fully closed and 1000 is fully open.
+    # Input feedback remains optional because this controller does not expose
+    # position feedback through the command channel.
     gripper_analog_input_enabled: bool = False
-    gripper_analog_output_enabled: bool = False
+    gripper_analog_output_enabled: bool = True
     gripper_analog_input_iotype: int = IO_CABINET
     gripper_analog_input_index: int = 0
-    gripper_analog_output_iotype: int = IO_CABINET
-    gripper_analog_output_index: int = 0
+    gripper_analog_output_iotype: int = IO_EXTEND
+    gripper_analog_output_index: int = 3
     gripper_analog_input_min: float = 0.0
     gripper_analog_input_max: float = 10.0
     gripper_analog_output_min: float = 0.0
-    gripper_analog_output_max: float = 10.0
+    gripper_analog_output_max: float = 1000.0
     gripper_analog_input_inverted: bool = False
     gripper_analog_output_inverted: bool = False
     gripper_fallback_position: float = 0.0
@@ -285,9 +291,7 @@ class JakaRobotConfig(RobotConfig):
         if self.servo_step_num < 1:
             raise ValueError("JakaRobotConfig.servo_step_num must be at least 1.")
         if self.servo_filter_mode not in {"none", "joint_lpf", "joint_nlf", "cartesian_nlf"}:
-            raise ValueError(
-                "servo_filter_mode must be one of: none, joint_lpf, joint_nlf, cartesian_nlf."
-            )
+            raise ValueError("servo_filter_mode must be one of: none, joint_lpf, joint_nlf, cartesian_nlf.")
         if not 1 <= self.servo_queue_warn_depth <= SERVO_QUEUE_MAX:
             raise ValueError(f"servo_queue_warn_depth must be in [1, {SERVO_QUEUE_MAX}].")
         if not 0 < self.servo_joint_max_velocity_rad_s <= math.pi:
@@ -421,6 +425,8 @@ class JakaRobot(Robot):
         self._servo_state_lock = threading.RLock()
         self._servo_stop = threading.Event()
         self._servo_thread: threading.Thread | None = None
+        self._servo_startup_ready: threading.Event | None = None
+        self._servo_startup_error: Exception | None = None
         self._servo_active = False
         self._servo_queue_warned = False
         self._last_eef_target: np.ndarray | None = None
@@ -445,8 +451,8 @@ class JakaRobot(Robot):
     @cached_property
     def observation_features(self) -> dict[str, Any]:
         features: dict[str, Any] = {f"{motor}.pos": float for motor in self.motors}
-        features.update(dict.fromkeys(self._EEF_KEYS, float))
         features["gripper.pos"] = float
+        features.update(dict.fromkeys(self._EEF_KEYS, float))
         for name, camera in self.cameras.items():
             if getattr(camera, "use_rgb", True):
                 features[name] = (camera.height, camera.width, 3)
@@ -457,8 +463,8 @@ class JakaRobot(Robot):
     @cached_property
     def action_features(self) -> dict[str, Any]:
         features: dict[str, Any] = dict.fromkeys(self._JOINT_KEYS, float)
-        features.update(dict.fromkeys(self._EEF_KEYS, float))
         features["gripper.pos"] = float
+        features.update(dict.fromkeys(self._EEF_KEYS, float))
         return features
 
     @property
@@ -488,14 +494,19 @@ class JakaRobot(Robot):
         self._login(rc)
         self.rc = rc
         try:
+            self.rc.set_vibsuppress_mode(1)  # enable vibration suppression
+            self.rc.vibsuppress_on(12)  # enable vibration suppression
+
             if self.config.separate_feedback_connection:
                 feedback_rc = create_rc(self.config.ip)
                 self._login(feedback_rc)
                 self._feedback_rc = feedback_rc
-            if self.config.auto_power_on:
+            controller_state = self.get_controller_state()
+            if self.config.auto_power_on and not controller_state["powered_on"]:
                 self._call("power_on", rc.power_on())
                 self._powered_by_driver = True
-            if self.config.auto_enable:
+                controller_state["powered_on"] = True
+            if self.config.auto_enable and not controller_state["enabled"]:
                 self._call("enable_robot", rc.enable_robot())
                 self._enabled_by_driver = True
 
@@ -561,7 +572,7 @@ class JakaRobot(Robot):
         try:
             if self._servo_active:
                 self._set_servo(False, suppress_errors=True)
-            if self._enabled_by_driver:
+            if self._enabled_by_driver and self.config.disable_on_disconnect:
                 self._call("disable_robot", rc.disable_robot())
             if self._powered_by_driver and self.config.power_off_on_disconnect:
                 self._call("power_off", rc.power_off())
@@ -697,7 +708,12 @@ class JakaRobot(Robot):
 
         representation = self._action_representation(action, name="action")
         if representation is not None and use_servo and not self._servo_active:
-            raise RuntimeError("Servo Move is disabled; call servo_enable(True) before send_action().")
+            with self._servo_state_lock:
+                worker_error = self._servo_last_error
+            detail = f" Last worker error: {worker_error}" if worker_error else ""
+            raise RuntimeError(
+                "Servo Move is disabled; call servo_enable(True) before send_action()." + detail
+            )
         if representation is not None and not use_servo and self._servo_active:
             raise RuntimeError("Exit Servo Move before sending a controller-planned action.")
         if "gripper.pos" in action:
@@ -978,14 +994,14 @@ class JakaRobot(Robot):
     def get_controller_state(self) -> dict[str, bool]:
         """Return controller-reported power and enable state."""
 
-        assert self.rc is not None
-        getter = getattr(self.rc, "get_robot_status_simple", None)
+        rc, lock = self._feedback_handle()
+        getter = getattr(rc, "get_robot_status_simple", None)
         if getter is None:
             return {
                 "powered_on": self._powered_by_driver,
                 "enabled": self._enabled_by_driver,
             }
-        with self._sdk_lock:
+        with lock:
             values = self._call("get_robot_status_simple", getter())
         if len(values) < 2:
             raise JakaError("get_robot_status_simple", -1, values)
@@ -1024,23 +1040,34 @@ class JakaRobot(Robot):
         return step * SERVO_CYCLE_S
 
     @check_if_not_connected
-    def servo_enable(self, enabled: bool = True) -> None:
+    def servo_enable(
+        self, enabled: bool = True, *, representation: Literal["joints", "eef"] = "joints"
+    ) -> None:
         """Start or stop continuous 8 ms Servo target tracking.
 
-        Enabling initializes the scheduler from measured joint feedback before
-        entering Servo Move. Disabling first stops and joins the sender, then
-        asks the controller to leave Servo Move mode. Repeated calls are
-        idempotent.
+        Enabling initializes the scheduler from measured joint or Cartesian
+        feedback before entering Servo Move. Disabling first stops and joins
+        the sender, then asks the controller to leave Servo Move mode.
+        Repeated calls are idempotent.
         """
 
-        self._set_servo(bool(enabled))
+        self._set_servo(bool(enabled), representation=representation)
 
-    def _set_servo(self, enabled: bool, *, suppress_errors: bool = False) -> None:
+    def _set_servo(
+        self,
+        enabled: bool,
+        *,
+        representation: Literal["joints", "eef"] = "joints",
+        suppress_errors: bool = False,
+    ) -> None:
         assert self.rc is not None
         if enabled:
             if self._servo_active:
                 return
-            initial_position = self._read_joint_vector()
+            if representation == "joints":
+                initial_position = self._read_joint_vector()
+            else:
+                initial_position = self.get_eef_pose()
             try:
                 self._set_controller_servo(True)
             except JakaError:
@@ -1048,11 +1075,14 @@ class JakaRobot(Robot):
                     logger.warning("Could not enter JAKA Servo Move mode during setup.", exc_info=True)
                     return
                 raise
+            startup_ready = threading.Event()
             with self._servo_state_lock:
                 self._servo_active = True
+                self._servo_startup_ready = startup_ready
+                self._servo_startup_error = None
                 self._servo_queue_warned = False
                 self._last_eef_target = None
-                self._servo_representation = "joints"
+                self._servo_representation = representation
                 self._servo_target = initial_position.copy()
                 self._servo_commanded_position = initial_position.copy()
                 self._servo_joint_velocity.fill(0.0)
@@ -1073,6 +1103,20 @@ class JakaRobot(Robot):
                     daemon=True,
                 )
                 self._servo_thread.start()
+            if not startup_ready.wait(timeout=self.config.servo_shutdown_timeout_s):
+                with self._servo_state_lock:
+                    startup_error = self._servo_startup_error
+                self._set_servo(False, suppress_errors=True)
+                if startup_error is not None:
+                    raise startup_error
+                raise RuntimeError(
+                    "JAKA Servo Move did not send an initial frame within "
+                    f"{self.config.servo_shutdown_timeout_s:.2f}s."
+                )
+            with self._servo_state_lock:
+                startup_error = self._servo_startup_error
+            if startup_error is not None:
+                raise startup_error
             return
 
         thread = self._servo_thread
@@ -1103,6 +1147,8 @@ class JakaRobot(Robot):
             with self._servo_state_lock:
                 self._servo_active = False
                 self._servo_thread = None
+                self._servo_startup_ready = None
+                self._servo_startup_error = None
                 self._servo_representation = None
                 self._servo_target = None
                 self._servo_commanded_position = None
@@ -1189,6 +1235,8 @@ class JakaRobot(Robot):
                 with self._servo_state_lock:
                     self._servo_frames_sent += 1
                     self._servo_queue_depth = queue_depth
+                    if self._servo_startup_ready is not None:
+                        self._servo_startup_ready.set()
 
                 deadline += period_s
                 if frame_at >= deadline:
@@ -1277,6 +1325,9 @@ class JakaRobot(Robot):
         logger.error("JAKA Servo sender stopped: %s", message, exc_info=True)
         with self._servo_state_lock:
             self._servo_last_error = message
+            if self._servo_startup_ready is not None and not self._servo_startup_ready.is_set():
+                self._servo_startup_error = exc
+                self._servo_startup_ready.set()
             if self._servo_watchdog is None and "watchdog" in message.lower():
                 self._servo_watchdog = message
             self._servo_active = False
@@ -1291,6 +1342,14 @@ class JakaRobot(Robot):
 
         with self._servo_state_lock:
             samples = np.asarray(self._servo_period_samples, dtype=float)
+            target = (
+                tuple(map(float, self._servo_target)) if self._servo_target is not None else None
+            )
+            commanded_position = (
+                tuple(map(float, self._servo_commanded_position))
+                if self._servo_commanded_position is not None
+                else None
+            )
             mean_period = float(samples.mean()) if samples.size else 0.0
             now = time.monotonic()
             target_age = (
@@ -1302,6 +1361,8 @@ class JakaRobot(Robot):
                 "active": self._servo_active,
                 "worker_alive": self._servo_thread is not None and self._servo_thread.is_alive(),
                 "representation": self._servo_representation,
+                "target": target,
+                "commanded_position": commanded_position,
                 "target_age_s": target_age,
                 "send_rate_hz": 1.0 / mean_period if mean_period > 0 else 0.0,
                 "period_p95_ms": float(np.percentile(samples, 95) * 1000.0) if samples.size else 0.0,
@@ -1332,9 +1393,9 @@ class JakaRobot(Robot):
     def is_in_servo(self) -> bool:
         """Return the controller-reported Servo Move state."""
 
-        assert self.rc is not None
-        with self._sdk_lock:
-            values = self._call("is_in_servomove", self.rc.is_in_servomove())
+        rc, lock = self._feedback_handle()
+        with lock:
+            values = self._call("is_in_servomove", rc.is_in_servomove())
         return bool(values[0]) if values else self._servo_active
 
     @check_if_not_connected
@@ -1435,7 +1496,7 @@ class JakaRobot(Robot):
 
     @check_if_not_connected
     def set_gripper_position(self, position: Any) -> float:
-        """Set normalized analog gripper output when configured; otherwise no-op."""
+        """Set normalized gripper opening through JAKA extension analog output 3."""
 
         try:
             normalized = float(position)
@@ -1458,9 +1519,9 @@ class JakaRobot(Robot):
             self._call(
                 "set_analog_output",
                 rc.set_analog_output(
-                    self.config.gripper_analog_output_iotype,
-                    self.config.gripper_analog_output_index,
-                    raw,
+                    iotype=self.config.gripper_analog_output_iotype,
+                    index=self.config.gripper_analog_output_index,
+                    value=raw,
                 ),
             )
         self._last_gripper_position = applied_position

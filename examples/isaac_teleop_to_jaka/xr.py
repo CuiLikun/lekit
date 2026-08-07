@@ -165,6 +165,9 @@ class XRControllerConfig(IsaacTeleopConfig):
     lock_pose: bool = False
     """Keep the measured JAKA roll/pitch/yaw fixed while the clutch is engaged."""
 
+    position_deadband_m: float = 0.0002
+    """Ignore Cartesian controller drift up to this distance from the last target."""
+
     base_T_anchor: list[list[float]] = field(  # noqa: N815
         default_factory=lambda: [row.copy() for row in _DEFAULT_BASE_T_ANCHOR]
     )
@@ -175,6 +178,8 @@ class XRControllerConfig(IsaacTeleopConfig):
             raise ValueError(f"hand_side must be 'left' or 'right', got {self.hand_side!r}")
         if not isinstance(self.lock_pose, bool):
             raise ValueError("lock_pose must be a boolean")
+        if not np.isfinite(self.position_deadband_m) or self.position_deadband_m < 0:
+            raise ValueError("position_deadband_m must be finite and non-negative")
 
 
 # ======================================================================================
@@ -580,7 +585,9 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
         clutch = Clutch(home_base_t_ee)
 
         if robot.name == "jaka_robot":
-            robot.servo_enable(True)
+            # Start directly in Cartesian Servo P mode. Some controllers reject
+            # switching from an initial Servo J stream into Servo P.
+            robot.servo_enable(True, representation="eef")
 
         print("Starting teleop loop. Squeeze and move the controller to teleoperate the robot...")
 
@@ -633,9 +640,11 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
         if last_pos is not None:
             delta = pos - last_pos
             n = float(np.linalg.norm(delta))
-            if n > MAX_EE_STEP_M:
+            if n <= teleop_config.position_deadband_m:
+                pos = last_pos.copy()
+            elif n > MAX_EE_STEP_M:
                 pos = last_pos + delta * (MAX_EE_STEP_M / n)
-        last_pos = pos
+        last_pos = pos.copy()
 
         if last_rpy is None:
             raise RuntimeError("XR orientation state was not initialized on clutch engage")

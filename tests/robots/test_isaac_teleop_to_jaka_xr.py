@@ -75,7 +75,7 @@ def test_lock_pose_holds_measured_orientation_while_translation_follows_controll
                 for key in ("ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw")
             )
 
-        def servo_enable(self, _enabled):
+        def servo_enable(self, _enabled, *, representation="joints"):
             pass
 
     monkeypatch.setattr(xr, "XRController", FakeTeleop)
@@ -94,6 +94,73 @@ def test_lock_pose_holds_measured_orientation_while_translation_follows_controll
     )
     assert [second[f"ee.{axis}"] for axis in ("roll", "pitch", "yaw")] == pytest.approx(
         [measured_pose[f"ee.{axis}"] for axis in ("roll", "pitch", "yaw")]
+    )
+
+
+def test_stationary_xr_position_noise_does_not_change_cartesian_target(monkeypatch):
+    xr = _xr_module()
+    measured_pose = {
+        "ee.x": 0.4,
+        "ee.y": -0.1,
+        "ee.z": 0.3,
+        "ee.roll": 0.1,
+        "ee.pitch": -0.2,
+        "ee.yaw": 0.3,
+    }
+
+    class FakeTeleop:
+        def __init__(self, _config):
+            self._actions = iter(
+                [
+                    {
+                        "grip_pos": np.array([0.0, 0.0, 0.0]),
+                        "grip_quat": np.array([0.0, 0.0, 0.0, 1.0]),
+                        "squeeze": 1.0,
+                        "trigger": 0.0,
+                    },
+                    {
+                        "grip_pos": np.array([0.0001, 0.0, 0.0]),
+                        "grip_quat": np.array([0.0, 0.0, 0.0, 1.0]),
+                        "squeeze": 1.0,
+                        "trigger": 0.0,
+                    },
+                ]
+            )
+            self.is_connected = False
+
+        def connect(self):
+            self.is_connected = True
+
+        def get_action(self):
+            return next(self._actions)
+
+        def disconnect(self):
+            self.is_connected = False
+
+    class FakeRobot:
+        name = "jaka_robot"
+        is_connected = True
+
+        def get_eef_pose(self):
+            return tuple(
+                measured_pose[key]
+                for key in ("ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw")
+            )
+
+        def servo_enable(self, _enabled, *, representation="joints"):
+            pass
+
+    monkeypatch.setattr(xr, "XRController", FakeTeleop)
+    monkeypatch.setattr(xr, "_wait_for_xr_controller", lambda _teleop: None)
+    bundle = xr.make_xr_device(FakeRobot(), xr.XRControllerConfig())
+    bundle["startup"]()
+
+    first = bundle["compute"](measured_pose)
+    second = bundle["compute"](measured_pose)
+
+    assert first is not None and second is not None
+    assert [second[f"ee.{axis}"] for axis in ("x", "y", "z")] == pytest.approx(
+        [first[f"ee.{axis}"] for axis in ("x", "y", "z")]
     )
 
 

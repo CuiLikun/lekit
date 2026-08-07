@@ -45,17 +45,20 @@ python -m examples.isaac_teleop_to_jaka.record \
 ~~~
 
 Hold the controller squeeze to engage motion. Releasing it holds the measured
-TCP pose. The trigger produces a normalized `gripper.pos` command where `0`
-means closed and `1` means open.
+TCP pose. Each trigger press toggles the normalized `gripper.pos` command
+between closed (`0`) and open (`1`).
 
 To control translation without rotating the tool, pass `--teleop.lock_pose=true`.
 The current measured roll/pitch/yaw is captured when the clutch engages and held
 while it remains engaged. `false` (the default) follows the XR controller's orientation.
+Cartesian controller drift up to 0.2 mm is ignored by default; adjust it with
+`--teleop.position_deadband_m` when the tracking noise or precision requirement differs.
 
-The driver always records `gripper.pos`, but analog input and output are
-disabled by default because JAKA controllers and grippers can use different
-channels and electrical ranges. After verifying the wiring, configure feedback
-and control independently. For example, a cabinet AI0/AO0 mapped over 0-10 V:
+The driver always records `gripper.pos`. By default, gripper commands are sent
+to JAKA extension analog output channel 3, with a width range of 0-1000 (0
+closed, 1000 open), as expected by the referenced gripper controller. If your
+wiring uses different channels or ranges, override the mapping explicitly. For
+example, a cabinet AI0/AO0 mapped over 0-10 V:
 
 ~~~bash
     --robot.gripper_analog_input_enabled=true \

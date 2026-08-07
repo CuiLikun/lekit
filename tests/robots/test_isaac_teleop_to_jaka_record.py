@@ -1,11 +1,28 @@
 import ast
 import importlib
+import io
 from pathlib import Path
 from types import SimpleNamespace
+
+from rich.console import Console
 
 from lerobot.datasets import LeRobotDatasetMetadata
 from robots.jaka_robot.dataset_features import build_dataset_features
 from robots.jaka_robot.jaka_robot import JakaRobot, JakaRobotConfig
+
+
+def test_trigger_gripper_toggle_changes_state_only_on_press_edges(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+    toggle = record_module.TriggerGripperToggle()
+    observation = {"gripper.pos": 0.0}
+    action = {"ee.x": 0.1, "gripper.pos": 0.4}
+
+    assert "gripper.pos" not in toggle.apply(action, observation, 0.0)
+    assert toggle.apply(action, observation, 0.8)["gripper.pos"] == 1.0
+    assert "gripper.pos" not in toggle.apply(action, observation, 0.8)
+    assert "gripper.pos" not in toggle.apply(action, observation, 0.0)
+    assert toggle.apply(action, observation, 0.8)["gripper.pos"] == 0.0
 
 
 def test_dataset_features_are_lerobot_metadata_compatible(tmp_path):
@@ -38,7 +55,96 @@ def test_control_panel_calls_pass_frame_duration():
     ]
 
     assert calls
-    assert all(len(call.args) == 4 for call in calls)
+    assert all(len(call.args) == 5 for call in calls)
+
+
+def test_signed_horizontal_bar_has_stable_width_and_direction(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+
+    negative = record_module._signed_horizontal_bar(-0.05, 0.05, width=11).plain
+    zero = record_module._signed_horizontal_bar(0.0, 0.05, width=11).plain
+    positive = record_module._signed_horizontal_bar(0.05, 0.05, width=11).plain
+
+    assert negative == "█████│─────"
+    assert zero == "─────│─────"
+    assert positive == "─────│█████"
+    assert len(negative) == len(zero) == len(positive) == 11
+
+
+def test_control_panel_visualizes_only_position_delta(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+    output = io.StringIO()
+    console = Console(file=output, width=100, color_system=None)
+
+    console.print(
+        record_module._control_panel(
+            {},
+            {"ee.x": 0.1, "ee.y": 0.2, "ee.z": 0.3},
+            {"ee.x": 0.08, "ee.y": 0.23, "ee.z": 0.31},
+            {},
+            8.0,
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "delta.position_m" in rendered
+    assert "X -0.0200 m" in rendered
+    assert "Y +0.0300 m" in rendered
+    assert "Z +0.0100 m" in rendered
+    assert "XYZ movement" not in rendered
+    assert "█" in rendered
+
+
+def test_jaka_status_contains_controller_and_servo_details(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+
+    class FakeRobot:
+        def get_controller_state(self):
+            return {"powered_on": True, "enabled": True}
+
+        def is_in_servo(self):
+            return True
+
+        def get_servo_status(self):
+            return {
+                "active": True,
+                "worker_alive": True,
+                "representation": "eef",
+                "send_rate_hz": 125.34,
+                "frames_sent": 42,
+                "queue_depth": 3,
+                "last_error": None,
+            }
+
+    status = record_module._jaka_status(FakeRobot())
+
+    assert status == {
+        "powered_on": True,
+        "enabled": True,
+        "servo_on": True,
+        "servo_sender_active": True,
+        "servo_sender_alive": True,
+        "servo_representation": "eef",
+        "servo_rate_hz": 125.3,
+        "servo_frames_sent": 42,
+        "servo_queue_depth": 3,
+        "servo_last_error": None,
+    }
+
+
+def test_jaka_status_line_shows_only_three_color_coded_states(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+
+    line = record_module._jaka_status_line(
+        {"powered_on": True, "enabled": False, "servo_on": True, "servo_sender_active": True}
+    )
+
+    assert line.plain == "powered_on=True  enabled=False  servo_on=True"
+    assert [span.style for span in line.spans] == ["green", "white", "green"]
 
 
 def test_build_device_isolates_feedback_and_defers_servo_start(monkeypatch):

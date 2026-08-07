@@ -39,6 +39,7 @@ python -m examples.isaac_teleop_to_jaka.record \
     --dataset.streaming_encoding=True \
     --dataset.push_to_hub=False
 
+The XR trigger toggles the gripper between closed (0) and open (1) on each press.
 Keyboard shortcuts: Right/n ends and saves the current episode, Left/r discards and
 re-records it, and Esc/q stops immediately. All frames, including
 clutch-disengaged hold frames, are recorded.
@@ -55,6 +56,7 @@ from pprint import pformat
 from threading import Lock
 from typing import Any
 
+import numpy as np
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
@@ -81,6 +83,9 @@ from robots.jaka_robot.dataset_features import build_dataset_features
 
 from .xr import CLOUDXR_ENV_FILE, IsaacTeleopConfig, make_xr_device
 
+DELTA_POSITION_BAR_SPAN_M = 0.05
+DELTA_POSITION_BAR_WIDTH = 31
+
 # ── Hold latch ──────────────────────────────────────────────────────────────
 
 
@@ -103,6 +108,31 @@ class HoldLatch:
         if self._held is None:
             self._held = {k: float(obs[k]) for k in self._action_keys if k in obs}
         return self._held
+
+
+class TriggerGripperToggle:
+    """Convert an analog XR trigger into a one-press gripper toggle."""
+
+    def __init__(self, threshold: float = 0.5):
+        self.threshold = threshold
+        self._position: float | None = None
+        self._pressed = False
+
+    def apply(self, action: dict, obs: dict, trigger: float) -> dict:
+        if self._position is None:
+            self._position = float(np.clip(float(obs.get("gripper.pos", 0.0)), 0.0, 1.0))
+
+        pressed = math.isfinite(trigger) and trigger >= self.threshold
+        should_send = pressed and not self._pressed
+        if should_send:
+            self._position = 1.0 - self._position
+        self._pressed = pressed
+
+        result = dict(action)
+        result.pop("gripper.pos", None)
+        if should_send:
+            result["gripper.pos"] = self._position
+        return result
 
 
 # ── Keyboard control ────────────────────────────────────────────────────────
@@ -251,7 +281,68 @@ def _rounded(values: object | None) -> list[float] | None:
     return [round(float(v), 4) for v in values]  # type: ignore[union-attr]
 
 
-def _control_panel(telemetry: dict[str, Any], action: dict[str, float], obs: dict, frame_ms: float) -> Panel:
+def _signed_horizontal_bar(value: float, span: float, *, width: int = DELTA_POSITION_BAR_WIDTH) -> Text:
+    """Render a fixed-width bar with negative values left of center."""
+
+    if width < 3 or width % 2 == 0:
+        raise ValueError("horizontal bar width must be an odd integer of at least 3")
+    if not math.isfinite(span) or span <= 0:
+        raise ValueError("horizontal bar span must be positive and finite")
+
+    half = (width - 1) // 2
+    filled = int(round(float(np.clip(abs(value) / span, 0.0, 1.0)) * half))
+    negative_fill = filled if value < 0 else 0
+    positive_fill = filled if value > 0 else 0
+
+    bar = Text()
+    bar.append("─" * (half - negative_fill), style="dim")
+    bar.append("█" * negative_fill, style="bold bright_cyan")
+    bar.append("│", style="bright_white")
+    bar.append("█" * positive_fill, style="bold bright_green")
+    bar.append("─" * (half - positive_fill), style="dim")
+    return bar
+
+
+def _jaka_status(robot: JakaRobot) -> dict[str, Any]:
+    """Return a best-effort controller and managed Servo status snapshot."""
+
+    status: dict[str, Any] = {}
+    try:
+        status.update(robot.get_controller_state())
+        status["servo_on"] = robot.is_in_servo()
+    except Exception as exc:
+        status["controller_error"] = str(exc)
+
+    servo = robot.get_servo_status()
+    status.update(
+        servo_sender_active=servo["active"],
+        servo_sender_alive=servo["worker_alive"],
+        servo_representation=servo["representation"],
+        servo_rate_hz=round(float(servo["send_rate_hz"]), 1),
+        servo_frames_sent=servo["frames_sent"],
+        servo_queue_depth=servo["queue_depth"],
+        servo_last_error=servo["last_error"],
+    )
+    return status
+
+
+def _jaka_status_line(robot_status: dict[str, Any]) -> Text:
+    line = Text()
+    for index, key in enumerate(("powered_on", "enabled", "servo_on")):
+        if index:
+            line.append("  ")
+        active = bool(robot_status.get(key, False))
+        line.append(f"{key}={active}", style="green" if active else "white")
+    return line
+
+
+def _control_panel(
+    telemetry: dict[str, Any],
+    action: dict[str, float],
+    obs: dict,
+    robot_status: dict[str, Any],
+    frame_ms: float,
+) -> Panel:
     start = time.perf_counter()
     table = Table.grid(padding=(0, 1))
     table.add_column(no_wrap=True)
@@ -279,7 +370,7 @@ def _control_panel(telemetry: dict[str, Any], action: dict[str, float], obs: dic
     # directly. Missing keys (e.g. right after connect) degrade gracefully.
     actual_pos = {axis: obs[f"ee.{axis}"] for axis in ("x", "y", "z") if f"ee.{axis}" in obs}
     actual_ori = {axis: obs[f"ee.{axis}"] for axis in ("roll", "pitch", "yaw") if f"ee.{axis}" in obs}
-    pos_delta = {k: round(actual_pos[k] - position[k], 4) for k in actual_pos if k in position}
+    pos_delta = {k: actual_pos[k] - position[k] for k in actual_pos if k in position}
     ori_delta = {
         k: round((actual_ori[k] - orientation[k] + math.pi) % (2 * math.pi) - math.pi, 4)
         for k in actual_ori
@@ -290,9 +381,20 @@ def _control_panel(telemetry: dict[str, Any], action: dict[str, float], obs: dic
     table.add_row("ee_actual.position_m", str({k: round(v, 4) for k, v in actual_pos.items()}))
     table.add_row("ee_actual.orientation_rad", str({k: round(v, 4) for k, v in actual_ori.items()}))
     if pos_delta:
-        table.add_row("delta.position_m", str(pos_delta))
+        table.add_row("delta.position_m", f"range ±{DELTA_POSITION_BAR_SPAN_M:.3f} m")
+        for axis in ("x", "y", "z"):
+            if axis not in pos_delta:
+                continue
+            delta = pos_delta[axis]
+            table.add_row(
+                f"{axis.upper()} {delta:+.4f} m",
+                _signed_horizontal_bar(delta, DELTA_POSITION_BAR_SPAN_M),
+            )
     if ori_delta:
         table.add_row("delta.orientation_rad", str(ori_delta))
+
+    table.add_row("", "")
+    table.add_row(Text("JAKA status", style="bold magenta"), _jaka_status_line(robot_status))
 
     panel_ms = (time.perf_counter() - start) * 1000
     panel = Panel(
@@ -333,6 +435,7 @@ def _record_loop(
     dataset: LeRobotDataset | None = None,
     control_time_s: float = 0.0,
     single_task: str | None = None,
+    gripper_toggle: TriggerGripperToggle | None = None,
 ) -> None:
     """Run one episode or reset phase of the Cartesian control loop.
 
@@ -341,6 +444,9 @@ def _record_loop(
     """
     control_interval = 1.0 / fps
     hold = HoldLatch(action_keys)
+    gripper_toggle = gripper_toggle or TriggerGripperToggle()
+    robot_status: dict[str, Any] = {}
+    next_status_refresh_at = 0.0
     start_t = time.perf_counter()
     timestamp = 0.0
     record_frames = dataset is not None
@@ -372,7 +478,11 @@ def _record_loop(
             if events["stop_recording"]:
                 break
             raise
-        action = hold.resolve(raw, obs)
+        action = gripper_toggle.apply(
+            hold.resolve(raw, obs),
+            obs,
+            float(device.telemetry.get("trigger", 0.0)),
+        )
 
         if events["stop_recording"]:
             break
@@ -384,6 +494,10 @@ def _record_loop(
                 break
             raise
 
+        if loop_start >= next_status_refresh_at:
+            robot_status = _jaka_status(robot)
+            next_status_refresh_at = loop_start + 1.0
+
         if record_frames:
             action_frame = build_dataset_frame(dataset.features, sent_action, prefix=ACTION)
             dataset.add_frame({**obs_frame, **action_frame, "task": single_task})
@@ -391,7 +505,16 @@ def _record_loop(
         # Work time of this iteration: obs read + compute + target update + record.
         # The robot-owned 8 ms sender continues independently if this loop is late.
         frame_ms = (time.perf_counter() - loop_start) * 1000
-        live.update(_control_panel(device.telemetry, action, obs, frame_ms), refresh=True)
+        live.update(
+            _control_panel(
+                device.telemetry,
+                action,
+                obs,
+                robot_status,
+                frame_ms,
+            ),
+            refresh=True,
+        )
 
         precise_sleep(max(control_interval - (time.perf_counter() - loop_start), 0.0))
         timestamp = time.perf_counter() - start_t
@@ -466,6 +589,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             "fps": cfg.dataset.fps,
             "live": None,  # bound below
             "single_task": cfg.dataset.single_task,
+            "gripper_toggle": TriggerGripperToggle(),
         }
 
         initial_panel = Panel(

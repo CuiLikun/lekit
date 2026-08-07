@@ -15,6 +15,7 @@ class FakeRC:
         self.tcp_mm = (100.0, 200.0, 300.0, 0.1, 0.2, 0.3)
         self.powered_on = False
         self.enabled = False
+        self.servo_enabled = False
         self.joint_reads = 0
         self.tcp_reads = 0
 
@@ -59,6 +60,9 @@ class FakeRC:
     def set_motion_planner(self, value):
         return self._call("set_motion_planner", value)
 
+    def set_vibsuppress_mode(self, value):
+        return self._call("set_vibsuppress_mode", value)
+
     def servo_move_use_joint_LPF(self, cutoff):  # noqa: N802
         return self._call("servo_move_use_joint_LPF", cutoff)
 
@@ -69,7 +73,11 @@ class FakeRC:
         return self._call("servo_move_use_carte_NLF", max_vp, max_ap, max_jp, max_vr, max_ar, max_jr)
 
     def servo_move_enable(self, value, _block=True):
+        self.servo_enabled = bool(value)
         return self._call("servo_move_enable", value)
+
+    def is_in_servomove(self):
+        return (0, self.servo_enabled)
 
     def get_actual_joint_position(self):
         self.joint_reads += 1
@@ -92,6 +100,10 @@ class FakeRC:
 
     def linear_move(self, pose, mode, is_block, speed):
         return self._call("linear_move", pose, mode, is_block, speed)
+
+    def set_analog_output(self, *, iotype, index, value):
+        self.calls.append(("set_analog_output", iotype, index, value))
+        return (0,)
 
 
 def wait_until(predicate, *, timeout: float = 0.5) -> None:
@@ -238,6 +250,39 @@ def test_feedback_connection_keeps_state_reads_off_servo_handle(monkeypatch):
         arm.disconnect()
 
 
+def test_controller_status_reads_use_feedback_connection(monkeypatch):
+    control_rc, feedback_rc = FakeRC(), FakeRC()
+    handles = iter((control_rc, feedback_rc))
+    monkeypatch.setattr(driver, "create_rc", lambda _ip: next(handles))
+    arm = driver.JakaRobot(
+        driver.JakaRobotConfig(
+            ip="10.0.0.2",
+            auto_enable_servo=False,
+            separate_feedback_connection=True,
+        )
+    )
+    arm.connect()
+    status_thread: threading.Thread | None = None
+    try:
+        results: list[dict[str, bool] | bool] = []
+        with arm._sdk_lock:
+            status_thread = threading.Thread(
+                target=lambda: results.extend((arm.get_controller_state(), arm.is_in_servo()))
+            )
+            status_thread.start()
+            status_thread.join(timeout=0.1)
+            assert not status_thread.is_alive()
+
+        assert results == [
+            {"powered_on": feedback_rc.powered_on, "enabled": feedback_rc.enabled},
+            feedback_rc.servo_enabled,
+        ]
+    finally:
+        if status_thread is not None:
+            status_thread.join(timeout=0.5)
+        arm.disconnect()
+
+
 def test_blocking_servo_p_does_not_block_target_updates(monkeypatch):
     rc = FakeRC()
     servo_p_started = threading.Event()
@@ -292,6 +337,41 @@ def test_gripper_only_action_does_not_send_an_arm_frame(robot):
     assert applied["gripper.pos"] == pytest.approx(0.75)
     assert set(applied) == set(arm.action_features)
     assert len([call for call in rc.calls if call[0] in {"servo_j", "servo_p"}]) == servo_call_count
+
+
+@pytest.mark.parametrize(
+    ("position", "expected_width"),
+    [(0.0, 0.0), (0.7, 700.0), (1.0, 1000.0)],
+)
+def test_gripper_uses_extension_analog_output_channel_three(robot, position, expected_width):
+    arm, rc = robot
+
+    assert arm.set_gripper_position(position) == pytest.approx(position)
+
+    assert rc.calls[-1] == (
+        "set_analog_output",
+        driver.IO_EXTEND,
+        3,
+        expected_width,
+    )
+
+
+def test_reconnect_preserves_an_enabled_controller_by_default(monkeypatch):
+    rc = FakeRC()
+    monkeypatch.setattr(driver, "create_rc", lambda _ip: rc)
+
+    arm = driver.JakaRobot(driver.JakaRobotConfig(ip="10.0.0.2", auto_enable_servo=False))
+    arm.connect()
+    arm.disconnect()
+    arm.connect()
+    arm.disconnect()
+
+    operations = [call[0] for call in rc.calls]
+    assert operations.count("power_on") == 1
+    assert operations.count("enable_robot") == 1
+    assert "disable_robot" not in operations
+    assert rc.powered_on is True
+    assert rc.enabled is True
 
 
 def test_non_servo_actions_use_controller_planned_moves(robot):
@@ -383,6 +463,35 @@ def test_servo_sender_continues_at_eight_ms_and_stops_before_controller_exit(rob
     assert rc.calls[-1] == ("servo_move_enable", False)
 
 
+def test_servo_enable_waits_for_the_first_controller_frame(monkeypatch):
+    rc = FakeRC()
+    monkeypatch.setattr(driver, "create_rc", lambda _ip: rc)
+    arm = driver.JakaRobot(driver.JakaRobotConfig(ip="10.0.0.2", auto_enable_servo=False))
+    arm.connect()
+    try:
+        rc.servo_j = lambda _joints, _mode, _step: (-3,)
+
+        with pytest.raises(driver.JakaError, match=r"servo_j failed \(-3\)"):
+            arm.servo_enable(True)
+    finally:
+        arm.disconnect()
+
+
+def test_cartesian_servo_starts_with_servo_p_not_servo_j(monkeypatch):
+    rc = FakeRC()
+    monkeypatch.setattr(driver, "create_rc", lambda _ip: rc)
+    arm = driver.JakaRobot(driver.JakaRobotConfig(ip="10.0.0.2", auto_enable_servo=False))
+    arm.connect()
+    try:
+        arm.servo_enable(True, representation="eef")
+
+        wait_until(lambda: bool(servo_calls(rc, "servo_p")))
+        assert not servo_calls(rc, "servo_j")
+        assert servo_calls(rc, "servo_p")[0][1] == pytest.approx(rc.tcp_mm)
+    finally:
+        arm.disconnect()
+
+
 def test_servo_target_timeout_disables_controller(monkeypatch):
     rc = FakeRC()
     monkeypatch.setattr(driver, "create_rc", lambda _ip: rc)
@@ -400,15 +509,17 @@ def test_servo_target_timeout_disables_controller(monkeypatch):
 
 def test_servo_sdk_failure_stops_sender_and_records_error(monkeypatch):
     rc = FakeRC()
-    rc.servo_j = lambda _joints, _mode, _step: (-3,)
     monkeypatch.setattr(driver, "create_rc", lambda _ip: rc)
     arm = driver.JakaRobot(driver.JakaRobotConfig(ip="10.0.0.2"))
     arm.connect()
     try:
+        rc.servo_j = lambda _joints, _mode, _step: (-3,)
         wait_until(lambda: not arm.get_servo_status()["worker_alive"])
         status = arm.get_servo_status()
         assert status["active"] is False
         assert "servo_j failed (-3)" in status["last_error"]
         assert ("servo_move_enable", False) in rc.calls
+        with pytest.raises(RuntimeError, match=r"Last worker error: JAKA servo_j failed \(-3\)"):
+            arm.send_action({"joint_1.pos": 0.1})
     finally:
         arm.disconnect()
