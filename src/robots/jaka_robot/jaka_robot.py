@@ -35,6 +35,8 @@ from lerobot.robots.utils import ensure_safe_goal_position
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
+from .pose_math import matrix_to_rpy
+
 logger = logging.getLogger(__name__)
 
 
@@ -164,15 +166,18 @@ def _euler_to_quaternion(rpy: np.ndarray) -> np.ndarray:
     return quaternion / np.linalg.norm(quaternion)
 
 
-def _quaternion_to_euler(quaternion: np.ndarray) -> np.ndarray:
-    """Convert a normalized wxyz quaternion to XYZ roll/pitch/yaw radians."""
+def _quaternion_to_euler(quaternion: np.ndarray, *, reference_rpy: np.ndarray | None = None) -> np.ndarray:
+    """Convert normalized wxyz quaternion to continuous XYZ roll/pitch/yaw radians."""
 
     w, x, y, z = quaternion / np.linalg.norm(quaternion)
-    roll = math.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
-    pitch_term = 2.0 * (w * y - z * x)
-    pitch = math.copysign(math.pi / 2.0, pitch_term) if abs(pitch_term) >= 1.0 else math.asin(pitch_term)
-    yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-    return np.array([roll, pitch, yaw])
+    matrix = np.array(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ]
+    )
+    return matrix_to_rpy(matrix, reference_rpy=reference_rpy)
 
 
 def _quaternion_distance(start: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, float]:
@@ -239,6 +244,13 @@ class JakaRobotConfig(RobotConfig):
     servo_eef_max_acceleration_m_s2: float = 0.2
     servo_eef_max_angular_velocity_rad_s: float = 0.5
     servo_eef_max_angular_acceleration_rad_s2: float = 1.0
+    # Optional controller-side Servo Move jitter suppression. ``none`` preserves the
+    # historical behavior; Cartesian NLF is the appropriate filter for Servo P targets.
+    servo_filter_mode: Literal["none", "joint_lpf", "joint_nlf", "cartesian_nlf"] = "none"
+    servo_filter_joint_lpf_cutoff_hz: float = 5.0
+    servo_filter_joint_max_jerk_rad_s3: float = 10.0
+    servo_filter_eef_max_jerk_m_s3: float = 1.0
+    servo_filter_eef_max_angular_jerk_rad_s3: float = 10.0
     servo_target_timeout_s: float | None = None
     servo_max_consecutive_overruns: int = 20
     servo_shutdown_timeout_s: float = 2.0
@@ -272,6 +284,10 @@ class JakaRobotConfig(RobotConfig):
             raise ValueError("JAKA Cartesian safety limits must be positive.")
         if self.servo_step_num < 1:
             raise ValueError("JakaRobotConfig.servo_step_num must be at least 1.")
+        if self.servo_filter_mode not in {"none", "joint_lpf", "joint_nlf", "cartesian_nlf"}:
+            raise ValueError(
+                "servo_filter_mode must be one of: none, joint_lpf, joint_nlf, cartesian_nlf."
+            )
         if not 1 <= self.servo_queue_warn_depth <= SERVO_QUEUE_MAX:
             raise ValueError(f"servo_queue_warn_depth must be in [1, {SERVO_QUEUE_MAX}].")
         if not 0 < self.servo_joint_max_velocity_rad_s <= math.pi:
@@ -284,6 +300,13 @@ class JakaRobotConfig(RobotConfig):
             (
                 "servo_eef_max_angular_acceleration_rad_s2",
                 self.servo_eef_max_angular_acceleration_rad_s2,
+            ),
+            ("servo_filter_joint_lpf_cutoff_hz", self.servo_filter_joint_lpf_cutoff_hz),
+            ("servo_filter_joint_max_jerk_rad_s3", self.servo_filter_joint_max_jerk_rad_s3),
+            ("servo_filter_eef_max_jerk_m_s3", self.servo_filter_eef_max_jerk_m_s3),
+            (
+                "servo_filter_eef_max_angular_jerk_rad_s3",
+                self.servo_filter_eef_max_angular_jerk_rad_s3,
             ),
             ("servo_shutdown_timeout_s", self.servo_shutdown_timeout_s),
         ):
@@ -494,6 +517,39 @@ class JakaRobot(Robot):
 
         if self.rc is not None:
             self._call("set_motion_planner", self.rc.set_motion_planner(PLANNER_S))
+            self._configure_servo_filter()
+
+    def _configure_servo_filter(self) -> None:
+        """Configure the SDK's Servo Move jitter filter before Servo is enabled."""
+
+        assert self.rc is not None
+        mode = self.config.servo_filter_mode
+        if mode == "none":
+            return
+
+        with self._sdk_lock:
+            if mode == "joint_lpf":
+                result = self.rc.servo_move_use_joint_LPF(self.config.servo_filter_joint_lpf_cutoff_hz)
+                self._call("servo_move_use_joint_LPF", result)
+            elif mode == "joint_nlf":
+                result = self.rc.servo_move_use_joint_NLF(
+                    self.config.servo_joint_max_velocity_rad_s,
+                    self.config.servo_joint_max_acceleration_rad_s2,
+                    self.config.servo_filter_joint_max_jerk_rad_s3,
+                )
+                self._call("servo_move_use_joint_NLF", result)
+            elif mode == "cartesian_nlf":
+                # JAKA's Cartesian filter takes linear values in mm-based SDK units;
+                # the LeRobot-facing config stores metres.
+                result = self.rc.servo_move_use_carte_NLF(
+                    self.config.servo_eef_max_velocity_m_s * 1000.0,
+                    self.config.servo_eef_max_acceleration_m_s2 * 1000.0,
+                    self.config.servo_filter_eef_max_jerk_m_s3 * 1000.0,
+                    self.config.servo_eef_max_angular_velocity_rad_s,
+                    self.config.servo_eef_max_angular_acceleration_rad_s2,
+                    self.config.servo_filter_eef_max_angular_jerk_rad_s3,
+                )
+                self._call("servo_move_use_carte_NLF", result)
 
     def disconnect(self) -> None:
         """Safely leave Servo Move, release owned state, and log out."""
@@ -510,7 +566,9 @@ class JakaRobot(Robot):
             if self._powered_by_driver and self.config.power_off_on_disconnect:
                 self._call("power_off", rc.power_off())
             if feedback_rc is not None and feedback_rc is not rc:
-                logout_feedback = getattr(feedback_rc, "logout", None) or getattr(feedback_rc, "log_out", None)
+                logout_feedback = getattr(feedback_rc, "logout", None) or getattr(
+                    feedback_rc, "log_out", None
+                )
                 if logout_feedback is not None:
                     self._call("feedback_logout", logout_feedback())
             logout = getattr(rc, "logout", None) or getattr(rc, "log_out", None)
@@ -807,7 +865,7 @@ class JakaRobot(Robot):
                 target_q,
                 self.config.max_eef_step_rad / angle,
             )
-            target[3:] = _quaternion_to_euler(target_q)
+            target[3:] = _quaternion_to_euler(target_q, reference_rpy=reference[3:])
         for index, key in enumerate(self._EEF_KEYS):
             if key in self.config.eef_pose_limits:
                 target[index] = np.clip(target[index], *self.config.eef_pose_limits[key])
@@ -1205,7 +1263,8 @@ class JakaRobot(Robot):
                 self._servo_angular_speed = 0.0
             else:
                 commanded[3:] = _quaternion_to_euler(
-                    _quaternion_slerp(start_q, target_q, angular_step / angle)
+                    _quaternion_slerp(start_q, target_q, angular_step / angle),
+                    reference_rpy=commanded[3:],
                 )
         else:
             self._servo_angular_speed = 0.0

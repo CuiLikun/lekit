@@ -59,6 +59,15 @@ class FakeRC:
     def set_motion_planner(self, value):
         return self._call("set_motion_planner", value)
 
+    def servo_move_use_joint_LPF(self, cutoff):  # noqa: N802
+        return self._call("servo_move_use_joint_LPF", cutoff)
+
+    def servo_move_use_joint_NLF(self, max_vr, max_ar, max_jr):  # noqa: N802
+        return self._call("servo_move_use_joint_NLF", max_vr, max_ar, max_jr)
+
+    def servo_move_use_carte_NLF(self, max_vp, max_ap, max_jp, max_vr, max_ar, max_jr):  # noqa: N802
+        return self._call("servo_move_use_carte_NLF", max_vp, max_ap, max_jp, max_vr, max_ar, max_jr)
+
     def servo_move_enable(self, value, _block=True):
         return self._call("servo_move_enable", value)
 
@@ -160,6 +169,24 @@ def test_cartesian_action_is_servo_bounded_and_converted_to_mm(monkeypatch):
 
         applied = arm.send_relative_action({"ee.x": 0.005})
         assert applied["ee.x"] == pytest.approx(0.105)
+    finally:
+        arm.disconnect()
+
+
+def test_cartesian_servo_filter_uses_sdk_units(monkeypatch):
+    rc = FakeRC()
+    monkeypatch.setattr(driver, "create_rc", lambda _ip: rc)
+    config = driver.JakaRobotConfig(
+        ip="10.0.0.2",
+        servo_filter_mode="cartesian_nlf",
+        servo_filter_eef_max_jerk_m_s3=1.5,
+        servo_filter_eef_max_angular_jerk_rad_s3=2.5,
+    )
+    arm = driver.JakaRobot(config)
+    arm.connect()
+    try:
+        calls = servo_calls(rc, "servo_move_use_carte_NLF")
+        assert calls == [("servo_move_use_carte_NLF", 50.0, 200.0, 1500.0, 0.5, 1.0, 2.5)]
     finally:
         arm.disconnect()
 

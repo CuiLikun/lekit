@@ -95,3 +95,50 @@ def test_build_device_isolates_feedback_and_defers_servo_start(monkeypatch):
         "separate_feedback_connection": True,
     }
     assert startup_calls == [True]
+
+
+def test_hardware_stop_callback_is_idempotent_and_orders_teardown():
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+    calls: list[str] = []
+
+    class FakeDevice:
+        def cleanup(self):
+            calls.append("device.cleanup")
+
+    class FakeRobot:
+        is_connected = True
+
+        def disconnect(self):
+            calls.append("robot.disconnect")
+
+    stop = record_module._make_hardware_stop_callback(FakeRobot(), FakeDevice())
+    stop()
+    stop()
+
+    assert calls == ["device.cleanup", "robot.disconnect"]
+
+
+def test_escape_keyboard_dispatch_invokes_stop_callback(monkeypatch):
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+    captured_dispatch = None
+
+    def fake_create_key_listener(dispatch, *, controls_help=""):
+        nonlocal captured_dispatch
+        captured_dispatch = dispatch
+        return "listener"
+
+    monkeypatch.setattr(
+        "lerobot.utils.keyboard_input.create_key_listener",
+        fake_create_key_listener,
+    )
+    stopped: list[bool] = []
+
+    listener, events = record_module.init_keyboard_listener(lambda: stopped.append(True))
+    assert listener == "listener"
+    assert captured_dispatch is not None
+
+    captured_dispatch("esc")
+
+    assert events["stop_recording"] is True
+    assert events["exit_early"] is True
+    assert stopped == [True]

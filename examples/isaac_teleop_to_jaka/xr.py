@@ -45,6 +45,7 @@ from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.types import RobotAction
 from lerobot.utils.import_utils import is_package_available
 from lerobot.utils.rotation import Rotation
+from robots.jaka_robot.pose_math import matrix_to_rpy
 
 from .clutch import Clutch
 
@@ -104,11 +105,13 @@ else:
     TeleopSession = None
     TeleopSessionConfig = None
 
-# Static rebase from the OpenXR controller anchor frame (X=Right, Y=Up, Z=Backward) into
-# the robot base frame (X=Forward, Y=Left, Z=Up). A proper rotation (det=+1).
+# Static rebase from the CloudXR controller anchor frame into the JAKA base frame used by
+# this setup. The X/Y signs are selected for the physical arm mounting: lateral hand motion
+# maps to lateral EE motion, and forward/backward hand motion maps to EE X. ``base_T_anchor``
+# remains configurable for a differently mounted arm.
 _DEFAULT_BASE_T_ANCHOR: list[list[float]] = [
-    [0.0, 0.0, -1.0, 0.0],
-    [-1.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [1.0, 0.0, 0.0, 0.0],
     [0.0, 1.0, 0.0, 0.0],
     [0.0, 0.0, 0.0, 1.0],
 ]
@@ -159,6 +162,9 @@ class XRControllerConfig(IsaacTeleopConfig):
     clutch_threshold: float = 0.5
     """Squeeze value above which the recorder's clutch engages (held-to-enable)."""
 
+    lock_pose: bool = False
+    """Keep the measured JAKA roll/pitch/yaw fixed while the clutch is engaged."""
+
     base_T_anchor: list[list[float]] = field(  # noqa: N815
         default_factory=lambda: [row.copy() for row in _DEFAULT_BASE_T_ANCHOR]
     )
@@ -167,6 +173,8 @@ class XRControllerConfig(IsaacTeleopConfig):
     def __post_init__(self):
         if self.hand_side not in ("left", "right"):
             raise ValueError(f"hand_side must be 'left' or 'right', got {self.hand_side!r}")
+        if not isinstance(self.lock_pose, bool):
+            raise ValueError("lock_pose must be a boolean")
 
 
 # ======================================================================================
@@ -392,6 +400,7 @@ class XRController(IsaacTeleopTeleoperator):
             # while commanding the gripper fully open, dropping whatever is grasped). On
             # failure the defaults stand untouched and the frame reports not-tracked.
             try:
+                grip_is_valid = bool(controller[ControllerInputIndex.GRIP_IS_VALID])
                 pos = np.asarray(controller[ControllerInputIndex.GRIP_POSITION], dtype=np.float32)
                 quat = np.asarray(controller[ControllerInputIndex.GRIP_ORIENTATION], dtype=np.float32)
                 squeeze_val = float(controller[ControllerInputIndex.SQUEEZE_VALUE])
@@ -399,8 +408,21 @@ class XRController(IsaacTeleopTeleoperator):
             except (IndexError, KeyError, TypeError, ValueError):
                 self._is_tracking = False
             else:
-                grip_pos, grip_quat = pos, quat
-                squeeze, trigger = squeeze_val, trigger_val
+                quat_norm = float(np.linalg.norm(quat))
+                if (
+                    not grip_is_valid
+                    or pos.shape != (3,)
+                    or quat.shape != (4,)
+                    or not np.all(np.isfinite(pos))
+                    or not np.all(np.isfinite(quat))
+                    or not np.isfinite(squeeze_val)
+                    or not np.isfinite(trigger_val)
+                    or quat_norm <= 1e-6
+                ):
+                    self._is_tracking = False
+                else:
+                    grip_pos, grip_quat = pos, quat / quat_norm
+                    squeeze, trigger = squeeze_val, trigger_val
 
         return {
             "grip_pos": grip_pos,
@@ -438,26 +460,11 @@ def _pose6_to_base_t_ee(pose: tuple[float, float, float, float, float, float]) -
     return out
 
 
-def _matrix_to_rpy(matrix: np.ndarray) -> tuple[float, float, float]:
-    """Decompose a 3x3 rotation matrix into XYZ-Euler ``(roll, pitch, yaw)`` in radians.
-
-    Pitch is clamped to the open interval (-pi/2, pi/2) so asin stays defined; near the
-    ±pi/2 boundary the formulas for roll/yaw become ill-conditioned — a small rotation
-    change can produce a large (roll, yaw) jump. The recorder relies on the controller
-    frame rate to keep successive frames close, but persistent RPY-targeting near
-    gimbal lock is a known weakness of the XYZ-Euler representation.
-    """
-    r00, r01 = matrix[0, 0], matrix[0, 1]
-    r11 = matrix[1, 1]
-    r20, r21, r22 = matrix[2, 0], matrix[2, 1], matrix[2, 2]
-    pitch = float(np.arcsin(max(-1.0, min(1.0, -r20))))
-    if abs(r20) < 1.0 - 1e-9:
-        roll = float(np.arctan2(r21, r22))
-        yaw = float(np.arctan2(matrix[1, 0], r00))
-    else:
-        roll = 0.0
-        yaw = float(np.arctan2(-r01, r11))
-    return roll, pitch, yaw
+def _matrix_to_rpy(
+    matrix: np.ndarray, *, reference_rpy: np.ndarray | None = None
+) -> tuple[float, float, float]:
+    """Decompose a matrix into a JAKA-continuous ``(roll, pitch, yaw)`` triple."""
+    return tuple(matrix_to_rpy(matrix, reference_rpy=reference_rpy))
 
 
 # ======================================================================================
@@ -555,6 +562,8 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
     clutch: Clutch | None = None
     prev_enabled = False
     last_pos: np.ndarray | None = None
+    last_rpy: np.ndarray | None = None
+    locked_rpy: np.ndarray | None = None
     telemetry: dict[str, object] = {}
 
     def startup() -> None:
@@ -576,7 +585,7 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
         print("Starting teleop loop. Squeeze and move the controller to teleoperate the robot...")
 
     def compute(robot_obs) -> dict | None:
-        nonlocal clutch, prev_enabled, last_pos
+        nonlocal clutch, prev_enabled, last_pos, last_rpy, locked_rpy
         if clutch is None:
             raise RuntimeError("compute() called before startup()")
 
@@ -607,11 +616,15 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
             measured_base_t_ee = _pose6_to_base_t_ee(measured_pose)
             clutch.engage(grip_pos, grip_quat, home_base_T_ee=measured_base_t_ee)
             last_pos = None  # drop the rate-limit reference so we don't fight the new home
+            last_rpy = np.asarray(measured_pose[3:], dtype=float)
+            locked_rpy = last_rpy.copy() if teleop_config.lock_pose else None
         prev_enabled = enabled
 
         # Hold the arm at the measured pose while the clutch is disengaged — the
         # recorder's HoldLatch freezes the value on the first idle frame.
         if not enabled:
+            last_rpy = None
+            locked_rpy = None
             return None
 
         pos, quat = clutch.rebase(grip_pos, grip_quat)
@@ -624,7 +637,15 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
                 pos = last_pos + delta * (MAX_EE_STEP_M / n)
         last_pos = pos
 
-        roll, pitch, yaw = _matrix_to_rpy(Rotation.from_quat(quat).as_matrix())
+        if last_rpy is None:
+            raise RuntimeError("XR orientation state was not initialized on clutch engage")
+        if teleop_config.lock_pose:
+            if locked_rpy is None:
+                raise RuntimeError("XR locked orientation was not initialized on clutch engage")
+            roll, pitch, yaw = (float(value) for value in locked_rpy)
+        else:
+            roll, pitch, yaw = _matrix_to_rpy(Rotation.from_quat(quat).as_matrix(), reference_rpy=last_rpy)
+            last_rpy = np.array([roll, pitch, yaw])
         return {
             "ee.x": float(pos[0]),
             "ee.y": float(pos[1]),

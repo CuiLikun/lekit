@@ -48,6 +48,10 @@ Hold the controller squeeze to engage motion. Releasing it holds the measured
 TCP pose. The trigger produces a normalized `gripper.pos` command where `0`
 means closed and `1` means open.
 
+To control translation without rotating the tool, pass `--teleop.lock_pose=true`.
+The current measured roll/pitch/yaw is captured when the clutch engages and held
+while it remains engaged. `false` (the default) follows the XR controller's orientation.
+
 The driver always records `gripper.pos`, but analog input and output are
 disabled by default because JAKA controllers and grippers can use different
 channels and electrical ranges. After verifying the wiring, configure feedback

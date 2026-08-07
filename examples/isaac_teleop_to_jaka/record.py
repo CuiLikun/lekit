@@ -22,21 +22,25 @@ the JAKA SDK ``servo_p`` Cartesian Servo Move. No host-side inverse kinematics.
 
 Usage:
 
-    python -m examples.isaac_teleop_to_jaka.record \
-        --robot.type=jaka_robot \
-        --robot.ip=192.168.1.31 \
-        --robot.id=jaka_arm \
-        --teleop.type=xr_controller \
-        --robot.cameras="{ hand: {type: intelrealsense, serial_number_or_name: '342522070741', width: 640, height: 480, fps: 30}}" \
-        --dataset.repo_id=<hf_user>/<dataset_name> \
-        --dataset.single_task="Pick up the object" \
-        --dataset.fps=30 \
-        --dataset.num_episodes=3 \
-        --dataset.episode_time_s=20 \
-        --dataset.reset_time_s=5
+python -m examples.isaac_teleop_to_jaka.record \
+    --robot.type=jaka_robot \
+    --robot.ip=192.168.1.31 \
+    --robot.id=jaka_arm \
+    --robot.cameras="{ hand: {type: intelrealsense, serial_number_or_name: '342522070741', width: 640, height: 480, fps: 30}}" \
+    --robot.servo_step_num=4 \
+    --teleop.type=xr_controller \
+    --teleop.lock_pose="[0.0, 0.0, 0.0]" \
+    --dataset.repo_id="sorel/pick-cube" \
+    --dataset.single_task="Pick up the object" \
+    --dataset.fps=30 \
+    --dataset.num_episodes=3 \
+    --dataset.episode_time_s=9999 \
+    --dataset.reset_time_s=5 \
+    --dataset.streaming_encoding=True \
+    --dataset.push_to_hub=False
 
 Keyboard shortcuts: Right/n ends and saves the current episode, Left/r discards and
-re-records it, and Esc/q stops after the current episode. All frames, including
+re-records it, and Esc/q stops immediately. All frames, including
 clutch-disengaged hold frames, are recorded.
 """
 
@@ -48,6 +52,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from pprint import pformat
+from threading import Lock
 from typing import Any
 
 from rich.live import Live
@@ -103,20 +108,21 @@ class HoldLatch:
 # ── Keyboard control ────────────────────────────────────────────────────────
 
 
-def init_keyboard_listener():
+def init_keyboard_listener(stop_callback: Callable[[], None] | None = None):
     """Wire Right/Left/Esc shortcuts to recording control events.
 
     When stdin is a TTY, prefer the stdlib :class:`TerminalKeyListener` (works over SSH
     and emits canonical key names); the dispatcher maps ``n``/``r``/``q`` to the same
     events as the arrow keys / ``Esc`` so a laggy terminal splitting escape sequences
-    still gets through. Otherwise fall back to the upstream pynput-based listener.
+    still gets through. For non-interactive stdin, use the upstream listener when no
+    callback is needed, or the shared listener factory when immediate teardown is needed.
     """
-    if not (sys.stdin is not None and sys.stdin.isatty()):
+    from lerobot.utils.keyboard_input import apply_recording_control
+
+    if not (sys.stdin is not None and sys.stdin.isatty()) and stop_callback is None:
         from lerobot.utils.keyboard_input import init_keyboard_listener as _upstream
 
         return _upstream()
-
-    from lerobot.utils.keyboard_input import TerminalKeyListener, apply_recording_control
 
     events = {"exit_early": False, "rerecord_episode": False, "stop_recording": False}
 
@@ -128,14 +134,51 @@ def init_keyboard_listener():
             apply_recording_control("left", events)
         elif key in ("esc", "q"):
             apply_recording_control("esc", events)
+            if stop_callback is not None:
+                stop_callback()
 
-    listener = TerminalKeyListener(on_key)
-    listener.start()
-    logging.info(
-        "Keyboard control via terminal — keep this terminal focused: "
-        "Right/n = end episode early, Left/r = re-record, Esc/q = stop."
+    if sys.stdin is not None and sys.stdin.isatty():
+        from lerobot.utils.keyboard_input import TerminalKeyListener
+
+        listener = TerminalKeyListener(on_key)
+        listener.start()
+        logging.info(
+            "Keyboard control via terminal — keep this terminal focused: "
+            "Right/n = end episode early, Left/r = re-record, Esc/q = stop."
+        )
+        return listener, events
+
+    from lerobot.utils.keyboard_input import create_key_listener
+
+    listener = create_key_listener(
+        on_key,
+        controls_help="Right/Left/Esc, or n=next, r=re-record, q=quit",
     )
     return listener, events
+
+
+def _make_hardware_stop_callback(robot: JakaRobot, device: "Device") -> Callable[[], None]:
+    """Return an idempotent best-effort teardown callback for keyboard handlers."""
+
+    stopped = False
+    lock = Lock()
+
+    def stop_hardware_now() -> None:
+        nonlocal stopped
+        with lock:
+            if stopped:
+                return
+            stopped = True
+
+            # Stop Servo/XR before disconnecting the robot. Each operation is guarded so
+            # a failure in one teardown step cannot leave the other connection open.
+            with suppress(Exception):
+                device.cleanup()
+            with suppress(Exception):
+                if robot.is_connected:
+                    robot.disconnect()
+
+    return stop_hardware_now
 
 
 # ── Device bundle ───────────────────────────────────────────────────────────
@@ -309,16 +352,37 @@ def _record_loop(
             events["exit_early"] = False
             break
 
-        obs = robot.get_observation()
+        try:
+            obs = robot.get_observation()
+        except Exception:
+            if events["stop_recording"]:
+                break
+            raise
+
+        if events["stop_recording"]:
+            break
 
         if record_frames:
             obs_frame = build_dataset_frame(dataset.features, obs, prefix=OBS_STR)
 
         # XR clutch disengaged: hold the TCP pose latched on the idle edge.
-        raw = device.compute(obs)
+        try:
+            raw = device.compute(obs)
+        except Exception:
+            if events["stop_recording"]:
+                break
+            raise
         action = hold.resolve(raw, obs)
 
-        sent_action = robot.send_action(action)
+        if events["stop_recording"]:
+            break
+
+        try:
+            sent_action = robot.send_action(action)
+        except Exception:
+            if events["stop_recording"]:
+                break
+            raise
 
         if record_frames:
             action_frame = build_dataset_frame(dataset.features, sent_action, prefix=ACTION)
@@ -342,6 +406,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     logging.info(pformat(asdict(cfg)))
 
     robot, device = build_device(cfg)
+    stop_hardware_now = _make_hardware_stop_callback(robot, device)
 
     dataset_features = build_dataset_features(robot, use_videos=cfg.dataset.video)
 
@@ -384,7 +449,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
             )
 
-        listener, events = init_keyboard_listener()
+        listener, events = init_keyboard_listener(stop_callback=stop_hardware_now)
 
         # The recorder commands Cartesian Servo Move. JAKA still returns its
         # full fixed action schema so joint feedback is recorded in the action
@@ -422,6 +487,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     control_time_s=cfg.dataset.episode_time_s,
                 )
 
+                # ESC/q tears down the arm from the keyboard thread. Do not reset the
+                # scene or save a partial episode after that immediate stop.
+                if events["stop_recording"]:
+                    break
+
                 # Reset window: give the operator time to reposition the scene.
                 # Skipped for the last episode (or if stop_recording was set).
                 if not events["stop_recording"] and (
@@ -447,15 +517,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     finally:
         logging.info("Stop recording")
 
-        # Hardware teardown FIRST, each step guarded: the arm must be freed
-        # promptly (not after a potentially long finalize/encode), a cleanup
-        # failure must not skip the follower disconnect, and neither must
-        # prevent the dataset from being finalized below.
-        with suppress(Exception):
-            device.cleanup()
-        with suppress(Exception):
-            if robot.is_connected:
-                robot.disconnect()
+        # The keyboard callback normally performs this before the loop unwinds. The
+        # same callback here covers normal completion, Ctrl-C, and startup races.
+        stop_hardware_now()
 
         # Restore the terminal before the (potentially long) finalize/encode.
         if listener is not None:
