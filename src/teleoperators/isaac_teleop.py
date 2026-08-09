@@ -48,7 +48,6 @@ from isaacteleop.retargeting_engine.tensor_types import TransformMatrix
 from isaacteleop.retargeting_engine.tensor_types.indices import ControllerInputIndex
 from isaacteleop.teleop_session_manager import TeleopSession, TeleopSessionConfig
 
-from examples.isaac_teleop_to_so101.isaac_teleop.teleop_xr_controller import _BASE_T_ANCHOR_INPUT
 from lerobot.teleoperators.config import TeleoperatorConfig
 from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.types import RobotAction
@@ -74,8 +73,6 @@ class IsaacTeleop(Teleoperator):
         self.cloudxr_launcher: CloudXRLauncher | None = None
         self.cloudxr_launcher: dict[str, Any] | None = None
 
-    # ------------------------------------------------------------------ schema
-
     @property
     def action_features(self) -> dict:
         return {
@@ -89,8 +86,6 @@ class IsaacTeleop(Teleoperator):
     def feedback_features(self) -> dict:
         return {}
 
-    # ------------------------------------------------------------ lifecycle
-
     @property
     def is_connected(self) -> bool:
         return self.session is not None
@@ -99,14 +94,11 @@ class IsaacTeleop(Teleoperator):
     def is_calibrated(self) -> bool:
         return True  # Tracking devices self-calibrate.
 
-    def calibrate(self) -> None:
-        pass
+    def calibrate(self) -> None: ...
 
-    def configure(self) -> None:
-        pass
+    def configure(self) -> None: ...
 
-    def send_feedback(self, feedback: dict[str, Any]) -> None:
-        pass  # Haptic feedback not yet implemented.
+    def send_feedback(self, feedback: dict[str, Any]) -> None: ...
 
     def connect(self, calibrate: bool = True) -> None:
         if self.session is not None:
@@ -119,15 +111,14 @@ class IsaacTeleop(Teleoperator):
         try:
             # build pipeline
             controllers = ControllersSource(name="controllers")
-            xform = ValueInput(_BASE_T_ANCHOR_INPUT, TransformMatrix())
-            ctrl = controllers.transformed(xform.output("value")).output(
-                f"controller_{self.config.hand_side}"
-            )
+            xform = ValueInput("base_T_anchor", TransformMatrix())
+            transformed = controllers.transformed(xform.output("value"))
+            ctrl = transformed.output("controller_right")
             pipeline = OutputCombiner({"controller": ctrl})
             session_config = TeleopSessionConfig(app_name=self.__class__.__name__, pipeline=pipeline)
             self.session = TeleopSession(session_config)
             self.session.__enter__()
-            self.cloudxr_launcher = self._buildcloudxr_launcher()
+            # self.cloudxr_launcher = self._buildcloudxr_launcher()
         except Exception:
             self.session = None
             self.cloudxr_launcher = None
@@ -162,16 +153,8 @@ class IsaacTeleop(Teleoperator):
             logger.info("LEROBOT_CLOUDXR_SKIP_AUTOLAUNCH=1 set; skipping CloudXR auto-launch.")
             return
 
-        if not self.config.auto_launch_cloudxr:
-            logger.info("config.auto_launch_cloudxr is False; skipping CloudXR auto-launch.")
-            return
-
         logger.info("Launching CloudXR runtime (first run may prompt for EULA and take ~30s)...")
-        self.cloudxr_launcher = CloudXRLauncher(
-            install_dir=str(Path.home() / ".cloudxr"),
-            env_config=self.config.cloudxr_env_file,
-            accept_eula=False,
-        )
+        self.cloudxr_launcher = CloudXRLauncher(install_dir=str(Path.home() / ".cloudxr"), accept_eula=False)
 
     def _stop_cloudxr_runtime(self) -> None:
         if self.cloudxr_launcher is None:
@@ -190,7 +173,7 @@ class IsaacTeleop(Teleoperator):
         """Materialize the constant ``base_T_anchor`` external input (once, in connect)."""
         tg = TensorGroup(TransformMatrix())
         tg[0] = np.asarray(self.config.base_T_anchor, dtype=np.float32)
-        return {_BASE_T_ANCHOR_INPUT: {"value": tg}}
+        return {"base_T_anchor": {"value": tg}}
 
     def _step(self) -> Any:
         if self.session is None:
@@ -264,3 +247,12 @@ class IsaacTeleop(Teleoperator):
 
 
 __all__ = ["IsaacTeleop", "IsaacTeleopConfig"]
+
+
+if __name__ == "__main__":
+    config = IsaacTeleopConfig()
+    teleop = IsaacTeleop(config)
+    teleop.connect()
+    while True:
+        action = teleop.get_action()
+        print(action)
