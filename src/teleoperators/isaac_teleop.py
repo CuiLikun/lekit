@@ -56,6 +56,8 @@ from isaacteleop.retargeting_engine.tensor_types import TransformMatrix
 from isaacteleop.retargeting_engine.tensor_types.indices import ControllerInputIndex
 from isaacteleop.teleop_session_manager import TeleopSession, TeleopSessionConfig
 
+from scipy.spatial.transform import Rotation
+
 from lerobot.teleoperators.config import TeleoperatorConfig
 from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.types import RobotAction
@@ -144,12 +146,27 @@ class IsaacTeleop(Teleoperator):
                 "shape": (4,),
                 "names": {"qx": 0, "qy": 1, "qz": 2, "qw": 3},
             },
+            "grip_ori": {
+                "dtype": "float32",
+                "shape": (3,),
+                "names": {"roll": 0, "pitch": 1, "yaw": 2},
+            },
             "squeeze": {
                 "dtype": "float32",
                 "shape": (),
                 "names": None,
             },
             "trigger": {
+                "dtype": "float32",
+                "shape": (),
+                "names": None,
+            },
+            "a_button": {
+                "dtype": "float32",
+                "shape": (),
+                "names": None,
+            },
+            "b_button": {
                 "dtype": "float32",
                 "shape": (),
                 "names": None,
@@ -342,27 +359,37 @@ class IsaacTeleop(Teleoperator):
     # ----------------------------------------------------------------- action
 
     def get_action(self) -> RobotAction:
-        """Step the session and return the raw base-frame grip pose + squeeze/trigger.
+        """Step the session and return the raw base-frame grip pose + buttons.
 
-        Returns identity quat / zero position / zero squeeze+trigger when the
+        Returns identity quat / zero position / zero buttons when the
         controller is not tracked or the read fails — a partially-populated
         frame must never mix live values with safe defaults.
+
+        Returns:
+            ``{"grip_pos": (3,), "grip_quat": (4,), "grip_ori": (3,) roll/pitch/yaw,
+            "squeeze": float, "trigger": float, "a_button": float, "b_button": float}``
         """
         result = self._step()
         controller = result["controller"]
 
         grip_pos = np.zeros(3, dtype=np.float32)
         grip_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        grip_ori = np.zeros(3, dtype=np.float32)
         squeeze = 0.0
         trigger = 0.0
+        a_button = 0.0
+        b_button = 0.0
 
         self._is_tracking = not getattr(controller, "is_none", False)
         if not self._is_tracking:
             return {
                 "grip_pos": grip_pos,
                 "grip_quat": grip_quat,
+                "grip_ori": grip_ori,
                 "squeeze": squeeze,
                 "trigger": trigger,
+                "a_button": a_button,
+                "b_button": b_button,
             }
 
         try:
@@ -371,6 +398,8 @@ class IsaacTeleop(Teleoperator):
             quat = np.asarray(controller[ControllerInputIndex.GRIP_ORIENTATION], dtype=np.float32)
             squeeze_val = float(controller[ControllerInputIndex.SQUEEZE_VALUE])
             trigger_val = float(controller[ControllerInputIndex.TRIGGER_VALUE])
+            a_val = float(controller[ControllerInputIndex.PRIMARY_CLICK])
+            b_val = float(controller[ControllerInputIndex.SECONDARY_CLICK])
         except (IndexError, KeyError, TypeError, ValueError):
             self._is_tracking = False
         else:
@@ -383,18 +412,28 @@ class IsaacTeleop(Teleoperator):
                 and np.all(np.isfinite(quat))
                 and np.isfinite(squeeze_val)
                 and np.isfinite(trigger_val)
-                and quat_norm > 1e-6
             ):
                 grip_pos = pos
-                grip_quat = quat / quat_norm
+                grip_quat = quat / quat_norm if quat_norm > 1e-6 else grip_quat
                 squeeze = squeeze_val
                 trigger = trigger_val
+            # RPY from quaternion (qx,qy,qz,qw → Rotation → XYZ intrinsic roll,pitch,yaw).
+            if quat_norm > 1e-6:
+                rpy = Rotation.from_quat(quat / quat_norm).as_euler("xyz")
+                grip_ori = np.asarray(rpy, dtype=np.float32)
+            if np.isfinite(a_val):
+                a_button = a_val
+            if np.isfinite(b_val):
+                b_button = b_val
 
         return {
             "grip_pos": grip_pos,
+            "grip_ori": grip_ori,
             "grip_quat": grip_quat,
             "squeeze": squeeze,
             "trigger": trigger,
+            "a_button": a_button,
+            "b_button": b_button,
         }
 
 
