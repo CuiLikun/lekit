@@ -55,7 +55,6 @@ from isaacteleop.retargeting_engine.interface import (
 from isaacteleop.retargeting_engine.tensor_types import TransformMatrix
 from isaacteleop.retargeting_engine.tensor_types.indices import ControllerInputIndex
 from isaacteleop.teleop_session_manager import TeleopSession, TeleopSessionConfig
-
 from scipy.spatial.transform import Rotation
 
 from lerobot.teleoperators.config import TeleoperatorConfig
@@ -123,6 +122,12 @@ class IsaacTeleop(Teleoperator):
     # ``TeleopSession.step(external_inputs=...)`` each frame.
     _BASE_T_ANCHOR_INPUT = "base_T_anchor"
 
+    # Squeeze hysteresis for the clutch state machine. ``squeeze`` must climb
+    # above the engage threshold to latch an origin, then drop below the
+    # release threshold to free it — prevents chatter at the boundary.
+    _CLUTCH_ENGAGE_THRESHOLD = 0.5
+    _CLUTCH_RELEASE_THRESHOLD = 0.3
+
     def __init__(self, config: IsaacTeleopConfig):
         super().__init__(config)
         self.config: IsaacTeleopConfig = config
@@ -130,6 +135,21 @@ class IsaacTeleop(Teleoperator):
         self._cloudxr_launcher: CloudXRLauncher | None = None
         self._external_inputs: dict[str, Any] | None = None
         self._is_tracking = False
+
+        # Clutch (squeeze-engaged relative-motion) state. ``_clutch_origin_*``
+        # is latched on the rising edge of squeeze. ``_clutch_home_*`` is set
+        # by the owning loop via ``set_home``; until it is set, the rebase is
+        # a no-op and the raw pose is returned. ``_last_rebased_*`` is the
+        # last valid rebased frame; frozen while disengaged or untracked so
+        # the EE target does not creep.
+        self._clutch_engaged: bool = False
+        self._clutch_origin_pos: np.ndarray | None = None
+        self._clutch_origin_quat: np.ndarray | None = None  # unit (xyzw)
+        self._clutch_home_pos: np.ndarray | None = None
+        self._clutch_home_quat: np.ndarray | None = None  # unit (xyzw)
+        self._last_rebased_pos: np.ndarray | None = None
+        self._last_rebased_quat: np.ndarray | None = None
+        self._last_rebased_ori: np.ndarray | None = None
 
     # ---------------------------------------------------------------- features
 
@@ -201,6 +221,44 @@ class IsaacTeleop(Teleoperator):
     def send_feedback(self, _feedback: dict[str, Any]) -> None:
         pass  # Haptic feedback not yet implemented.
 
+    def set_home(self, pose: np.ndarray | tuple[np.ndarray, np.ndarray] | None) -> None:
+        """Latch the EE home pose used as the rebase origin when squeeze is engaged.
+
+        While engaged (and after a ``set_home`` call), ``get_action`` reports
+        the absolute EE target ``home + (grip - origin)`` for position and
+        ``(grip * origin⁻¹) * home`` for orientation. Until ``set_home`` is
+        called, the rebase is a no-op and the raw pose is returned.
+
+        The home is cleared on :meth:`disconnect`; call again after reconnect.
+
+        Args:
+            pose: Either a 4x4 ``base_T_ee`` transform, a ``(pos (3,), quat
+                (4,))`` tuple in xyzw order, or ``None`` to clear.
+        """
+        if pose is None:
+            self._clutch_home_pos = None
+            self._clutch_home_quat = None
+            logger.debug("IsaacTeleop clutch home cleared")
+            return
+        if isinstance(pose, tuple):
+            pos, quat = pose
+            pos = np.asarray(pos, dtype=np.float32).reshape(3)
+            quat = np.asarray(quat, dtype=np.float32).reshape(4)
+        else:
+            m = np.asarray(pose, dtype=np.float32)
+            if m.shape != (4, 4):
+                raise ValueError(f"set_home: expected 4x4 matrix, (pos, quat), or None; got shape {m.shape}")
+            pos = m[:3, 3]
+            quat = Rotation.from_matrix(m[:3, :3]).as_quat()
+        qn = float(np.linalg.norm(quat))
+        if qn < 1e-6:
+            raise ValueError("set_home: zero-norm quaternion")
+        self._clutch_home_pos = pos.astype(np.float32).copy()
+        self._clutch_home_quat = (quat / qn).astype(np.float32)
+        logger.debug(
+            "IsaacTeleop clutch home set: pos=%s quat=%s", self._clutch_home_pos, self._clutch_home_quat
+        )
+
     def connect(self, calibrate: bool = True) -> None:
         """Launch CloudXR (unless opted out), build the pipeline, and open the session.
 
@@ -241,6 +299,17 @@ class IsaacTeleop(Teleoperator):
                 session.__exit__(None, None, None)
                 logger.info("Isaac Teleop session ended")
         finally:
+            # Clutch state is per-session; clear so a fresh connect() does
+            # not inherit a stale origin or frozen pose. Home is also cleared
+            # — the owning loop should re-set it after reconnect.
+            self._clutch_engaged = False
+            self._clutch_origin_pos = None
+            self._clutch_origin_quat = None
+            self._clutch_home_pos = None
+            self._clutch_home_quat = None
+            self._last_rebased_pos = None
+            self._last_rebased_quat = None
+            self._last_rebased_ori = None
             self._stop_cloudxr_runtime()
 
     # -------------------------------------------------------- CloudXR runtime
@@ -359,11 +428,16 @@ class IsaacTeleop(Teleoperator):
     # ----------------------------------------------------------------- action
 
     def get_action(self) -> RobotAction:
-        """Step the session and return the raw base-frame grip pose + buttons.
+        """Step the session and return the squeeze-clutched base-frame EE target.
 
-        Returns identity quat / zero position / zero buttons when the
-        controller is not tracked or the read fails — a partially-populated
-        frame must never mix live values with safe defaults.
+        On the rising edge of ``squeeze`` (above ``_CLUTCH_ENGAGE_THRESHOLD``),
+        the controller pose is latched as the origin. While engaged (and after
+        a :meth:`set_home` call), ``grip_pos`` / ``grip_quat`` / ``grip_ori``
+        report the absolute EE target ``home + (raw - origin)``. On the
+        falling edge (below ``_CLUTCH_RELEASE_THRESHOLD``) and during
+        untracked / invalid frames, the last valid rebased pose is frozen so
+        the EE does not creep; ``squeeze`` / ``trigger`` / buttons are gated
+        by frame validity.
 
         Returns:
             ``{"grip_pos": (3,), "grip_quat": (4,), "grip_ori": (3,) roll/pitch/yaw,
@@ -372,78 +446,118 @@ class IsaacTeleop(Teleoperator):
         result = self._step()
         controller = result["controller"]
 
-        grip_pos = np.zeros(3, dtype=np.float32)
-        grip_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
-        grip_ori = np.zeros(3, dtype=np.float32)
-        squeeze = 0.0
-        trigger = 0.0
-        a_button = 0.0
-        b_button = 0.0
+        pos: np.ndarray | None = None
+        quat: np.ndarray | None = None
+        squeeze_val = 0.0
+        trigger_val = 0.0
+        a_val = 0.0
+        b_val = 0.0
+        grip_is_valid = False
 
-        self._is_tracking = not getattr(controller, "is_none", False)
-        if not self._is_tracking:
-            return {
-                "grip_pos": grip_pos,
-                "grip_quat": grip_quat,
-                "grip_ori": grip_ori,
-                "squeeze": squeeze,
-                "trigger": trigger,
-                "a_button": a_button,
-                "b_button": b_button,
-            }
+        is_tracking = not getattr(controller, "is_none", False)
+        if is_tracking:
+            try:
+                grip_is_valid = bool(controller[ControllerInputIndex.GRIP_IS_VALID])
+                pos = np.asarray(controller[ControllerInputIndex.GRIP_POSITION], dtype=np.float32)
+                quat = np.asarray(controller[ControllerInputIndex.GRIP_ORIENTATION], dtype=np.float32)
+                squeeze_val = float(controller[ControllerInputIndex.SQUEEZE_VALUE])
+                trigger_val = float(controller[ControllerInputIndex.TRIGGER_VALUE])
+                a_val = float(controller[ControllerInputIndex.PRIMARY_CLICK])
+                b_val = float(controller[ControllerInputIndex.SECONDARY_CLICK])
+            except (IndexError, KeyError, TypeError, ValueError):
+                pos = None
 
-        try:
-            grip_is_valid = bool(controller[ControllerInputIndex.GRIP_IS_VALID])
-            pos = np.asarray(controller[ControllerInputIndex.GRIP_POSITION], dtype=np.float32)
-            quat = np.asarray(controller[ControllerInputIndex.GRIP_ORIENTATION], dtype=np.float32)
-            squeeze_val = float(controller[ControllerInputIndex.SQUEEZE_VALUE])
-            trigger_val = float(controller[ControllerInputIndex.TRIGGER_VALUE])
-            a_val = float(controller[ControllerInputIndex.PRIMARY_CLICK])
-            b_val = float(controller[ControllerInputIndex.SECONDARY_CLICK])
-        except (IndexError, KeyError, TypeError, ValueError):
-            self._is_tracking = False
-        else:
+        # Frame validity gates both the clutch state machine and the live
+        # buttons. A briefly-occluded frame must not advance the state machine
+        # (would trigger spurious engage/release) and must not leak a partial
+        # read into the output dict.
+        frame_ok = (
+            pos is not None
+            and quat is not None
+            and pos.shape == (3,)
+            and quat.shape == (4,)
+            and grip_is_valid
+            and np.all(np.isfinite(pos))
+            and np.all(np.isfinite(quat))
+            and np.isfinite(squeeze_val)
+            and np.isfinite(trigger_val)
+        )
+        self._is_tracking = frame_ok
+
+        quat_unit: np.ndarray | None = None
+        if frame_ok:
             quat_norm = float(np.linalg.norm(quat))
-            if (
-                grip_is_valid
-                and pos.shape == (3,)
-                and quat.shape == (4,)
-                and np.all(np.isfinite(pos))
-                and np.all(np.isfinite(quat))
-                and np.isfinite(squeeze_val)
-                and np.isfinite(trigger_val)
-            ):
-                grip_pos = pos
-                grip_quat = quat / quat_norm if quat_norm > 1e-6 else grip_quat
-                squeeze = squeeze_val
-                trigger = trigger_val
-            # RPY from quaternion (qx,qy,qz,qw → Rotation → XYZ intrinsic roll,pitch,yaw).
             if quat_norm > 1e-6:
-                rpy = Rotation.from_quat(quat / quat_norm).as_euler("xyz")
-                grip_ori = np.asarray(rpy, dtype=np.float32)
-            if np.isfinite(a_val):
-                a_button = a_val
-            if np.isfinite(b_val):
-                b_button = b_val
+                quat_unit = (quat / quat_norm).astype(np.float32)
+            else:
+                # Degenerate quaternion — treat as an invalid frame.
+                frame_ok = False
+
+        if frame_ok:
+            assert quat_unit is not None
+            # Hysteresis: rising edge above engage threshold latches origin;
+            # falling edge below release threshold frees it. Re-engage
+            # overwrites the origin with the new raw pose, so the rebase
+            # resets to ``home`` at every engage — i.e. the EE jumps to home
+            # when the user re-clamps. This is the standard clutch semantic
+            # and gives the user explicit re-centering control.
+            if not self._clutch_engaged and squeeze_val >= self._CLUTCH_ENGAGE_THRESHOLD:
+                self._clutch_engaged = True
+                self._clutch_origin_pos = pos.copy()
+                self._clutch_origin_quat = quat_unit
+            elif self._clutch_engaged and squeeze_val < self._CLUTCH_RELEASE_THRESHOLD:
+                self._clutch_engaged = False
+
+            if self._clutch_engaged and self._clutch_home_pos is not None:
+                # Position: ``home + (raw - origin)`` is the EE target the
+                # robot should servo to this frame. It equals ``home`` at the
+                # engage instant (raw == origin) and tracks the controller
+                # translation for the rest of the press.
+                rebased_pos = self._clutch_home_pos + (pos - self._clutch_origin_pos)
+                # Orientation: controller moved by ``raw * origin⁻¹`` from
+                # the origin; apply the same rotation to ``home`` so the EE
+                # orientation tracks the controller pose.
+                ctrl_rot = Rotation.from_quat(quat_unit)
+                origin_rot = Rotation.from_quat(self._clutch_origin_quat)
+                home_rot = Rotation.from_quat(self._clutch_home_quat)
+                rebased_rot = (ctrl_rot * origin_rot.inv()) * home_rot
+                rebased_quat = rebased_rot.as_quat().astype(np.float32)
+                rebased_ori = rebased_rot.as_euler("xyz").astype(np.float32)
+                self._last_rebased_pos = rebased_pos.astype(np.float32)
+                self._last_rebased_quat = rebased_quat
+                self._last_rebased_ori = rebased_ori
+
+        # Priority: live rebased (engaged + home + frame) > frozen
+        # last_rebased (release / untracked) > live raw (no engage history
+        # yet, or engaged but home never set) > safe defaults (untracked,
+        # no history). ``_last_rebased_*`` is only updated inside the
+        # engaged-and-home branch above, so any fall-through to the frozen
+        # case is a genuine freeze — the EE does not drift back to the
+        # controller when the user releases squeeze or the frame is lost.
+        if self._last_rebased_pos is not None:
+            grip_pos = self._last_rebased_pos
+            grip_quat = self._last_rebased_quat
+            grip_ori = self._last_rebased_ori
+        elif frame_ok and quat_unit is not None:
+            # No engage history yet (or engaged but no home): surface the
+            # raw controller pose so the consumer can still see input.
+            grip_pos = pos
+            grip_quat = quat_unit
+            grip_ori = Rotation.from_quat(quat_unit).as_euler("xyz").astype(np.float32)
+        else:
+            grip_pos = np.zeros(3, dtype=np.float32)
+            grip_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+            grip_ori = np.zeros(3, dtype=np.float32)
 
         return {
             "grip_pos": grip_pos,
             "grip_ori": grip_ori,
             "grip_quat": grip_quat,
-            "squeeze": squeeze,
-            "trigger": trigger,
-            "a_button": a_button,
-            "b_button": b_button,
+            "squeeze": squeeze_val if frame_ok else 0.0,
+            "trigger": trigger_val if frame_ok else 0.0,
+            "a_button": a_val if frame_ok and np.isfinite(a_val) else 0.0,
+            "b_button": b_val if frame_ok and np.isfinite(b_val) else 0.0,
         }
 
 
 __all__ = ["IsaacTeleop", "IsaacTeleopConfig"]
-
-
-if __name__ == "__main__":
-    config = IsaacTeleopConfig()
-    teleop = IsaacTeleop(config)
-    teleop.connect()
-    while True:
-        action = teleop.get_action()
-        print(action)
