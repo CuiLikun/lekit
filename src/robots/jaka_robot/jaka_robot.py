@@ -309,9 +309,7 @@ class JakaRobotConfig(RobotConfig):
             if len(self.reset_joints) != 6:
                 raise ValueError("reset_joints must contain exactly six joint angles in radians.")
             if any(
-                not isinstance(value, (int, float))
-                or isinstance(value, bool)
-                or not np.isfinite(value)
+                not isinstance(value, (int, float)) or isinstance(value, bool) or not np.isfinite(value)
                 for value in self.reset_joints
             ):
                 raise ValueError("reset_joints must contain six finite joint angles in radians.")
@@ -1026,7 +1024,6 @@ class JakaRobot(Robot):
             self._call("disable_robot", self.rc.disable_robot())
         self._enabled_by_driver = False
 
-    @check_if_not_connected
     def get_controller_state(self) -> dict[str, bool]:
         """Return controller-reported power and enable state."""
 
