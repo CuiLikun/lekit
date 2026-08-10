@@ -42,6 +42,72 @@ def test_hold_latch_captures_measured_pose_on_engage_release(monkeypatch):
     assert latch.resolve(None, lagging_feedback) == lagging_feedback
 
 
+def test_arm_servo_follows_clutch_lifecycle_and_preserves_hold_action(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+    calls: list[tuple] = []
+    schema_robot = JakaRobot(JakaRobotConfig(ip="127.0.0.1"))
+    robot_action_features = schema_robot.action_features
+    dataset_features = build_dataset_features(schema_robot, use_videos=False)
+
+    class FakeRobot:
+        servo_active = False
+        action_features = robot_action_features
+
+        def is_in_servo(self):
+            return self.servo_active
+
+        def servo_enable(self, enabled, *, representation="joints"):
+            calls.append(("servo_enable", enabled, representation))
+            self.servo_active = enabled
+
+        def send_action(self, action):
+            calls.append(("send_action", dict(action)))
+            return dict(action)
+
+    robot = FakeRobot()
+    action = {
+        "ee.x": 0.1,
+        "ee.y": 0.2,
+        "ee.z": 0.3,
+        "ee.roll": 0.0,
+        "ee.pitch": 0.0,
+        "ee.yaw": 0.0,
+        "gripper.pos": 1.0,
+    }
+    observation = {
+        key: index / 10 for index, key in enumerate(robot_action_features, start=1)
+    }
+
+    assert record_module._send_action_for_clutch_state(robot, action, engaged=True) == action
+    assert calls == [
+        ("servo_enable", True, "eef"),
+        ("send_action", action),
+    ]
+
+    calls.clear()
+    held = record_module._send_action_for_clutch_state(
+        robot, action, engaged=False, observation=observation
+    )
+    expected_hold = {**observation, **action}
+    assert held == expected_hold
+    record_module.build_dataset_frame(dataset_features, held, prefix=record_module.ACTION)
+    assert calls == [
+        ("servo_enable", False, "joints"),
+        ("send_action", {"gripper.pos": 1.0}),
+    ]
+
+    calls.clear()
+    hold_without_gripper = {key: value for key, value in action.items() if key != "gripper.pos"}
+    assert (
+        record_module._send_action_for_clutch_state(
+            robot, hold_without_gripper, engaged=False, observation=observation
+        )
+        == {**observation, **hold_without_gripper}
+    )
+    assert calls == []
+
+
 def test_dataset_features_are_lerobot_metadata_compatible(tmp_path):
     """The recorder must convert robot descriptors to dataset feature metadata."""
     robot = JakaRobot(JakaRobotConfig(ip="127.0.0.1"))

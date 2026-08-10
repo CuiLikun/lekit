@@ -1212,26 +1212,6 @@ class JakaRobot(Robot):
             self._servo_target = target
             self._servo_target_updated_at = time.monotonic()
 
-    def cancel_eef_motion(self, measured_pose: Any) -> None:
-        """Cancel pending Cartesian motion at a measured TCP pose.
-
-        This replaces both sides of the host-side Servo state so the next frame
-        is sent directly at the measured pose instead of being clamped relative
-        to an older hand target. The controller may still need time to decelerate
-        its internal Cartesian NLF trajectory.
-        """
-
-        measured = _vector(measured_pose, name="measured TCP pose").copy()
-        with self._servo_state_lock:
-            if not self._servo_active or self._servo_representation != "eef":
-                raise RuntimeError("Cartesian Servo Move must be active to cancel EEF motion.")
-            self._servo_target = measured.copy()
-            self._servo_commanded_position = measured.copy()
-            self._servo_target_updated_at = time.monotonic()
-            self._servo_linear_velocity.fill(0.0)
-            self._servo_angular_speed = 0.0
-            self._last_eef_target = measured.copy()
-
     def _servo_worker(self) -> None:
         period_s = SERVO_CYCLE_S
         deadline = time.monotonic()

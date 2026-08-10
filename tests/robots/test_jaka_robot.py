@@ -270,27 +270,6 @@ def test_cartesian_nlf_is_the_only_eef_trajectory_filter():
     assert frame == pytest.approx(target)
 
 
-def test_cancel_eef_motion_replaces_pending_target_with_measured_pose():
-    arm = driver.JakaRobot(driver.JakaRobotConfig(ip="10.0.0.2"))
-    pending = np.array([0.3, 0.2, 0.3, 0.2, 0.2, 0.3])
-    measured = np.array([0.24, 0.2, 0.3, 0.1, 0.2, 0.3])
-    arm._servo_active = True
-    arm._servo_representation = "eef"
-    arm._servo_target = pending.copy()
-    arm._servo_commanded_position = pending.copy()
-    arm._last_eef_target = pending.copy()
-    arm._servo_linear_velocity[:] = 0.1
-    arm._servo_angular_speed = 0.2
-
-    arm.cancel_eef_motion(measured)
-
-    assert arm._servo_target == pytest.approx(measured)
-    assert arm._servo_commanded_position == pytest.approx(measured)
-    assert arm._last_eef_target == pytest.approx(measured)
-    assert arm._servo_linear_velocity == pytest.approx(np.zeros(3))
-    assert arm._servo_angular_speed == 0.0
-
-
 def test_recent_observation_is_reused_by_eef_action(robot):
     arm, rc = robot
     arm.get_observation()

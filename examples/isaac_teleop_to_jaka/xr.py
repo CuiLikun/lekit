@@ -731,11 +731,6 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
         home_base_t_ee = _pose6_to_base_t_ee(measured_pose)
         clutch = Clutch(home_base_t_ee)
 
-        if robot.name == "jaka_robot":
-            # Start directly in Cartesian Servo P mode. Some controllers reject
-            # switching from an initial Servo J stream into Servo P.
-            robot.servo_enable(True, representation="eef")
-
         print("Starting teleop loop. Squeeze and move the controller to teleoperate the robot...")
 
     def compute(robot_obs) -> dict | None:

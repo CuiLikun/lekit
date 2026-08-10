@@ -138,6 +138,41 @@ class TriggerGripperToggle:
         return result
 
 
+def _send_action_for_clutch_state(
+    robot: JakaRobot,
+    action: dict,
+    *,
+    engaged: bool,
+    observation: dict | None = None,
+) -> dict:
+    """Run Cartesian Servo only while the XR deadman is engaged."""
+
+    if engaged:
+        if not robot.is_in_servo():
+            robot.servo_enable(True, representation="eef")
+        return robot.send_action(action)
+
+    if robot.is_in_servo():
+        robot.servo_enable(False)
+    gripper_action = (
+        {"gripper.pos": action["gripper.pos"]} if "gripper.pos" in action else None
+    )
+    if gripper_action is not None:
+        robot.send_action(gripper_action)
+
+    held = (
+        {
+            key: float(observation[key])
+            for key in robot.action_features
+            if key in observation
+        }
+        if observation is not None
+        else {}
+    )
+    held.update(action)
+    return held
+
+
 # ── Keyboard control ────────────────────────────────────────────────────────
 
 
@@ -517,9 +552,6 @@ def _record_loop(
             if events["stop_recording"]:
                 break
             raise
-        if device.telemetry.get("clutch_released"):
-            eef_keys = ("ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw")
-            robot.cancel_eef_motion([float(obs[key]) for key in eef_keys])
         action = gripper_toggle.apply(
             hold.resolve(raw, obs),
             obs,
@@ -530,7 +562,12 @@ def _record_loop(
             break
 
         try:
-            sent_action = robot.send_action(action)
+            sent_action = _send_action_for_clutch_state(
+                robot,
+                action,
+                engaged=bool(device.telemetry.get("clutch_engaged", False)),
+                observation=obs,
+            )
         except Exception:
             if events["stop_recording"]:
                 break
