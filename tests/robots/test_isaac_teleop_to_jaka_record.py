@@ -27,6 +27,160 @@ def test_trigger_gripper_toggle_changes_state_only_on_press_edges(monkeypatch):
     assert toggle.apply(action, observation, 0.8)["gripper.pos"] == 0.0
 
 
+def test_controller_buttons_emit_one_a_edge_and_one_b_long_press(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+    buttons = record_module.ControllerButtons(reset_hold_s=1.0)
+
+    assert buttons.update(0.0, 0.0, 10.0) == (False, False)
+    assert buttons.update(1.0, 0.0, 10.1) == (True, False)
+    assert buttons.update(1.0, 0.0, 10.2) == (False, False)
+    assert buttons.update(0.0, 1.0, 11.0) == (False, False)
+    assert buttons.update(0.0, 1.0, 11.9) == (False, False)
+    assert buttons.update(0.0, 1.0, 12.0) == (False, True)
+    assert buttons.update(0.0, 1.0, 13.0) == (False, False)
+    assert buttons.update(0.0, 0.0, 13.1) == (False, False)
+    assert buttons.update(0.0, 1.0, 14.0) == (False, False)
+    assert buttons.update(0.0, 1.0, 15.0) == (False, True)
+
+    tracking_safe = record_module.ControllerButtons(reset_hold_s=1.0)
+    assert tracking_safe.update(1.0, 0.0, 20.0) == (True, False)
+    assert tracking_safe.update(0.0, 0.0, 20.1, tracking=False) == (False, False)
+    assert tracking_safe.update(1.0, 0.0, 20.2) == (False, False)
+
+
+def test_episode_controller_starts_ready_and_tracks_recording_time(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+    episode = record_module.EpisodeController()
+
+    assert episode.state == "ready"
+    assert episode.elapsed_s(10.0) == 0.0
+    assert episode.toggle_recording(10.0) is False
+    assert episode.state == "recording"
+    assert episode.elapsed_s(12.5) == pytest.approx(2.5)
+    assert episode.toggle_recording(13.0) is True
+    assert episode.state == "ready"
+    assert episode.elapsed_s(14.0) == 0.0
+
+
+def test_robot_reset_exits_servo_and_uses_exact_planned_joint_action(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+    calls: list[tuple] = []
+    reset_joints = [-0.956, 1.903, 1.427, 1.368, -1.590, -0.290]
+
+    class FakeRobot:
+        config = SimpleNamespace(reset_joints=reset_joints, max_relative_target=0.05)
+
+        def is_in_servo(self):
+            return True
+
+        def servo_enable(self, enabled):
+            calls.append(("servo_enable", enabled))
+
+        def send_action(self, action, *, use_servo=True):
+            calls.append(("send_action", dict(action), use_servo, self.config.max_relative_target))
+            return dict(action)
+
+    robot = FakeRobot()
+    result = record_module._reset_robot(robot)
+    expected = {f"joint_{index}.pos": value for index, value in enumerate(reset_joints, start=1)}
+
+    assert result == expected
+    assert calls == [
+        ("servo_enable", False),
+        ("send_action", expected, False, None),
+    ]
+    assert robot.config.max_relative_target == 0.05
+
+
+def test_record_loop_only_buffers_frames_between_a_press_edges(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+    schema_robot = JakaRobot(JakaRobotConfig(ip="127.0.0.1"))
+    features = build_dataset_features(schema_robot, use_videos=False)
+    observation = {
+        key: float(index) / 10
+        for index, key in enumerate(schema_robot.observation_features, start=1)
+        if isinstance(schema_robot.observation_features[key], type)
+    }
+
+    class FakeRobot:
+        action_features = schema_robot.action_features
+
+        def get_observation(self):
+            return dict(observation)
+
+        def is_in_servo(self):
+            return False
+
+        def send_action(self, action, *, use_servo=True):
+            return dict(action)
+
+    class FakeDevice:
+        def __init__(self):
+            self.telemetry = {}
+            self._a_values = iter((0.0, 1.0, 0.0, 1.0))
+
+        def compute(self, _obs):
+            self.telemetry.update(
+                a_button=next(self._a_values),
+                b_button=0.0,
+                trigger=0.0,
+                clutch_engaged=False,
+            )
+            return None
+
+        def rearm(self):
+            pass
+
+    class FakeDataset:
+        def __init__(self):
+            self.features = features
+            self.frames = []
+
+        def add_frame(self, frame):
+            self.frames.append(frame)
+
+        def has_pending_frames(self):
+            return bool(self.frames)
+
+        def clear_episode_buffer(self):
+            self.frames.clear()
+
+    class FakeLive:
+        def update(self, *_args, **_kwargs):
+            pass
+
+    monkeypatch.setattr(record_module, "_jaka_status", lambda _robot: {})
+    monkeypatch.setattr(record_module, "precise_sleep", lambda _duration: None)
+    dataset = FakeDataset()
+    events = {
+        "exit_early": False,
+        "toggle_recording": False,
+        "reset_robot": False,
+        "rerecord_episode": False,
+        "stop_recording": False,
+    }
+
+    outcome = record_module._record_loop(
+        FakeRobot(),
+        FakeDevice(),
+        [key for key in schema_robot.action_features if key.startswith("ee.")]
+        + ["gripper.pos"],
+        events,
+        30,
+        FakeLive(),
+        dataset=dataset,
+        control_time_s=60,
+        single_task="test",
+    )
+
+    assert outcome == "completed"
+    assert len(dataset.frames) == 2
+
+
 def test_hold_latch_captures_measured_pose_on_engage_release(monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
     record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
@@ -227,8 +381,10 @@ def test_control_panel_visualizes_only_position_delta(monkeypatch):
     rendered = output.getvalue()
     assert "JAKA Teleop" in rendered
     assert "Mode" not in rendered
+    assert "RECORDING" in rendered
     assert "ENGAGED" in rendered
     assert "Episode" in rendered and "2 / 5   12.4 s" in rendered
+    assert "A rec/stop" in rendered and "B(hold) reset" in rendered
     assert "TCP(m/rad)" in rendered
     assert "[0.080, 0.230, 0.310, 0.100, 0.200, 0.300]" in rendered
     assert "Joint(rad)" in rendered
@@ -269,6 +425,25 @@ def test_control_panel_deadbands_submillimetre_feedback_noise(monkeypatch):
     assert "X +0.0 mm" in rendered
     assert "Y +0.0 mm" in rendered
     assert "Z +0.0 mm" in rendered
+
+
+@pytest.mark.parametrize("state", ["ready", "recording", "resetting"])
+def test_control_panel_shows_recorder_state(monkeypatch, state):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+    output = io.StringIO()
+    console = Console(file=output, width=100, color_system=None)
+
+    console.print(
+        record_module._control_panel(
+            {},
+            {},
+            {},
+            {"record_state": state},
+        )
+    )
+
+    assert state.upper() in output.getvalue()
 
 
 def test_jaka_status_contains_controller_and_servo_details(monkeypatch):
@@ -589,3 +764,27 @@ def test_escape_keyboard_dispatch_invokes_stop_callback(monkeypatch):
     assert events["stop_recording"] is True
     assert events["exit_early"] is True
     assert stopped == [True]
+
+
+def test_keyboard_dispatch_maps_episode_and_reset_redundancy(monkeypatch):
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+    captured_dispatch = None
+
+    def fake_create_key_listener(dispatch, *, controls_help=""):
+        nonlocal captured_dispatch
+        captured_dispatch = dispatch
+        return "listener"
+
+    monkeypatch.setattr(
+        "lerobot.utils.keyboard_input.create_key_listener",
+        fake_create_key_listener,
+    )
+    _, events = record_module.init_keyboard_listener(lambda: None)
+    assert captured_dispatch is not None
+
+    captured_dispatch("a")
+    assert events["toggle_recording"] is True
+    captured_dispatch("b")
+    assert events["reset_robot"] is True
+    captured_dispatch("left")
+    assert events["rerecord_episode"] is True

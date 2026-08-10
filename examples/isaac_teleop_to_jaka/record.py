@@ -41,9 +41,9 @@ uv run python -m examples.isaac_teleop_to_jaka.record \
     --dataset.push_to_hub=False
 
 The XR trigger toggles the gripper between closed (0) and open (1) on each press.
-Keyboard shortcuts: Right/n ends and saves the current episode, Left/r discards and
-re-records it, and Esc/q stops immediately. All frames, including
-clutch-disengaged hold frames, are recorded.
+Press A to start or finish an episode and hold B to reset the robot. Keyboard
+shortcuts provide the same controls: Right/n/a toggles recording, b resets,
+Left/r discards the current episode, and Esc/q stops immediately.
 """
 
 import logging
@@ -91,6 +91,8 @@ DELTA_POSITION_BAR_SPAN_M = 0.05
 DELTA_POSITION_BAR_WIDTH = 31
 DELTA_POSITION_DISPLAY_DEADBAND_M = 0.0002
 CONTROL_RATE_WINDOW_S = 1.0
+BUTTON_THRESHOLD = 0.5
+DEFAULT_RESET_HOLD_S = 1.0
 
 # ── Hold latch ──────────────────────────────────────────────────────────────
 
@@ -165,6 +167,79 @@ class TriggerGripperToggle:
         return result
 
 
+class ControllerButtons:
+    """Convert XR A edges and B holds into one-shot control commands."""
+
+    def __init__(self, reset_hold_s: float = DEFAULT_RESET_HOLD_S):
+        if not math.isfinite(reset_hold_s) or reset_hold_s <= 0:
+            raise ValueError("reset hold duration must be positive and finite")
+        self.reset_hold_s = float(reset_hold_s)
+        self._a_pressed = False
+        self._b_pressed_at: float | None = None
+        self._b_fired = False
+
+    def update(
+        self, a_value: float, b_value: float, now: float, *, tracking: bool = True
+    ) -> tuple[bool, bool]:
+        if not tracking:
+            self._b_pressed_at = None
+            self._b_fired = False
+            return False, False
+
+        a_pressed = math.isfinite(a_value) and a_value >= BUTTON_THRESHOLD
+        toggle_recording = a_pressed and not self._a_pressed
+        self._a_pressed = a_pressed
+
+        b_pressed = math.isfinite(b_value) and b_value >= BUTTON_THRESHOLD
+        reset_robot = False
+        if not b_pressed:
+            self._b_pressed_at = None
+            self._b_fired = False
+        elif self._b_pressed_at is None:
+            self._b_pressed_at = now
+        elif not self._b_fired and now - self._b_pressed_at >= self.reset_hold_s:
+            self._b_fired = True
+            reset_robot = True
+        return toggle_recording, reset_robot
+
+
+class EpisodeController:
+    """Track the explicit ready/recording/resetting recorder state."""
+
+    def __init__(self):
+        self.state = "ready"
+        self.started_at: float | None = None
+
+    @property
+    def is_recording(self) -> bool:
+        return self.state == "recording"
+
+    def toggle_recording(self, now: float) -> bool:
+        if self.state == "ready":
+            self.state = "recording"
+            self.started_at = now
+            return False
+        if self.state == "recording":
+            self.state = "ready"
+            self.started_at = None
+            return True
+        return False
+
+    def discard(self) -> None:
+        self.state = "ready"
+        self.started_at = None
+
+    def begin_reset(self) -> None:
+        self.state = "resetting"
+        self.started_at = None
+
+    def finish_reset(self) -> None:
+        self.state = "ready"
+
+    def elapsed_s(self, now: float) -> float:
+        return max(now - self.started_at, 0.0) if self.started_at is not None else 0.0
+
+
 def _send_action_for_clutch_state(
     robot: JakaRobot,
     action: dict,
@@ -198,7 +273,7 @@ def _send_action_for_clutch_state(
 
 
 def init_keyboard_listener(stop_callback: Callable[[], None] | None = None):
-    """Wire Right/Left/Esc shortcuts to recording control events.
+    """Wire redundant keyboard shortcuts to recorder control events.
 
     When stdin is a TTY, prefer the stdlib :class:`TerminalKeyListener` (works over SSH
     and emits canonical key names); the dispatcher maps ``n``/``r``/``q`` to the same
@@ -208,19 +283,22 @@ def init_keyboard_listener(stop_callback: Callable[[], None] | None = None):
     """
     from lerobot.utils.keyboard_input import apply_recording_control
 
-    if not (sys.stdin is not None and sys.stdin.isatty()) and stop_callback is None:
-        from lerobot.utils.keyboard_input import init_keyboard_listener as _upstream
-
-        return _upstream()
-
-    events = {"exit_early": False, "rerecord_episode": False, "stop_recording": False}
+    events = {
+        "exit_early": False,
+        "toggle_recording": False,
+        "reset_robot": False,
+        "rerecord_episode": False,
+        "stop_recording": False,
+    }
 
     def on_key(name: str) -> None:
         key = name.lower()
-        if key in ("right", "n"):
-            apply_recording_control("right", events)
+        if key in ("right", "n", "a"):
+            events["toggle_recording"] = True
+        elif key == "b":
+            events["reset_robot"] = True
         elif key in ("left", "r"):
-            apply_recording_control("left", events)
+            events["rerecord_episode"] = True
         elif key in ("esc", "q"):
             apply_recording_control("esc", events)
             if stop_callback is not None:
@@ -232,8 +310,8 @@ def init_keyboard_listener(stop_callback: Callable[[], None] | None = None):
         listener = TerminalKeyListener(on_key)
         listener.start()
         logging.info(
-            "Keyboard control via terminal — keep this terminal focused: "
-            "Right/n = end episode early, Left/r = re-record, Esc/q = stop."
+            "Keyboard control via terminal - keep this terminal focused: "
+            "Right/n/a = start/end, b = reset, Left/r = discard, Esc/q = stop."
         )
         return listener, events
 
@@ -241,7 +319,7 @@ def init_keyboard_listener(stop_callback: Callable[[], None] | None = None):
 
     listener = create_key_listener(
         on_key,
-        controls_help="Right/Left/Esc, or n=next, r=re-record, q=quit",
+        controls_help="Right/n/a=start/end, b=reset, Left/r=discard, Esc/q=quit",
     )
     return listener, events
 
@@ -281,6 +359,7 @@ class Device:
     compute: Callable[[dict | None], dict | None]
     startup: Callable[[], None]
     cleanup: Callable[[], None]
+    rearm: Callable[[], None] = lambda: None
     telemetry: dict[str, Any] = field(default_factory=dict)
 
 
@@ -344,6 +423,7 @@ def build_device(cfg: "RecordConfig") -> tuple[JakaRobot, Device]:
             compute=bundle["compute"],
             startup=bundle["startup"],
             cleanup=bundle["cleanup"],
+            rearm=bundle.get("rearm", lambda: None),
             telemetry=bundle["telemetry"],
         )
         device.startup()
@@ -449,8 +529,17 @@ def _control_panel(
     table.add_column(no_wrap=True)
     table.add_column()
 
+    default_state = "recording" if robot_status.get("recording", False) else "ready"
+    record_state = str(robot_status.get("record_state", default_state)).lower()
+    state_styles = {
+        "ready": "bold cyan",
+        "recording": "bold green",
+        "resetting": "bold yellow",
+    }
+    mode = Text(record_state.upper(), style=state_styles.get(record_state, "bold white"))
     engaged = bool(telemetry.get("clutch_engaged", False))
-    mode = Text("ENGAGED" if engaged else "HOLD", style="bold green" if engaged else "bold yellow")
+    mode.append("   ")
+    mode.append("ENGAGED" if engaged else "HOLD", style="green" if engaged else "yellow")
     if telemetry.get("head_is_tracking") is False:
         mode.append("   XR TRACKING LOST", style="bold red")
     mode.append("   LOOP ", style="dim")
@@ -468,16 +557,14 @@ def _control_panel(
         and isinstance(episode_total, int)
         and isinstance(episode_elapsed_s, (int, float))
     ):
-        if robot_status.get("recording", False):
-            table.add_row(
-                "Episode",
-                f"{episode_number} / {episode_total}   {float(episode_elapsed_s):.1f} s",
-            )
-        else:
-            table.add_row(
-                "Reset",
-                f"after {episode_number} / {episode_total}   {float(episode_elapsed_s):.1f} s",
-            )
+        table.add_row(
+            "Episode",
+            f"{episode_number} / {episode_total}   {float(episode_elapsed_s):.1f} s",
+        )
+    table.add_row(
+        "Controls",
+        "A rec/stop | B(hold) reset | keyboard n/b/r/q",
+    )
     table.add_row("Robot", _jaka_status_line(robot_status))
 
     position = {axis: action[f"ee.{axis}"] for axis in ("x", "y", "z") if f"ee.{axis}" in action}
@@ -524,6 +611,31 @@ class RecordConfig:
     resume: bool = False
     control_trace_csv: Path | None = None
     control_trace_flush_frames: int = 30
+    reset_hold_s: float = DEFAULT_RESET_HOLD_S
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.reset_hold_s) or self.reset_hold_s <= 0:
+            raise ValueError("reset_hold_s must be positive and finite")
+
+
+def _reset_robot(robot: JakaRobot) -> dict[str, float]:
+    """Move to the configured reset pose with one blocking planned joint action."""
+
+    reset_joints = robot.config.reset_joints
+    if reset_joints is None:
+        raise ValueError("Robot reset requires --robot.reset_joints with six angles in radians.")
+    if robot.is_in_servo():
+        robot.servo_enable(False)
+    action = {f"joint_{index}.pos": value for index, value in enumerate(reset_joints, start=1)}
+
+    # The driver's relative limit protects streaming commands. A configured reset pose is
+    # an explicit planner target, so let this one blocking move reach it exactly.
+    previous_limit = robot.config.max_relative_target
+    try:
+        robot.config.max_relative_target = None
+        return robot.send_action(action, use_servo=False)
+    finally:
+        robot.config.max_relative_target = previous_limit
 
 
 # ── Record loop ─────────────────────────────────────────────────────────────
@@ -541,32 +653,28 @@ def _record_loop(
     control_time_s: float = 0.0,
     single_task: str | None = None,
     gripper_toggle: TriggerGripperToggle | None = None,
+    buttons: ControllerButtons | None = None,
     control_trace: ControlTraceWriter | None = None,
     episode_number: int | None = None,
     episode_total: int | None = None,
-) -> None:
-    """Run one episode or reset phase of the Cartesian control loop.
+    reset_hold_s: float = DEFAULT_RESET_HOLD_S,
+) -> str:
+    """Stay ready until A starts an episode, then return when A finishes it."""
 
-    When ``dataset`` is None the loop still controls the robot so the operator can
-    reposition during reset, but frames are not recorded.
-    """
+    if dataset is None:
+        raise ValueError("The interactive record loop requires a dataset.")
     control_interval = 1.0 / fps
     rate_monitor = LoopRateMonitor()
     hold = HoldLatch(action_keys)
     gripper_toggle = gripper_toggle or TriggerGripperToggle()
+    buttons = buttons or ControllerButtons(reset_hold_s)
+    episode = EpisodeController()
     robot_status: dict[str, Any] = {}
     next_status_refresh_at = 0.0
-    start_t = time.perf_counter()
-    timestamp = 0.0
-    record_frames = dataset is not None
 
-    while timestamp < control_time_s:
+    while not events["stop_recording"]:
         loop_start = time.perf_counter()
         control_rate_hz = rate_monitor.update(loop_start)
-
-        if events["exit_early"]:
-            events["exit_early"] = False
-            break
 
         try:
             obs = robot.get_observation()
@@ -577,9 +685,6 @@ def _record_loop(
 
         if events["stop_recording"]:
             break
-
-        if record_frames:
-            obs_frame = build_dataset_frame(dataset.features, obs, prefix=OBS_STR)
 
         # XR clutch disengaged: hold the TCP pose latched on the idle edge.
         try:
@@ -596,6 +701,62 @@ def _record_loop(
 
         if events["stop_recording"]:
             break
+
+        a_toggle, b_reset = buttons.update(
+            float(device.telemetry.get("a_button", 0.0)),
+            float(device.telemetry.get("b_button", 0.0)),
+            loop_start,
+            tracking=bool(device.telemetry.get("controller_is_tracking", True)),
+        )
+        toggle_requested = a_toggle or bool(events.pop("toggle_recording", False))
+        reset_requested = b_reset or bool(events.pop("reset_robot", False))
+        discard_requested = bool(events.pop("rerecord_episode", False))
+        events["exit_early"] = False
+
+        if discard_requested:
+            if dataset.has_pending_frames():
+                dataset.clear_episode_buffer()
+            episode.discard()
+            logging.info("Discarded current episode; recorder is ready")
+
+        episode_finished = episode.toggle_recording(loop_start) if toggle_requested else False
+        if toggle_requested and episode.is_recording:
+            logging.info("Recording episode %s", episode_number)
+
+        if reset_requested:
+            if dataset.has_pending_frames():
+                dataset.clear_episode_buffer()
+                logging.info("Discarded incomplete episode before robot reset")
+            episode.begin_reset()
+            if loop_start >= next_status_refresh_at:
+                robot_status = _jaka_status(robot)
+                next_status_refresh_at = loop_start + 1.0
+            robot_status.update(
+                control_rate_hz=control_rate_hz,
+                control_target_hz=float(fps),
+                episode_number=episode_number,
+                episode_total=episode_total,
+                episode_elapsed_s=0.0,
+                recording=False,
+                record_state=episode.state,
+            )
+            live.update(_control_panel(device.telemetry, action, obs, robot_status), refresh=True)
+            logging.info("Resetting robot to configured joint pose")
+            _reset_robot(robot)
+            device.rearm()
+            hold = HoldLatch(action_keys)
+            episode.finish_reset()
+            logging.info("Robot reset complete; recorder is ready")
+            continue
+
+        if (
+            episode.is_recording
+            and control_time_s > 0
+            and episode.elapsed_s(loop_start) >= control_time_s
+        ):
+            episode.toggle_recording(loop_start)
+            episode_finished = True
+            logging.info("Episode reached the configured %.1f s limit", control_time_s)
 
         try:
             sent_action = _send_action_for_clutch_state(
@@ -616,10 +777,12 @@ def _record_loop(
         robot_status["control_target_hz"] = float(fps)
         robot_status["episode_number"] = episode_number
         robot_status["episode_total"] = episode_total
-        robot_status["episode_elapsed_s"] = loop_start - start_t
-        robot_status["recording"] = record_frames
+        robot_status["episode_elapsed_s"] = episode.elapsed_s(loop_start)
+        robot_status["recording"] = episode.is_recording
+        robot_status["record_state"] = episode.state
 
-        if record_frames:
+        if episode.is_recording:
+            obs_frame = build_dataset_frame(dataset.features, obs, prefix=OBS_STR)
             action_frame = build_dataset_frame(dataset.features, sent_action, prefix=ACTION)
             dataset.add_frame({**obs_frame, **action_frame, "task": single_task})
 
@@ -628,7 +791,7 @@ def _record_loop(
         frame_ms = (time.perf_counter() - loop_start) * 1000
         if control_trace is not None:
             control_trace.write_frame(
-                phase="record" if record_frames else "reset",
+                phase=episode.state,
                 raw_action=raw,
                 action=action,
                 sent_action=sent_action,
@@ -649,8 +812,14 @@ def _record_loop(
             refresh=True,
         )
 
+        if episode_finished:
+            return "completed"
+
         precise_sleep(max(control_interval - (time.perf_counter() - loop_start), 0.0))
-        timestamp = time.perf_counter() - start_t
+
+    if dataset.has_pending_frames():
+        dataset.clear_episode_buffer()
+    return "stopped"
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────
@@ -723,6 +892,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             "live": None,  # bound below
             "single_task": cfg.dataset.single_task,
             "gripper_toggle": TriggerGripperToggle(),
+            "buttons": ControllerButtons(cfg.reset_hold_s),
+            "reset_hold_s": cfg.reset_hold_s,
         }
 
         initial_panel = Panel(
@@ -750,9 +921,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             recorded_episodes = 0
             episode_total = dataset.num_episodes + cfg.dataset.num_episodes
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
-                logging.info(f"Recording episode {dataset.num_episodes}")
                 episode_number = dataset.num_episodes + 1
-                _record_loop(
+                logging.info("Ready for episode %s; press A to start", episode_number)
+                outcome = _record_loop(
                     **loop_kwargs,
                     dataset=dataset,
                     control_time_s=cfg.dataset.episode_time_s,
@@ -764,30 +935,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 # scene or save a partial episode after that immediate stop.
                 if events["stop_recording"]:
                     break
-
-                # Reset window: give the operator time to reposition the scene.
-                # Skipped for the last episode (or if stop_recording was set).
-                if not events["stop_recording"] and (
-                    recorded_episodes < cfg.dataset.num_episodes - 1 or events["rerecord_episode"]
-                ):
-                    logging.info("Reset the environment")
-                    _record_loop(
-                        **loop_kwargs,
-                        dataset=None,
-                        control_time_s=cfg.dataset.reset_time_s,
-                        episode_number=episode_number,
-                        episode_total=episode_total,
-                    )
-
-                if events["rerecord_episode"]:
-                    logging.info("Re-record episode")
-                    events["rerecord_episode"] = False
-                    events["exit_early"] = False
-                    dataset.clear_episode_buffer()
-                    continue
-
-                dataset.save_episode()
-                recorded_episodes += 1
+                if outcome == "completed":
+                    dataset.save_episode()
+                    recorded_episodes += 1
 
     finally:
         logging.info("Stop recording")

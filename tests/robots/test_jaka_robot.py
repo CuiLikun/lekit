@@ -484,6 +484,16 @@ def test_config_normalizes_scalar_safety_limit_and_rejects_incomplete_joint_mapp
         driver.JakaRobotConfig(max_relative_target={"joint_1.pos": 0.1})
 
 
+def test_config_validates_and_normalizes_reset_joints():
+    config = driver.JakaRobotConfig(reset_joints=[0, 1, 2, 3, 4, 5])
+    assert config.reset_joints == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+
+    with pytest.raises(ValueError, match="exactly six"):
+        driver.JakaRobotConfig(reset_joints=[0.0] * 5)
+    with pytest.raises(ValueError, match="finite"):
+        driver.JakaRobotConfig(reset_joints=[0.0, 1.0, 2.0, 3.0, 4.0, math.nan])
+
+
 def test_configured_joint_and_eef_position_limits_are_enforced(monkeypatch):
     rc = FakeRC()
     monkeypatch.setattr(driver, "create_rc", lambda _ip: rc)

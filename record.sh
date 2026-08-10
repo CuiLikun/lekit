@@ -13,12 +13,12 @@ uv run python -m examples.isaac_teleop_to_jaka.record \
     --teleop.lock_pose=True \
     --teleop.use_head_yaw=True \
     --teleop.operator_yaw_deg=0 \
+    --reset_hold_s=1.0 \
     --dataset.repo_id="sorel/pick-cube" \
     --dataset.single_task="Pick up the object" \
     --dataset.fps=30 \
     --dataset.num_episodes=3 \
     --dataset.episode_time_s=9999 \
-    --dataset.reset_time_s=5 \
     --dataset.streaming_encoding=True \
     --dataset.push_to_hub=False \
     "$@"

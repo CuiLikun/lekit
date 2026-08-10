@@ -476,6 +476,8 @@ class XRController(IsaacTeleopTeleoperator):
             "head_is_tracking": {"dtype": "bool", "shape": ()},
             "squeeze": {"dtype": "float32", "shape": ()},
             "trigger": {"dtype": "float32", "shape": ()},
+            "a_button": {"dtype": "float32", "shape": ()},
+            "b_button": {"dtype": "float32", "shape": ()},
         }
 
     @property
@@ -496,10 +498,12 @@ class XRController(IsaacTeleopTeleoperator):
         grip_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
         squeeze = 0.0
         trigger = 0.0
+        a_button = 0.0
+        b_button = 0.0
         self._is_tracking = not getattr(controller, "is_none", False)
         if self._is_tracking:
-            # Read ALL four fields into locals before committing any of them: a failure on a
-            # partially-populated frame must not mix live values with the safe defaults (a
+            # Read the pose/deadman fields into locals before committing any of them: a failure
+            # on a partially-populated frame must not mix live values with the safe defaults (a
             # live squeeze paired with a defaulted trigger=0.0 would keep the clutch engaged
             # while commanding the gripper fully open, dropping whatever is grasped). On
             # failure the defaults stand untouched and the frame reports not-tracked.
@@ -527,6 +531,16 @@ class XRController(IsaacTeleopTeleoperator):
                 else:
                     grip_pos, grip_quat = pos, quat / quat_norm
                     squeeze, trigger = squeeze_val, trigger_val
+                    try:
+                        a_val = float(controller[ControllerInputIndex.PRIMARY_CLICK])
+                        b_val = float(controller[ControllerInputIndex.SECONDARY_CLICK])
+                    except (IndexError, KeyError, TypeError, ValueError):
+                        pass
+                    else:
+                        if np.isfinite(a_val):
+                            a_button = a_val
+                        if np.isfinite(b_val):
+                            b_button = b_val
 
         raw_grip_pos = grip_pos.copy()
         raw_grip_quat = grip_quat.copy()
@@ -580,6 +594,8 @@ class XRController(IsaacTeleopTeleoperator):
             "head_is_tracking": head_is_tracking,
             "squeeze": squeeze,
             "trigger": trigger,
+            "a_button": a_button,
+            "b_button": b_button,
         }
 
 
@@ -749,6 +765,8 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
         head_is_tracking = bool(xr_action.get("head_is_tracking", False))
         squeeze = float(xr_action["squeeze"])
         trigger = float(xr_action["trigger"])
+        a_button = float(xr_action.get("a_button", 0.0))
+        b_button = float(xr_action.get("b_button", 0.0))
         requested_enabled = squeeze > teleop_config.clutch_threshold
 
         # Use the operator's heading at the engage edge, then keep that transform fixed
@@ -788,9 +806,12 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
             raw_grip_quat=tuple(float(v) for v in raw_grip_quat),
             head_quat=tuple(float(v) for v in head_quat),
             head_is_tracking=head_is_tracking,
+            controller_is_tracking=bool(getattr(teleop, "is_tracking", True)),
             control_yaw_deg=control_yaw_deg,
             squeeze=squeeze,
             trigger=trigger,
+            a_button=a_button,
+            b_button=b_button,
             clutch_engaged=enabled,
             clutch_released=is_release_frame,
         )
@@ -859,10 +880,22 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
         finally:
             teleop.disconnect()
 
+    def rearm() -> None:
+        """Force the next squeeze frame to latch a fresh measured robot pose."""
+
+        nonlocal prev_enabled, last_pos, last_rpy, locked_rpy, latched_base_t_anchor
+        prev_enabled = False
+        last_pos = None
+        last_rpy = None
+        locked_rpy = None
+        latched_base_t_anchor = None
+        telemetry.update(clutch_engaged=False, clutch_released=True)
+
     return {
         "startup": startup,
         "compute": compute,
         "cleanup": cleanup,
+        "rearm": rearm,
         "telemetry": telemetry,
     }
 

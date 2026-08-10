@@ -489,6 +489,8 @@ def test_xr_controller_discards_invalid_grip_pose():
     assert action["grip_quat"] == pytest.approx([0.0, 0.0, 0.0, 1.0])
     assert action["squeeze"] == 0.0
     assert action["trigger"] == 0.0
+    assert action["a_button"] == 0.0
+    assert action["b_button"] == 0.0
 
 
 def test_xr_controller_reports_raw_and_transformed_grip_pose():
@@ -507,6 +509,8 @@ def test_xr_controller_reports_raw_and_transformed_grip_pose():
                 xr.ControllerInputIndex.GRIP_IS_VALID: True,
                 xr.ControllerInputIndex.SQUEEZE_VALUE: 0.75,
                 xr.ControllerInputIndex.TRIGGER_VALUE: 0.25,
+                xr.ControllerInputIndex.PRIMARY_CLICK: 1.0,
+                xr.ControllerInputIndex.SECONDARY_CLICK: 0.5,
             }
             return values[index]
 
@@ -537,6 +541,8 @@ def test_xr_controller_reports_raw_and_transformed_grip_pose():
     assert action["raw_grip_quat"] == pytest.approx([0.0, 0.0, 0.0, 1.0])
     assert action["head_quat"] == pytest.approx([0.0, 0.5, 0.0, math.sqrt(0.75)])
     assert action["head_is_tracking"] is True
+    assert action["a_button"] == 1.0
+    assert action["b_button"] == 0.5
 
 
 def test_rpy_conversion_preserves_a_near_gimbal_lock_reference():

@@ -305,6 +305,17 @@ class JakaRobotConfig(RobotConfig):
         super().__post_init__()
         if not self.ip.strip():
             raise ValueError("JakaRobotConfig.ip must not be empty.")
+        if self.reset_joints is not None:
+            if len(self.reset_joints) != 6:
+                raise ValueError("reset_joints must contain exactly six joint angles in radians.")
+            if any(
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not np.isfinite(value)
+                for value in self.reset_joints
+            ):
+                raise ValueError("reset_joints must contain six finite joint angles in radians.")
+            self.reset_joints = [float(value) for value in self.reset_joints]
         if not 0 <= self.tool_id <= 15 or not 0 <= self.user_frame_id <= 15:
             raise ValueError("JAKA tool_id and user_frame_id must be in [0, 15].")
         if not 0 <= self.collision_level <= 5:
