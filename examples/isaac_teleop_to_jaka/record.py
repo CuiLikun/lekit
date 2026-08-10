@@ -51,8 +51,8 @@ import math
 import sys
 import time
 from collections import deque
-from collections.abc import Callable
-from contextlib import nullcontext, suppress
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
@@ -281,8 +281,6 @@ def init_keyboard_listener(stop_callback: Callable[[], None] | None = None):
     still gets through. For non-interactive stdin, use the upstream listener when no
     callback is needed, or the shared listener factory when immediate teardown is needed.
     """
-    from lerobot.utils.keyboard_input import apply_recording_control
-
     events = {
         "exit_early": False,
         "toggle_recording": False,
@@ -300,7 +298,8 @@ def init_keyboard_listener(stop_callback: Callable[[], None] | None = None):
         elif key in ("left", "r"):
             events["rerecord_episode"] = True
         elif key in ("esc", "q"):
-            apply_recording_control("esc", events)
+            events["stop_recording"] = True
+            events["exit_early"] = True
             if stop_callback is not None:
                 stop_callback()
 
@@ -536,6 +535,7 @@ def _control_panel(
         "recording": "bold green",
         "resetting": "bold yellow",
     }
+    border_styles = {"ready": "cyan", "recording": "green", "resetting": "yellow"}
     mode = Text(record_state.upper(), style=state_styles.get(record_state, "bold white"))
     engaged = bool(telemetry.get("clutch_engaged", False))
     mode.append("   ")
@@ -593,7 +593,12 @@ def _control_panel(
                 _signed_horizontal_bar(delta, DELTA_POSITION_BAR_SPAN_M),
             )
 
-    return Panel(table, title="JAKA Teleop", subtitle=mode)
+    return Panel(
+        table,
+        title="JAKA Teleop",
+        subtitle=mode,
+        border_style=border_styles.get(record_state, "white"),
+    )
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -636,6 +641,36 @@ def _reset_robot(robot: JakaRobot) -> dict[str, float]:
         return robot.send_action(action, use_servo=False)
     finally:
         robot.config.max_relative_target = previous_limit
+
+
+def _save_episode_quietly(dataset: LeRobotDataset) -> None:
+    """Save an episode without datasets progress output redrawing the Live panel."""
+
+    from datasets import are_progress_bars_disabled, disable_progress_bars, enable_progress_bars
+
+    progress_was_disabled = are_progress_bars_disabled()
+    if not progress_was_disabled:
+        disable_progress_bars()
+    try:
+        dataset.save_episode()
+    finally:
+        if not progress_was_disabled:
+            enable_progress_bars()
+
+
+@contextmanager
+def _stable_live(renderable: Any, **kwargs: Any) -> Iterator[Live]:
+    """Run Live without leaving partial tall-panel rows in terminal scrollback."""
+
+    live = Live(renderable, transient=True, **kwargs)
+    live.start()
+    try:
+        yield live
+    finally:
+        final_renderable = live.renderable
+        live.update(Text(""), refresh=False)
+        live.stop()
+        live.console.print(final_renderable)
 
 
 # ── Record loop ─────────────────────────────────────────────────────────────
@@ -717,16 +752,12 @@ def _record_loop(
             if dataset.has_pending_frames():
                 dataset.clear_episode_buffer()
             episode.discard()
-            logging.info("Discarded current episode; recorder is ready")
 
         episode_finished = episode.toggle_recording(loop_start) if toggle_requested else False
-        if toggle_requested and episode.is_recording:
-            logging.info("Recording episode %s", episode_number)
 
         if reset_requested:
             if dataset.has_pending_frames():
                 dataset.clear_episode_buffer()
-                logging.info("Discarded incomplete episode before robot reset")
             episode.begin_reset()
             if loop_start >= next_status_refresh_at:
                 robot_status = _jaka_status(robot)
@@ -741,12 +772,10 @@ def _record_loop(
                 record_state=episode.state,
             )
             live.update(_control_panel(device.telemetry, action, obs, robot_status), refresh=True)
-            logging.info("Resetting robot to configured joint pose")
             _reset_robot(robot)
             device.rearm()
             hold = HoldLatch(action_keys)
             episode.finish_reset()
-            logging.info("Robot reset complete; recorder is ready")
             continue
 
         if (
@@ -756,7 +785,6 @@ def _record_loop(
         ):
             episode.toggle_recording(loop_start)
             episode_finished = True
-            logging.info("Episode reached the configured %.1f s limit", control_time_s)
 
         try:
             sent_action = _send_action_for_clutch_state(
@@ -839,6 +867,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     image_writer_threads = cfg.dataset.num_image_writer_threads_per_camera * num_cameras
 
     dataset: LeRobotDataset | None = None
+    dataset_managed = False
     listener = None
     try:
         if cfg.resume:
@@ -874,7 +903,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
             )
 
-        listener, events = init_keyboard_listener(stop_callback=stop_hardware_now)
+        listener, events = init_keyboard_listener()
 
         # The recorder commands Cartesian Servo Move. JAKA still returns its
         # full fixed action schema so joint feedback is recorded in the action
@@ -910,48 +939,53 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             else nullcontext(None)
         )
         with (
-            Live(initial_panel, refresh_per_second=max(cfg.dataset.fps, 1), transient=False) as live,
             VideoEncodingManager(dataset),
             trace_context as control_trace,
         ):
-            if control_trace is not None:
-                logging.info("[JAKA-TRACE] Writing control trace to %s", control_trace.path)
-            loop_kwargs["live"] = live
-            loop_kwargs["control_trace"] = control_trace
-            recorded_episodes = 0
-            episode_total = dataset.num_episodes + cfg.dataset.num_episodes
-            while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
-                episode_number = dataset.num_episodes + 1
-                logging.info("Ready for episode %s; press A to start", episode_number)
-                outcome = _record_loop(
-                    **loop_kwargs,
-                    dataset=dataset,
-                    control_time_s=cfg.dataset.episode_time_s,
-                    episode_number=episode_number,
-                    episode_total=episode_total,
-                )
+            dataset_managed = True
+            try:
+                with _stable_live(
+                    initial_panel, refresh_per_second=max(cfg.dataset.fps, 1)
+                ) as live:
+                    loop_kwargs["live"] = live
+                    loop_kwargs["control_trace"] = control_trace
+                    recorded_episodes = 0
+                    episode_total = dataset.num_episodes + cfg.dataset.num_episodes
+                    while (
+                        recorded_episodes < cfg.dataset.num_episodes
+                        and not events["stop_recording"]
+                    ):
+                        episode_number = dataset.num_episodes + 1
+                        outcome = _record_loop(
+                            **loop_kwargs,
+                            dataset=dataset,
+                            control_time_s=cfg.dataset.episode_time_s,
+                            episode_number=episode_number,
+                            episode_total=episode_total,
+                        )
 
-                # ESC/q tears down the arm from the keyboard thread. Do not reset the
-                # scene or save a partial episode after that immediate stop.
-                if events["stop_recording"]:
-                    break
-                if outcome == "completed":
-                    dataset.save_episode()
-                    recorded_episodes += 1
+                        if events["stop_recording"]:
+                            break
+                        if outcome == "completed":
+                            _save_episode_quietly(dataset)
+                            recorded_episodes += 1
+            finally:
+                # Keep hardware teardown outside Live, but ahead of dataset/video finalization.
+                stop_hardware_now()
 
     finally:
         logging.info("Stop recording")
 
-        # The keyboard callback normally performs this before the loop unwinds. The
-        # same callback here covers normal completion, Ctrl-C, and startup races.
+        # The managed recording path already stops hardware before video finalization.
+        # This idempotent fallback covers startup failures and early exceptions.
         stop_hardware_now()
 
-        # Restore the terminal before the (potentially long) finalize/encode.
+        # Restore the terminal before any fallback finalization or upload work.
         if listener is not None:
             with suppress(Exception):
                 listener.stop()
 
-        if dataset is not None:
+        if dataset is not None and not dataset_managed:
             dataset.finalize()
 
         if cfg.dataset.push_to_hub:

@@ -155,6 +155,13 @@ def test_record_loop_only_buffers_frames_between_a_press_edges(monkeypatch):
 
     monkeypatch.setattr(record_module, "_jaka_status", lambda _robot: {})
     monkeypatch.setattr(record_module, "precise_sleep", lambda _duration: None)
+    monkeypatch.setattr(
+        record_module.logging,
+        "info",
+        lambda *_args, **_kwargs: pytest.fail(
+            "button-state logging bypasses Rich Live and leaves terminal border fragments"
+        ),
+    )
     dataset = FakeDataset()
     events = {
         "exit_early": False,
@@ -179,6 +186,69 @@ def test_record_loop_only_buffers_frames_between_a_press_edges(monkeypatch):
 
     assert outcome == "completed"
     assert len(dataset.frames) == 2
+
+
+def test_episode_save_keeps_live_active_while_suppressing_progress(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+    calls: list[str] = []
+
+    class FakeLive:
+        is_started = True
+
+        def stop(self):
+            pytest.fail("stopping a tall Live panel leaves partial rows in terminal scrollback")
+
+        def start(self, *, refresh=False):
+            pytest.fail("the Live panel must not be restarted during episode saves")
+
+    class ProgressPrintingDataset:
+        def save_episode(self):
+            assert live.is_started
+            calls.append("dataset.save_episode")
+
+    live = FakeLive()
+    record_module._save_episode_quietly(ProgressPrintingDataset())
+
+    assert calls == ["dataset.save_episode"]
+
+
+def test_stable_live_clears_dynamic_render_before_printing_final_panel(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+    calls: list[tuple] = []
+
+    class FakeConsole:
+        def print(self, renderable):
+            calls.append(("print", renderable))
+
+    class FakeLive:
+        def __init__(self, renderable, **kwargs):
+            assert kwargs["transient"] is True
+            self.renderable = renderable
+            self.console = FakeConsole()
+
+        def start(self):
+            calls.append(("start",))
+
+        def update(self, renderable, *, refresh=False):
+            self.renderable = renderable
+            calls.append(("update", getattr(renderable, "plain", renderable), refresh))
+
+        def stop(self):
+            calls.append(("stop",))
+
+    monkeypatch.setattr(record_module, "Live", FakeLive)
+
+    with record_module._stable_live("initial", refresh_per_second=30) as live:
+        live.renderable = "final panel"
+
+    assert calls == [
+        ("start",),
+        ("update", "", False),
+        ("stop",),
+        ("print", "final panel"),
+    ]
 
 
 def test_hold_latch_captures_measured_pose_on_engage_release(monkeypatch):
@@ -310,6 +380,22 @@ def test_control_panel_calls_use_compact_signature():
     assert all(len(call.args) == 4 for call in calls)
 
 
+def test_record_does_not_teardown_hardware_from_keyboard_thread():
+    source_path = Path(__file__).parents[2] / "examples/isaac_teleop_to_jaka/record.py"
+    tree = ast.parse(source_path.read_text())
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "init_keyboard_listener"
+    ]
+
+    assert len(calls) == 1
+    assert calls[0].args == []
+    assert calls[0].keywords == []
+
+
 def test_signed_horizontal_bar_has_stable_width_and_direction(monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
     record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
@@ -427,23 +513,26 @@ def test_control_panel_deadbands_submillimetre_feedback_noise(monkeypatch):
     assert "Z +0.0 mm" in rendered
 
 
-@pytest.mark.parametrize("state", ["ready", "recording", "resetting"])
-def test_control_panel_shows_recorder_state(monkeypatch, state):
+@pytest.mark.parametrize(
+    ("state", "border_style"),
+    [("ready", "cyan"), ("recording", "green"), ("resetting", "yellow")],
+)
+def test_control_panel_shows_recorder_state(monkeypatch, state, border_style):
     monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
     record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
     output = io.StringIO()
     console = Console(file=output, width=100, color_system=None)
 
-    console.print(
-        record_module._control_panel(
-            {},
-            {},
-            {},
-            {"record_state": state},
-        )
+    panel = record_module._control_panel(
+        {},
+        {},
+        {},
+        {"record_state": state},
     )
+    console.print(panel)
 
     assert state.upper() in output.getvalue()
+    assert panel.border_style == border_style
 
 
 def test_jaka_status_contains_controller_and_servo_details(monkeypatch):
@@ -740,7 +829,7 @@ def test_hardware_stop_callback_is_idempotent_and_orders_teardown():
     assert calls == ["device.cleanup", "robot.disconnect"]
 
 
-def test_escape_keyboard_dispatch_invokes_stop_callback(monkeypatch):
+def test_escape_keyboard_dispatch_invokes_stop_callback(monkeypatch, capsys):
     record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
     captured_dispatch = None
 
@@ -764,6 +853,7 @@ def test_escape_keyboard_dispatch_invokes_stop_callback(monkeypatch):
     assert events["stop_recording"] is True
     assert events["exit_early"] is True
     assert stopped == [True]
+    assert capsys.readouterr().out == ""
 
 
 def test_keyboard_dispatch_maps_episode_and_reset_redundancy(monkeypatch):
