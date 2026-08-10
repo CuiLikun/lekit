@@ -212,6 +212,9 @@ def test_control_trace_records_disengaged_hold_and_servo_targets(monkeypatch, tm
                     "trigger": 0.0,
                     "grip_pos": (0.1, 0.2, 0.3),
                     "raw_grip_pos": (0.4, 0.5, 0.6),
+                    "head_quat": (0.0, 0.5, 0.0, 0.8660254),
+                    "head_is_tracking": True,
+                    "control_yaw_deg": 60.0,
                 },
                 servo_status={
                     "active": True,
@@ -242,6 +245,11 @@ def test_control_trace_records_disengaged_hold_and_servo_targets(monkeypatch, tm
     assert [
         float(rows[1][f"raw_grip_{axis}_m"]) for axis in ("x", "y", "z")
     ] == pytest.approx([0.4, 0.5, 0.6])
+    assert rows[1]["head_is_tracking"] == "True"
+    assert [float(rows[1][f"head_quat_{axis}"]) for axis in ("x", "y", "z", "w")] == pytest.approx(
+        [0.0, 0.5, 0.0, 0.8660254]
+    )
+    assert float(rows[1]["control_yaw_deg"]) == pytest.approx(60.0)
 
 
 def test_build_device_isolates_feedback_and_defers_servo_start(monkeypatch):

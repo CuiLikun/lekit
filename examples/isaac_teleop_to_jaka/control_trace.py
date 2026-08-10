@@ -23,6 +23,9 @@ _TRACE_FIELDS = (
     "frame_ms",
     *(f"grip_{axis}_m" for axis in ("x", "y", "z")),
     *(f"raw_grip_{axis}_m" for axis in ("x", "y", "z")),
+    "head_is_tracking",
+    *(f"head_quat_{axis}" for axis in ("x", "y", "z", "w")),
+    "control_yaw_deg",
     *(f"actual_{axis}" for axis in _EEF_AXES),
     *(f"requested_{axis}" for axis in _EEF_AXES),
     *(f"applied_{axis}" for axis in _EEF_AXES),
@@ -155,6 +158,7 @@ class ControlTraceWriter:
         target_step = _pose_delta(applied, self._previous_applied)
         grip_pos = _sequence(telemetry.get("grip_pos"), 3)
         raw_grip_pos = _sequence(telemetry.get("raw_grip_pos"), 3)
+        head_quat = _sequence(telemetry.get("head_quat"), 4)
 
         row: dict[str, object] = {
             "time_s": time.monotonic() - self._started_at,
@@ -171,6 +175,12 @@ class ControlTraceWriter:
             "raw_grip_x_m": raw_grip_pos[0],
             "raw_grip_y_m": raw_grip_pos[1],
             "raw_grip_z_m": raw_grip_pos[2],
+            "head_is_tracking": telemetry.get("head_is_tracking"),
+            "head_quat_x": head_quat[0],
+            "head_quat_y": head_quat[1],
+            "head_quat_z": head_quat[2],
+            "head_quat_w": head_quat[3],
+            "control_yaw_deg": _number(telemetry.get("control_yaw_deg")),
             "tracking_error_norm_m": _translation_norm(tracking_error),
             "tracking_error_angle_rad": _angle_norm(tracking_error),
             "target_step_norm_m": _translation_norm(target_step),

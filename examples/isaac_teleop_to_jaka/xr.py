@@ -81,7 +81,7 @@ _isaacteleop_available = is_package_available("isaacteleop")
 
 if TYPE_CHECKING or _isaacteleop_available:
     from isaacteleop.cloudxr import CloudXRLauncher
-    from isaacteleop.retargeting_engine.deviceio_source_nodes import ControllersSource
+    from isaacteleop.retargeting_engine.deviceio_source_nodes import ControllersSource, HeadSource
     from isaacteleop.retargeting_engine.interface import (
         ExecutionEvents,
         ExecutionState,
@@ -90,11 +90,12 @@ if TYPE_CHECKING or _isaacteleop_available:
         ValueInput,
     )
     from isaacteleop.retargeting_engine.tensor_types import TransformMatrix
-    from isaacteleop.retargeting_engine.tensor_types.indices import ControllerInputIndex
+    from isaacteleop.retargeting_engine.tensor_types.indices import ControllerInputIndex, HeadPoseIndex
     from isaacteleop.teleop_session_manager import TeleopSession, TeleopSessionConfig
 else:
     CloudXRLauncher = None
     ControllersSource = None
+    HeadSource = None
     ExecutionEvents = None
     ExecutionState = None
     OutputCombiner = None
@@ -102,13 +103,14 @@ else:
     ValueInput = None
     TransformMatrix = None
     ControllerInputIndex = None
+    HeadPoseIndex = None
     TeleopSession = None
     TeleopSessionConfig = None
 
 # Static rebase from the CloudXR controller anchor frame (X=Right, Y=Up, Z=Backward)
-# into the JAKA base frame (X=Forward, Y=Left, Z=Up). The default rotation maps
-# controller forward -> robot +X, right -> robot -Y (i.e. rightward), up -> robot +Z.
-# A rotated operator station can set ``operator_yaw_deg`` or provide ``base_T_anchor``.
+# into the JAKA base frame (X=Right, Y=Forward, Z=Up). Head-relative control latches the
+# operator's horizontal heading on each clutch engage; ``operator_yaw_deg`` is an optional
+# correction between the headset's gaze direction and the operator's intended forward.
 DEFAULT_OPERATOR_YAW_DEG = 0.0
 
 
@@ -116,18 +118,54 @@ def _base_t_anchor_for_yaw(yaw_deg: float) -> list[list[float]]:
     """Build the OpenXR -> JAKA rebase for an operator station yawed CCW (from above)
     by ``yaw_deg`` around the vertical axis.
 
-    At ``yaw_deg=0`` this matches the SO101 ``_DEFAULT_BASE_T_ANCHOR``: hand
-    forward -> robot +X (forward), right -> robot -Y (rightward), up -> robot +Z.
+    At ``yaw_deg=0`` hand right maps to robot +X, hand forward maps to robot +Y,
+    and hand up maps to robot +Z.
     """
     yaw_rad = np.deg2rad(float(yaw_deg))
     yaw_sin = float(np.sin(yaw_rad))
     yaw_cos = float(np.cos(yaw_rad))
     return [
+        [yaw_cos, 0.0, yaw_sin, 0.0],
         [yaw_sin, 0.0, -yaw_cos, 0.0],
-        [-yaw_cos, 0.0, -yaw_sin, 0.0],
         [0.0, 1.0, 0.0, 0.0],
         [0.0, 0.0, 0.0, 1.0],
     ]
+
+
+def _base_t_anchor_from_head_quat(
+    head_quat: np.ndarray, *, yaw_offset_deg: float = 0.0
+) -> np.ndarray:
+    """Build an OpenXR-anchor -> JAKA-base transform from the headset's horizontal yaw."""
+
+    quat = np.asarray(head_quat, dtype=float)
+    if quat.shape != (4,) or not np.all(np.isfinite(quat)):
+        raise ValueError("head quaternion must contain four finite values")
+    norm = float(np.linalg.norm(quat))
+    if norm <= 1e-6:
+        raise ValueError("head quaternion norm is too small")
+
+    anchor_r_head = Rotation.from_quat(quat / norm).as_matrix()
+    forward = anchor_r_head @ np.array([0.0, 0.0, -1.0])
+    horizontal_norm = float(np.linalg.norm(forward[[0, 2]]))
+    if horizontal_norm <= 1e-3:
+        raise ValueError("head forward direction is too close to vertical")
+    forward /= horizontal_norm
+    heading_deg = float(np.rad2deg(np.arctan2(forward[0], -forward[2])))
+    return np.asarray(_base_t_anchor_for_yaw(heading_deg + yaw_offset_deg), dtype=float)
+
+
+def _transform_grip_pose(
+    position: np.ndarray, quaternion: np.ndarray, base_t_anchor: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply an anchor-to-base transform to an OpenXR grip pose."""
+
+    transform = np.asarray(base_t_anchor, dtype=float)
+    rotation = transform[:3, :3]
+    transformed_position = rotation @ np.asarray(position, dtype=float) + transform[:3, 3]
+    transformed_rotation = Rotation.from_matrix(rotation) * Rotation.from_quat(
+        np.asarray(quaternion, dtype=float)
+    )
+    return transformed_position, transformed_rotation.as_quat()
 
 
 # Source-node name for the static base_T_anchor rebase input fed via TeleopSession.step.
@@ -183,7 +221,10 @@ class XRControllerConfig(IsaacTeleopConfig):
     """Ignore Cartesian controller drift up to this distance from the last target."""
 
     operator_yaw_deg: float = DEFAULT_OPERATOR_YAW_DEG
-    """Horizontal yaw from the operator station to the JAKA base frame."""
+    """Horizontal correction in degrees from headset gaze to intended operator forward."""
+
+    use_head_yaw: bool = True
+    """Latch headset yaw on each clutch engage so translation follows operator heading."""
 
     servo_linear_velocity_m_s: float = 0.15
     """Maximum linear Servo P velocity used by the teleoperation profile."""
@@ -215,6 +256,8 @@ class XRControllerConfig(IsaacTeleopConfig):
             raise ValueError("position_deadband_m must be finite and non-negative")
         if not np.isfinite(self.operator_yaw_deg):
             raise ValueError("operator_yaw_deg must be finite")
+        if not isinstance(self.use_head_yaw, bool):
+            raise ValueError("use_head_yaw must be a boolean")
         if self.base_T_anchor is None:
             self.base_T_anchor = _base_t_anchor_for_yaw(self.operator_yaw_deg)
         for name in (
@@ -396,12 +439,15 @@ class XRController(IsaacTeleopTeleoperator):
         controller_key = f"controller_{side}"
 
         controllers = ControllersSource(name="controllers")
+        head = HeadSource(name="head")
         raw_ctrl = controllers.output(controller_key)
         xform = ValueInput(_BASE_T_ANCHOR_INPUT, TransformMatrix())
         transformed = controllers.transformed(xform.output("value"))
         ctrl = transformed.output(controller_key)
 
-        return OutputCombiner({"controller": ctrl, "controller_raw": raw_ctrl})
+        return OutputCombiner(
+            {"controller": ctrl, "controller_raw": raw_ctrl, "head": head.output("head")}
+        )
 
     def _build_external_inputs(self) -> dict[str, Any]:
         """Materialize the constant ``base_T_anchor`` external input (once, in connect)."""
@@ -426,6 +472,8 @@ class XRController(IsaacTeleopTeleoperator):
             "grip_quat": {"dtype": "float32", "shape": (4,)},
             "raw_grip_pos": {"dtype": "float32", "shape": (3,)},
             "raw_grip_quat": {"dtype": "float32", "shape": (4,)},
+            "head_quat": {"dtype": "float32", "shape": (4,)},
+            "head_is_tracking": {"dtype": "bool", "shape": ()},
             "squeeze": {"dtype": "float32", "shape": ()},
             "trigger": {"dtype": "float32", "shape": ()},
         }
@@ -503,11 +551,33 @@ class XRController(IsaacTeleopTeleoperator):
                     raw_grip_pos = raw_pos
                     raw_grip_quat = raw_quat / raw_quat_norm
 
+        head_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        head_is_tracking = False
+        head = result.get("head")
+        if head is not None and not getattr(head, "is_none", False):
+            try:
+                head_is_valid = bool(head[HeadPoseIndex.IS_VALID])
+                candidate = np.asarray(head[HeadPoseIndex.ORIENTATION], dtype=np.float32)
+            except (IndexError, KeyError, TypeError, ValueError):
+                pass
+            else:
+                candidate_norm = float(np.linalg.norm(candidate))
+                if (
+                    head_is_valid
+                    and candidate.shape == (4,)
+                    and np.all(np.isfinite(candidate))
+                    and candidate_norm > 1e-6
+                ):
+                    head_quat = candidate / candidate_norm
+                    head_is_tracking = True
+
         return {
             "grip_pos": grip_pos,
             "grip_quat": grip_quat,
             "raw_grip_pos": raw_grip_pos,
             "raw_grip_quat": raw_grip_quat,
+            "head_quat": head_quat,
+            "head_is_tracking": head_is_tracking,
             "squeeze": squeeze,
             "trigger": trigger,
         }
@@ -645,6 +715,7 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
     last_pos: np.ndarray | None = None
     last_rpy: np.ndarray | None = None
     locked_rpy: np.ndarray | None = None
+    latched_base_t_anchor: np.ndarray | None = None
     telemetry: dict[str, object] = {}
 
     def startup() -> None:
@@ -668,7 +739,7 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
         print("Starting teleop loop. Squeeze and move the controller to teleoperate the robot...")
 
     def compute(robot_obs) -> dict | None:
-        nonlocal clutch, prev_enabled, last_pos, last_rpy, locked_rpy
+        nonlocal clutch, prev_enabled, last_pos, last_rpy, locked_rpy, latched_base_t_anchor
         if clutch is None:
             raise RuntimeError("compute() called before startup()")
 
@@ -676,13 +747,52 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
         grip_pos = np.asarray(xr_action["grip_pos"], dtype=float)
         grip_quat = np.asarray(xr_action["grip_quat"], dtype=float)
         raw_grip_pos = np.asarray(xr_action.get("raw_grip_pos", grip_pos), dtype=float)
+        raw_grip_quat = np.asarray(xr_action.get("raw_grip_quat", grip_quat), dtype=float)
+        head_quat = np.asarray(
+            xr_action.get("head_quat", [0.0, 0.0, 0.0, 1.0]), dtype=float
+        )
+        head_is_tracking = bool(xr_action.get("head_is_tracking", False))
         squeeze = float(xr_action["squeeze"])
         trigger = float(xr_action["trigger"])
-        enabled = squeeze > teleop_config.clutch_threshold
+        requested_enabled = squeeze > teleop_config.clutch_threshold
+
+        # Use the operator's heading at the engage edge, then keep that transform fixed
+        # until release. Continuous head following would move a stationary hand whenever
+        # the operator merely looks sideways.
+        if requested_enabled and not prev_enabled and teleop_config.use_head_yaw:
+            if head_is_tracking:
+                try:
+                    latched_base_t_anchor = _base_t_anchor_from_head_quat(
+                        head_quat, yaw_offset_deg=teleop_config.operator_yaw_deg
+                    )
+                except ValueError:
+                    latched_base_t_anchor = None
+            else:
+                latched_base_t_anchor = None
+
+        enabled = requested_enabled and (
+            not teleop_config.use_head_yaw or latched_base_t_anchor is not None
+        )
+        if teleop_config.use_head_yaw and latched_base_t_anchor is not None:
+            grip_pos, grip_quat = _transform_grip_pose(
+                raw_grip_pos, raw_grip_quat, latched_base_t_anchor
+            )
+
+        control_yaw_deg = None
+        if latched_base_t_anchor is not None:
+            control_yaw_deg = float(
+                np.rad2deg(
+                    np.arctan2(latched_base_t_anchor[0, 2], latched_base_t_anchor[0, 0])
+                )
+            )
         telemetry.update(
             grip_pos=tuple(float(v) for v in grip_pos),
             grip_quat=tuple(float(v) for v in grip_quat),
             raw_grip_pos=tuple(float(v) for v in raw_grip_pos),
+            raw_grip_quat=tuple(float(v) for v in raw_grip_quat),
+            head_quat=tuple(float(v) for v in head_quat),
+            head_is_tracking=head_is_tracking,
+            control_yaw_deg=control_yaw_deg,
             squeeze=squeeze,
             trigger=trigger,
             clutch_engaged=enabled,
@@ -710,6 +820,8 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
         if not enabled:
             last_rpy = None
             locked_rpy = None
+            if not requested_enabled:
+                latched_base_t_anchor = None
             return None
 
         pos, quat = clutch.rebase(grip_pos, grip_quat)

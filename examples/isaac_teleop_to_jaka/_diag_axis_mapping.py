@@ -1,5 +1,5 @@
-"""Standalone diagnostic: for each OpenXR axis, push the controller +5 cm in that
-direction and print the resulting JAKA ``ee.{x,y,z}`` target delta. Run with:
+"""Standalone diagnostic: move the controller +5 cm along each operator axis and print
+the resulting JAKA ``ee.{x,y,z}`` target delta. Run with:
 
     python -m examples.isaac_teleop_to_jaka._diag_axis_mapping
 
@@ -9,17 +9,17 @@ The fake XR controller applies ``R @ p + t`` internally so the matrix is exercis
 exactly as the real SDK's ``ControllerTransform`` does.
 
 The expected JAKA convention is:
-    X = Forward, Y = Left, Z = Up (right-handed, per JAKA Zu APP manual §3.1).
+    X = Right, Y = Forward, Z = Up.
 
 The expected OpenXR grip-pose convention (per OpenXR spec, CloudXR, and the
 SO101 example's docstring) is:
     X = Right, Y = Up, Z = Backward (toward operator).
 
-For an operator standing BEHIND the robot looking at it (the standard teleop
-position), the intuitive mapping is therefore:
-    OpenXR +X  (hand right)  -> JAKA -Y (robot right)
-    OpenXR -Z  (hand forward)-> JAKA +X (robot forward)
-    OpenXR +Y  (hand up)     -> JAKA +Z (robot up)
+For the configured operator yaw, the diagnostic expresses physical right/forward in
+the OpenXR anchor frame and verifies the intuitive mapping:
+    hand right   -> JAKA +X (robot right)
+    hand forward -> JAKA +Y (robot forward)
+    hand up      -> JAKA +Z (robot up)
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ import numpy as np
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-from examples.isaac_teleop_to_jaka.xr import XRControllerConfig, make_xr_device
+from examples.isaac_teleop_to_jaka.xr import XRControllerConfig, make_xr_device  # noqa: E402
 
 # Measured EE pose — what the JAKA arm reports back. Any finite pose works for the
 # diagnostic; only the *delta* between successive frames is meaningful.
@@ -71,7 +71,7 @@ class FakeXRController:
     the same matrix the recorder sends through ``servo_p``.
     """
 
-    _instance: "FakeXRController | None" = None
+    _instance: FakeXRController | None = None
 
     def __init__(self, _config):
         self._raw_pose = np.array([0.0, 0.0, 0.0], dtype=np.float32)
@@ -90,15 +90,19 @@ class FakeXRController:
         self._raw_pose = np.asarray(raw_pose, dtype=np.float32)
 
     def get_action(self):
-        # Mirror the SDK's transform_utils.transform_position: R @ p + t.
-        R = self._base_T_anchor[:3, :3]
-        t = self._base_T_anchor[:3, 3]
-        transformed = (R @ self._raw_pose.astype(np.float64) + t).astype(np.float32)
+        # Mirror the SDK's transform_utils.transform_position: rotation @ p + translation.
+        rotation = self._base_T_anchor[:3, :3]
+        translation = self._base_T_anchor[:3, 3]
+        transformed = (
+            rotation @ self._raw_pose.astype(np.float64) + translation
+        ).astype(np.float32)
         return {
             "grip_pos": transformed,
             "grip_quat": self._quat.copy(),
             "raw_grip_pos": self._raw_pose.copy(),
             "raw_grip_quat": self._quat.copy(),
+            "head_quat": self._quat.copy(),
+            "head_is_tracking": True,
             "squeeze": 1.0,  # keep clutch engaged the whole time
             "trigger": 0.0,
         }
@@ -112,18 +116,21 @@ def main() -> None:
         bundle["startup"]()
         compute = bundle["compute"]
 
-        DELTA = 0.05  # 5 cm push per axis
+        delta = 0.05  # 5 cm push per axis
 
-        # Per the JAKA Zu APP manual: X=Forward, Y=Left, Z=Up.
-        # Per the SO101 docstring: OpenXR X=Right, Y=Up, Z=Backward.
+        # Express the operator's physical horizontal axes in the OpenXR anchor frame.
+        yaw = np.deg2rad(config.operator_yaw_deg)
+        operator_right = np.array([np.cos(yaw), 0.0, np.sin(yaw)])
+        operator_forward = np.array([np.sin(yaw), 0.0, -np.cos(yaw)])
+
         # For an operator behind the robot, intuitive mapping:
-        #   hand right  -> robot right  (-Y)  i.e. ee.y should DECREASE
-        #   hand forward-> robot forward (+X)  i.e. ee.x should INCREASE
+        #   hand right  -> robot right  (+X)  i.e. ee.x should INCREASE
+        #   hand forward-> robot forward (+Y)  i.e. ee.y should INCREASE
         #   hand up     -> robot up     (+Z)  i.e. ee.z should INCREASE
         cases = [
-            ("OpenXR +X (hand right)",      np.array([+DELTA,  0.0,  0.0]),  ("ee.y", "decrease")),
-            ("OpenXR -Z (hand forward)",    np.array([ 0.0,   0.0, -DELTA]),  ("ee.x", "increase")),
-            ("OpenXR +Y (hand up)",         np.array([ 0.0,  +DELTA,  0.0]),  ("ee.z", "increase")),
+            ("physical hand right", delta * operator_right, ("ee.x", "increase")),
+            ("physical hand forward", delta * operator_forward, ("ee.y", "increase")),
+            ("physical hand up", np.array([0.0, +delta, 0.0]), ("ee.z", "increase")),
         ]
 
         fake = FakeXRController._instance

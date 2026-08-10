@@ -8,6 +8,8 @@ python -m examples.isaac_teleop_to_jaka.record \
     --robot.servo_step_num=4 \
     --teleop.type=xr_controller \
     --teleop.lock_pose=True \
+    --teleop.use_head_yaw=True \
+    --teleop.operator_yaw_deg=0 \
     --dataset.repo_id="sorel/pick-cube" \
     --dataset.single_task="Pick up the object" \
     --dataset.fps=30 \

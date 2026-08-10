@@ -20,7 +20,7 @@ def test_default_xr_base_transform_matches_jaka_operator_axes():
 
     Conventions:
       - OpenXR controller: X=Right, Y=Up, Z=Backward (toward operator).
-      - JAKA base frame:   X=Forward, Y=Left, Z=Up.
+      - JAKA base frame:   X=Right, Y=Forward, Z=Up.
     """
     xr = _xr_module()
     rotation = np.asarray(xr.XRControllerConfig().base_T_anchor, dtype=float)[:3, :3]
@@ -28,9 +28,9 @@ def test_default_xr_base_transform_matches_jaka_operator_axes():
     operator_right = np.array([np.cos(yaw), 0.0, np.sin(yaw)])
     operator_forward = np.array([np.sin(yaw), 0.0, -np.cos(yaw)])
 
-    # Right -> robot right (-Y), forward -> robot forward (+X), up -> robot up (+Z).
-    assert rotation @ operator_right == pytest.approx([0.0, -1.0, 0.0])
-    assert rotation @ operator_forward == pytest.approx([1.0, 0.0, 0.0])
+    # Right -> robot +X, forward -> robot +Y, up -> robot +Z.
+    assert rotation @ operator_right == pytest.approx([1.0, 0.0, 0.0])
+    assert rotation @ operator_forward == pytest.approx([0.0, 1.0, 0.0])
     assert rotation @ np.array([0.0, 1.0, 0.0]) == pytest.approx([0.0, 0.0, 1.0])
     assert rotation.T @ rotation == pytest.approx(np.eye(3))
     assert np.linalg.det(rotation) == pytest.approx(1.0)
@@ -38,13 +38,269 @@ def test_default_xr_base_transform_matches_jaka_operator_axes():
 
 def test_operator_yaw_generates_requested_transform():
     """Rotating the operator CCW by ``yaw`` in OpenXR's horizontal plane keeps the
-    operator's right direction aligned with the robot's right axis (-Y)."""
+    operator's right direction aligned with the robot's right axis (+X)."""
     xr = _xr_module()
     yaw = np.deg2rad(33.635)
     rotation = np.asarray(xr.XRControllerConfig(operator_yaw_deg=33.635).base_T_anchor)[:3, :3]
     # The OpenXR +X axis rotated CCW by `yaw` around OpenXR +Y: still the operator's
-    # right direction expressed in OpenXR's frame; must map to robot right (-Y).
-    assert rotation @ np.array([np.cos(yaw), 0.0, np.sin(yaw)]) == pytest.approx([0.0, -1.0, 0.0])
+    # right direction expressed in OpenXR's frame; must map to robot right (+X).
+    assert rotation @ np.array([np.cos(yaw), 0.0, np.sin(yaw)]) == pytest.approx([1.0, 0.0, 0.0])
+
+
+def test_static_calibration_decouples_captured_horizontal_motion():
+    """Replay the right/forward vectors captured from the physical XR workstation."""
+    xr = _xr_module()
+    config = xr.XRControllerConfig(use_head_yaw=False, operator_yaw_deg=-10.0364)
+    rotation = np.asarray(config.base_T_anchor, dtype=float)[:3, :3]
+    raw_right = np.array([0.14900, -0.00965, -0.02315])
+    raw_forward = np.array([-0.03119, 0.03398, -0.15691])
+
+    mapped_right = rotation @ raw_right
+    mapped_forward = rotation @ raw_forward
+
+    assert mapped_right[0] > 0.0
+    assert abs(mapped_right[1] / mapped_right[0]) < 0.03
+    assert mapped_forward[1] > 0.0
+    assert abs(mapped_forward[0] / mapped_forward[1]) < 0.03
+
+
+def test_calibrated_station_motion_maps_to_matching_tcp_axes(monkeypatch):
+    """Exercise the raw OpenXR -> transformed grip -> clutch -> TCP target path."""
+    xr = _xr_module()
+    station_yaw = np.deg2rad(-10.0364)
+    # Keep the diagonal transition between the two probes below MAX_EE_STEP_M.
+    delta = 0.03
+    raw_poses = iter(
+        [
+            np.zeros(3),
+            delta * np.array([np.sin(station_yaw), 0.0, -np.cos(station_yaw)]),
+            delta * np.array([np.cos(station_yaw), 0.0, np.sin(station_yaw)]),
+        ]
+    )
+
+    class FakeTeleop:
+        def __init__(self, config):
+            self._rotation = np.asarray(config.base_T_anchor, dtype=float)[:3, :3]
+            self.is_connected = False
+
+        def connect(self):
+            self.is_connected = True
+
+        def get_action(self):
+            raw_pos = next(raw_poses)
+            return {
+                "grip_pos": self._rotation @ raw_pos,
+                "grip_quat": np.array([0.0, 0.0, 0.0, 1.0]),
+                "raw_grip_pos": raw_pos,
+                "raw_grip_quat": np.array([0.0, 0.0, 0.0, 1.0]),
+                "squeeze": 1.0,
+                "trigger": 0.0,
+            }
+
+        def disconnect(self):
+            self.is_connected = False
+
+    home = {
+        "ee.x": 0.4,
+        "ee.y": -0.1,
+        "ee.z": 0.3,
+        "ee.roll": 0.1,
+        "ee.pitch": -0.2,
+        "ee.yaw": 0.3,
+    }
+
+    class FakeRobot:
+        name = "jaka_robot"
+        is_connected = True
+
+        def get_eef_pose(self):
+            keys = ("ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw")
+            return tuple(home[key] for key in keys)
+
+        def servo_enable(self, _enabled, *, representation="joints"):
+            pass
+
+    monkeypatch.setattr(xr, "XRController", FakeTeleop)
+    monkeypatch.setattr(xr, "_wait_for_xr_controller", lambda _teleop: None)
+    config = xr.XRControllerConfig(
+        lock_pose=True, use_head_yaw=False, operator_yaw_deg=-10.0364
+    )
+    bundle = xr.make_xr_device(FakeRobot(), config)
+    bundle["startup"]()
+
+    origin = bundle["compute"](home)
+    forward = bundle["compute"](home)
+    right = bundle["compute"](home)
+
+    assert origin is not None and forward is not None and right is not None
+    origin_pos = np.array([origin[f"ee.{axis}"] for axis in ("x", "y", "z")])
+    forward_pos = np.array([forward[f"ee.{axis}"] for axis in ("x", "y", "z")])
+    right_pos = np.array([right[f"ee.{axis}"] for axis in ("x", "y", "z")])
+    assert forward_pos - origin_pos == pytest.approx([0.0, delta, 0.0], abs=1e-7)
+    assert right_pos - origin_pos == pytest.approx([delta, 0.0, 0.0], abs=1e-7)
+
+
+def test_head_relative_mapping_tracks_operator_heading_at_each_engage(monkeypatch):
+    """Body-forward motion must remain TCP +Y after the operator turns 90 degrees."""
+    xr = _xr_module()
+    delta = 0.03
+    identity = np.array([0.0, 0.0, 0.0, 1.0])
+    head_turned_left = np.array([0.0, -math.sin(math.pi / 4), 0.0, math.cos(math.pi / 4)])
+    samples = iter(
+        [
+            (np.zeros(3), identity, 1.0),
+            (np.array([0.0, 0.0, -delta]), identity, 1.0),
+            (np.zeros(3), identity, 0.0),
+            (np.zeros(3), head_turned_left, 1.0),
+            (np.array([delta, 0.0, 0.0]), head_turned_left, 1.0),
+        ]
+    )
+
+    class FakeTeleop:
+        def __init__(self, config):
+            self._rotation = np.asarray(config.base_T_anchor, dtype=float)[:3, :3]
+            self.is_connected = False
+
+        def connect(self):
+            self.is_connected = True
+
+        def get_action(self):
+            raw_pos, head_quat, squeeze = next(samples)
+            return {
+                "grip_pos": self._rotation @ raw_pos,
+                "grip_quat": identity,
+                "raw_grip_pos": raw_pos,
+                "raw_grip_quat": identity,
+                "head_quat": head_quat,
+                "head_is_tracking": True,
+                "squeeze": squeeze,
+                "trigger": 0.0,
+            }
+
+        def disconnect(self):
+            self.is_connected = False
+
+    home = {
+        "ee.x": 0.4,
+        "ee.y": -0.1,
+        "ee.z": 0.3,
+        "ee.roll": 0.1,
+        "ee.pitch": -0.2,
+        "ee.yaw": 0.3,
+    }
+
+    class FakeRobot:
+        name = "jaka_robot"
+        is_connected = True
+
+        def get_eef_pose(self):
+            keys = ("ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw")
+            return tuple(home[key] for key in keys)
+
+        def servo_enable(self, _enabled, *, representation="joints"):
+            pass
+
+    monkeypatch.setattr(xr, "XRController", FakeTeleop)
+    monkeypatch.setattr(xr, "_wait_for_xr_controller", lambda _teleop: None)
+    bundle = xr.make_xr_device(FakeRobot(), xr.XRControllerConfig(lock_pose=True))
+    bundle["startup"]()
+
+    origin_facing_anchor = bundle["compute"](home)
+    forward_facing_anchor = bundle["compute"](home)
+    assert bundle["compute"](home) is None
+    origin_after_turn = bundle["compute"](home)
+    forward_after_turn = bundle["compute"](home)
+
+    assert all(
+        action is not None
+        for action in (
+            origin_facing_anchor,
+            forward_facing_anchor,
+            origin_after_turn,
+            forward_after_turn,
+        )
+    )
+    for origin, forward in (
+        (origin_facing_anchor, forward_facing_anchor),
+        (origin_after_turn, forward_after_turn),
+    ):
+        origin_pos = np.array([origin[f"ee.{axis}"] for axis in ("x", "y", "z")])
+        forward_pos = np.array([forward[f"ee.{axis}"] for axis in ("x", "y", "z")])
+        assert forward_pos - origin_pos == pytest.approx([0.0, delta, 0.0], abs=1e-7)
+
+
+def test_head_relative_mapping_waits_for_valid_head_tracking(monkeypatch):
+    """A held squeeze may engage only after a valid headset heading is available."""
+    xr = _xr_module()
+    delta = 0.03
+    identity = np.array([0.0, 0.0, 0.0, 1.0])
+    samples = iter(
+        [
+            (np.zeros(3), False),
+            (np.zeros(3), True),
+            (np.array([0.0, 0.0, -delta]), True),
+        ]
+    )
+
+    class FakeTeleop:
+        def __init__(self, _config):
+            self.is_connected = False
+
+        def connect(self):
+            self.is_connected = True
+
+        def get_action(self):
+            raw_pos, head_is_tracking = next(samples)
+            return {
+                "grip_pos": raw_pos,
+                "grip_quat": identity,
+                "raw_grip_pos": raw_pos,
+                "raw_grip_quat": identity,
+                "head_quat": identity,
+                "head_is_tracking": head_is_tracking,
+                "squeeze": 1.0,
+                "trigger": 0.0,
+            }
+
+        def disconnect(self):
+            self.is_connected = False
+
+    home = {
+        "ee.x": 0.4,
+        "ee.y": -0.1,
+        "ee.z": 0.3,
+        "ee.roll": 0.1,
+        "ee.pitch": -0.2,
+        "ee.yaw": 0.3,
+    }
+
+    class FakeRobot:
+        name = "jaka_robot"
+        is_connected = True
+
+        def get_eef_pose(self):
+            keys = ("ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw")
+            return tuple(home[key] for key in keys)
+
+        def servo_enable(self, _enabled, *, representation="joints"):
+            pass
+
+    monkeypatch.setattr(xr, "XRController", FakeTeleop)
+    monkeypatch.setattr(xr, "_wait_for_xr_controller", lambda _teleop: None)
+    bundle = xr.make_xr_device(FakeRobot(), xr.XRControllerConfig(lock_pose=True))
+    bundle["startup"]()
+
+    assert bundle["compute"](home) is None
+    assert bundle["telemetry"]["clutch_engaged"] is False
+
+    origin = bundle["compute"](home)
+    forward = bundle["compute"](home)
+
+    assert origin is not None and forward is not None
+    assert bundle["telemetry"]["clutch_engaged"] is True
+    origin_pos = np.array([origin[f"ee.{axis}"] for axis in ("x", "y", "z")])
+    forward_pos = np.array([forward[f"ee.{axis}"] for axis in ("x", "y", "z")])
+    assert forward_pos - origin_pos == pytest.approx([0.0, delta, 0.0], abs=1e-7)
 
 
 def test_lock_pose_holds_measured_orientation_while_translation_follows_controller(monkeypatch):
@@ -102,7 +358,7 @@ def test_lock_pose_holds_measured_orientation_while_translation_follows_controll
 
     monkeypatch.setattr(xr, "XRController", FakeTeleop)
     monkeypatch.setattr(xr, "_wait_for_xr_controller", lambda _teleop: None)
-    config = xr.XRControllerConfig(lock_pose=True)
+    config = xr.XRControllerConfig(lock_pose=True, use_head_yaw=False)
     bundle = xr.make_xr_device(FakeRobot(), config)
     bundle["startup"]()
 
@@ -174,7 +430,7 @@ def test_stationary_xr_position_noise_does_not_change_cartesian_target(monkeypat
 
     monkeypatch.setattr(xr, "XRController", FakeTeleop)
     monkeypatch.setattr(xr, "_wait_for_xr_controller", lambda _teleop: None)
-    bundle = xr.make_xr_device(FakeRobot(), xr.XRControllerConfig())
+    bundle = xr.make_xr_device(FakeRobot(), xr.XRControllerConfig(use_head_yaw=False))
     bundle["startup"]()
 
     first = bundle["compute"](measured_pose)
@@ -243,12 +499,23 @@ def test_xr_controller_reports_raw_and_transformed_grip_pose():
             }
             return values[index]
 
+    class Head:
+        is_none = False
+
+        def __getitem__(self, index):
+            values = {
+                xr.HeadPoseIndex.ORIENTATION: np.array([0.0, 0.5, 0.0, math.sqrt(0.75)]),
+                xr.HeadPoseIndex.IS_VALID: True,
+            }
+            return values[index]
+
     controller = object.__new__(xr.XRController)
     controller._external_inputs = None
     controller._is_tracking = False
     controller._step = lambda **_kwargs: {
         "controller": Controller([4.0, 5.0, 6.0]),
         "controller_raw": Controller([1.0, 2.0, 3.0]),
+        "head": Head(),
     }
 
     action = controller.get_action()
@@ -257,6 +524,8 @@ def test_xr_controller_reports_raw_and_transformed_grip_pose():
     assert action["raw_grip_pos"] == pytest.approx([1.0, 2.0, 3.0])
     assert action["grip_quat"] == pytest.approx([0.0, 0.0, 0.0, 1.0])
     assert action["raw_grip_quat"] == pytest.approx([0.0, 0.0, 0.0, 1.0])
+    assert action["head_quat"] == pytest.approx([0.0, 0.5, 0.0, math.sqrt(0.75)])
+    assert action["head_is_tracking"] is True
 
 
 def test_rpy_conversion_preserves_a_near_gimbal_lock_reference():

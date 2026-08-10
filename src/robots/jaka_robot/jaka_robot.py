@@ -1342,9 +1342,7 @@ class JakaRobot(Robot):
 
         with self._servo_state_lock:
             samples = np.asarray(self._servo_period_samples, dtype=float)
-            target = (
-                tuple(map(float, self._servo_target)) if self._servo_target is not None else None
-            )
+            target = tuple(map(float, self._servo_target)) if self._servo_target is not None else None
             commanded_position = (
                 tuple(map(float, self._servo_commanded_position))
                 if self._servo_commanded_position is not None
