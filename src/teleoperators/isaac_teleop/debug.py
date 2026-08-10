@@ -82,6 +82,50 @@ def _meter(value: float, width: int = 12) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+def _xy_plot(ee_xy: np.ndarray, span_x: float = 0.4, span_y: float = 0.2, cols: int = 31, rows: int = 11):
+    """Render a 2D x-y plot as rich ``Text``.
+
+    Integrates the consumer's view of the EE target: ``ee_xy`` is the
+    accumulated position in the user convention (m). Cell size is
+    ``2 * span_x / (cols - 1)`` wide and ``2 * span_y / (rows - 1)`` tall.
+    The crosshair marks the origin (the engage point). The marker is
+    clamped to the grid if the EE has wandered off.
+
+    Args:
+        ee_xy: ``(x_right, y_front)`` in metres. ``z`` is ignored.
+        span_x: Half-width in metres. Total range is ``±span_x``.
+        span_y: Half-height in metres. Total range is ``±span_y``.
+    """
+    from rich.text import Text as RText
+
+    half_c = (cols - 1) // 2
+    half_r = (rows - 1) // 2
+    cell_x = span_x / half_c
+    cell_y = span_y / half_r
+    col = int(round(float(ee_xy[0]) / cell_x)) + half_c
+    row = half_r - int(round(float(ee_xy[1]) / cell_y))
+    col = max(0, min(cols - 1, col))
+    row = max(0, min(rows - 1, row))
+
+    text = RText()
+    for r in range(rows):
+        for c in range(cols):
+            # Marker first so the crosshair can't paint over it.
+            if r == row and c == col:
+                text.append("●", style="bold red")
+            elif r == half_r and c == half_c:
+                text.append("┼", style="dim")
+            elif r == half_r:
+                text.append("─", style="dim")
+            elif c == half_c:
+                text.append("│", style="dim")
+            else:
+                text.append(" ")
+        if r < rows - 1:
+            text.append("\n")
+    return text
+
+
 # --------------------------------------------------------------------- main
 
 
@@ -102,18 +146,29 @@ def _run_demo() -> None:
     period = 1.0 / target_hz
     vel_alpha = 0.35  # Velocity EMA — smooths jitter without adding much lag.
     deadzone = 0.02  # m/s; below this the controller reads as "still".
-    pos_span = 1.0  # Metres that saturate half a position bar.
+    pos_span = 0.05  # Metres/frame that saturate half a bar. At 30 Hz this
+    # corresponds to ~1.5 m/s — fast hand motion. Normal teleop is well
+    # inside the bar; truly fast moves saturate visibly.
 
-    axis_rows = (  # (label, name, meaning of +, meaning of -)
-        ("X", "fwd", "forward", "back"),
-        ("Y", "left", "left", "right"),
+    # (label, name, word for +, word for -). Matches the operator-friendly
+    # convention in IsaacTeleop.get_action (NOT the base frame).
+    axis_rows = (
+        ("X", "right", "right", "left"),
+        ("Y", "fwd", "forward", "back"),
         ("Z", "up", "up", "down"),
     )
 
     def _section(title: str) -> Text:
         return Text(title, style="dim bold")
 
-    def _panel(action: RobotAction, tracking: bool, vel: np.ndarray, hz: float, step_ms: float) -> Panel:
+    def _panel(
+        action: RobotAction,
+        tracking: bool,
+        vel: np.ndarray,
+        hz: float,
+        step_ms: float,
+        ee_xy: np.ndarray,
+    ) -> Panel:
         pos = np.asarray(action["grip_pos"], dtype=np.float32)
         roll, pitch, yaw = (float(a) for a in np.degrees(action["grip_ori"]))
 
@@ -169,11 +224,20 @@ def _run_demo() -> None:
             pressed = float(value) > 0.5
             buttons.append(f"{name} {'●' if pressed else '○'}   ", style="bold green" if pressed else "dim")
 
+        # 2D x-y trace. The marker is the integrated EE position in user
+        # convention; z is dropped. The grid spans ±0.4 m horizontally and
+        # ±0.2 m vertically (one typical hand-reach workspace).
+        plot = _xy_plot(ee_xy)
+        plot_caption = Text(
+            "  x → right  ·  y ↑ front  ·  ┼ = origin (engage)  ·  m",
+            style="dim",
+        )
+
         return Panel(
             Group(
                 header,
                 Text(),
-                _section("POSITION  (base frame, m)"),
+                _section("INCREMENT  (m/frame)"),
                 axes,
                 Text(),
                 _section("MOVE  (instantaneous)"),
@@ -185,6 +249,10 @@ def _run_demo() -> None:
                 _section("INPUTS"),
                 inputs,
                 buttons,
+                Text(),
+                _section("XY TRACE  (±0.4 m × ±0.2 m, z ignored)"),
+                plot,
+                plot_caption,
             ),
             title=f"IsaacTeleop · {config.hand_side} hand",
             subtitle="Ctrl-C to quit",
@@ -198,11 +266,14 @@ def _run_demo() -> None:
     console = Console()
 
     with teleop:
-        prev_pos: np.ndarray | None = None
         prev_t: float | None = None
         last_loop_t: float | None = None
         vel = np.zeros(3, dtype=np.float32)
         hz = 0.0
+        # Integrated EE target in user convention (m). Starts at 0; the
+        # consumer-side integration is simulated here so the XY trace shows
+        # where the EE would land if the deltas were summed. z is dropped.
+        ee_xy = np.zeros(2, dtype=np.float32)
 
         with Live(console=console, refresh_per_second=15) as live:
             try:
@@ -213,22 +284,36 @@ def _run_demo() -> None:
 
                     now = time.perf_counter()
                     tracking = teleop.is_tracking
-                    pos = np.asarray(action["grip_pos"], dtype=np.float32)
-                    if not tracking:
-                        # Untracked frames report zeros; differencing against
-                        # them would fabricate a huge spike on re-acquire.
-                        prev_pos, prev_t = None, None
+                    # Under plan-B, ``grip_pos`` is already the per-frame
+                    # increment (m/frame); dividing by dt gives the
+                    # instantaneous velocity in m/s. The previous-position
+                    # diff (which made sense under total-from-engage) would
+                    # now be a derivative of velocity i.e. acceleration, so
+                    # we use the increment directly.
+                    inc = np.asarray(action["grip_pos"], dtype=np.float32)
+                    if not tracking or prev_t is None or now <= prev_t:
+                        prev_t = now
                         vel[:] = 0.0
                     else:
-                        if prev_pos is not None and prev_t is not None and now > prev_t:
-                            vel += vel_alpha * ((pos - prev_pos) / (now - prev_t) - vel)
-                        prev_pos, prev_t = pos, now
+                        dt = now - prev_t
+                        v = inc / dt
+                        vel += vel_alpha * (v - vel)
+                        prev_t = now
+
+                    # Accumulate the per-frame increment into the simulated
+                    # EE position. The first engaged frame is (0,0,0) so
+                    # engage itself adds nothing; subsequent frames move
+                    # the marker. Released / untracked frames are also
+                    # (0,0,0), so the marker freezes in place.
+                    if tracking:
+                        ee_xy[0] += float(inc[0])
+                        ee_xy[1] += float(inc[1])
 
                     if last_loop_t is not None and now > last_loop_t:
                         hz += 0.2 * (1.0 / (now - last_loop_t) - hz)
                     last_loop_t = now
 
-                    live.update(_panel(action, tracking, vel, hz, step_ms))
+                    live.update(_panel(action, tracking, vel, hz, step_ms, ee_xy))
 
                     remaining = period - (time.perf_counter() - loop_t0)
                     if remaining > 0:
