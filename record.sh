@@ -12,6 +12,8 @@ uv run python -m examples.isaac_teleop_to_jaka.record \
     --robot.reset_joints="$reset_joints" \
     --teleop.type=xr_controller \
     --teleop.lock_pose=True \
+    --teleop.thumbstick_deadband=0.15 \
+    --teleop.thumbstick_angular_speed_rad_s=0.5 \
     --teleop.use_head_yaw=True \
     --teleop.operator_yaw_deg=0 \
     --reset_hold_s=1.0 \

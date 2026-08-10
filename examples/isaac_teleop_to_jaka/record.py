@@ -28,7 +28,7 @@ uv run python -m examples.isaac_teleop_to_jaka.record \
     --robot.id=jaka_arm \
     --robot.cameras="{ hand: {type: intelrealsense, serial_number_or_name: '342522070741', width: 640, height: 480, fps: 30}}" \
     --teleop.type=xr_controller \
-    --teleop.lock_pose="[0.0, 0.0, 0.0]" \
+    --teleop.lock_pose=true \
     --teleop.use_head_yaw=true \
     --teleop.operator_yaw_deg=0 \
     --dataset.repo_id="sorel/pick-cube" \
@@ -563,7 +563,7 @@ def _control_panel(
         )
     table.add_row(
         "Controls",
-        "A rec/stop | B(hold) reset | keyboard n/b/r/q",
+        "A/n rec | B/b reset | stick XY pitch/yaw | click+X roll | r redo | q quit",
     )
     table.add_row("Robot", _jaka_status_line(robot_status))
 

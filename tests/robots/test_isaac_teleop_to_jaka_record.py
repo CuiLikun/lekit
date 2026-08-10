@@ -470,7 +470,10 @@ def test_control_panel_visualizes_only_position_delta(monkeypatch):
     assert "RECORDING" in rendered
     assert "ENGAGED" in rendered
     assert "Episode" in rendered and "2 / 5   12.4 s" in rendered
-    assert "A rec/stop" in rendered and "B(hold) reset" in rendered
+    assert "A/n rec" in rendered and "stick XY pitch/yaw" in rendered
+    assert "click+X roll" in rendered
+    controls_line = next(line for line in rendered.splitlines() if "Controls" in line)
+    assert "stick XY pitch/yaw" in controls_line and "click+X roll" in controls_line
     assert "TCP(m/rad)" in rendered
     assert "[0.080, 0.230, 0.310, 0.100, 0.200, 0.300]" in rendered
     assert "Joint(rad)" in rendered
@@ -610,6 +613,9 @@ def test_control_trace_records_disengaged_hold_and_servo_targets(monkeypatch, tm
                     "clutch_released": True,
                     "squeeze": 0.0,
                     "trigger": 0.0,
+                    "thumbstick_x": -0.25,
+                    "thumbstick_y": 0.75,
+                    "thumbstick_click": 1.0,
                     "grip_pos": (0.1, 0.2, 0.3),
                     "raw_grip_pos": (0.4, 0.5, 0.6),
                     "head_quat": (0.0, 0.5, 0.0, 0.8660254),
@@ -655,6 +661,9 @@ def test_control_trace_records_disengaged_hold_and_servo_targets(monkeypatch, tm
         [0.0, 0.5, 0.0, 0.8660254]
     )
     assert float(rows[1]["control_yaw_deg"]) == pytest.approx(60.0)
+    assert float(rows[1]["thumbstick_x"]) == pytest.approx(-0.25)
+    assert float(rows[1]["thumbstick_y"]) == pytest.approx(0.75)
+    assert rows[1]["thumbstick_click"] == "1.0"
 
 
 def test_build_device_isolates_feedback_and_defers_servo_start(monkeypatch):

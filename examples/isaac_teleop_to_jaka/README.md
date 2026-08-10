@@ -93,7 +93,14 @@ p_tcp_target = p_tcp_home + (p_grip_current - p_grip_origin)
 `HoldLatch` 保持最后一个命令目标，不会用滞后的反馈把机械臂拉回去。
 
 手柄方向四元数使用同一锁存旋转变换到 JAKA base，再由 clutch 计算相对旋转。使用
-`--teleop.lock_pose=true` 时，接合瞬间的实测 TCP roll/pitch/yaw 会被锁定，只跟随平移。
+`--teleop.lock_pose=true` 时，接合瞬间的实测 TCP roll/pitch/yaw 会作为姿态基准，手柄
+移动只控制平移。持续按住 squeeze 时，摇杆上下调节 pitch，左右调节 yaw；按住摇杆
+再左右推动可调节 roll。松开 squeeze 后停止姿态调节，下次接合会从新的实测 TCP 姿态
+重新开始，不会沿用上一次的姿态偏移。
+
+摇杆中心死区和满量程角速度可分别通过
+`--teleop.thumbstick_deadband`（默认 `0.15`）与
+`--teleop.thumbstick_angular_speed_rad_s`（默认 `0.5` rad/s）调整。
 
 ## 静态兼容模式
 

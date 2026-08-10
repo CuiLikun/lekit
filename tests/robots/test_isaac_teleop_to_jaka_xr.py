@@ -386,6 +386,91 @@ def test_lock_pose_holds_measured_orientation_while_translation_follows_controll
     )
 
 
+def test_thumbstick_trims_locked_tcp_orientation_without_center_drift(monkeypatch):
+    xr = _xr_module()
+    measured_pose = {
+        "ee.x": 0.4,
+        "ee.y": -0.1,
+        "ee.z": 0.3,
+        "ee.roll": 0.1,
+        "ee.pitch": -0.2,
+        "ee.yaw": 0.3,
+    }
+    actions = iter(
+        [
+            {"thumbstick_x": 0.0, "thumbstick_y": 0.0, "thumbstick_click": 0.0},
+            {"thumbstick_x": 1.0, "thumbstick_y": 1.0, "thumbstick_click": 0.0},
+            {"thumbstick_x": 1.0, "thumbstick_y": 0.0, "thumbstick_click": 1.0},
+            {"thumbstick_x": 0.1, "thumbstick_y": -0.1, "thumbstick_click": 0.0},
+        ]
+    )
+
+    class FakeTeleop:
+        def __init__(self, _config):
+            self.is_connected = False
+
+        def connect(self):
+            self.is_connected = True
+
+        def get_action(self):
+            return {
+                "grip_pos": np.zeros(3),
+                "grip_quat": np.array([0.0, 0.0, 0.0, 1.0]),
+                "squeeze": 1.0,
+                "trigger": 0.0,
+                **next(actions),
+            }
+
+        def disconnect(self):
+            self.is_connected = False
+
+    class FakeRobot:
+        name = "jaka_robot"
+        is_connected = True
+
+        def get_eef_pose(self):
+            return tuple(
+                measured_pose[key]
+                for key in ("ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw")
+            )
+
+        def servo_enable(self, _enabled, *, representation="joints"):
+            pass
+
+    times = iter([10.0, 10.2, 10.3, 10.4])
+    monkeypatch.setattr(xr, "XRController", FakeTeleop)
+    monkeypatch.setattr(xr, "_wait_for_xr_controller", lambda _teleop: None)
+    monkeypatch.setattr(xr.time, "monotonic", lambda: next(times))
+    config = xr.XRControllerConfig(
+        lock_pose=True,
+        use_head_yaw=False,
+        thumbstick_deadband=0.15,
+        thumbstick_angular_speed_rad_s=0.5,
+    )
+    bundle = xr.make_xr_device(FakeRobot(), config)
+    bundle["startup"]()
+
+    origin = bundle["compute"](measured_pose)
+    pitch_yaw = bundle["compute"](measured_pose)
+    roll = bundle["compute"](measured_pose)
+    centered = bundle["compute"](measured_pose)
+
+    assert origin is not None and pitch_yaw is not None and roll is not None and centered is not None
+    assert [origin[f"ee.{axis}"] for axis in ("roll", "pitch", "yaw")] == pytest.approx(
+        [0.1, -0.2, 0.3]
+    )
+    # Elapsed time is capped at 0.1 s, so full deflection adds 0.05 rad per frame.
+    assert [pitch_yaw[f"ee.{axis}"] for axis in ("roll", "pitch", "yaw")] == pytest.approx(
+        [0.1, -0.15, 0.35]
+    )
+    assert [roll[f"ee.{axis}"] for axis in ("roll", "pitch", "yaw")] == pytest.approx(
+        [0.15, -0.15, 0.35]
+    )
+    assert [centered[f"ee.{axis}"] for axis in ("roll", "pitch", "yaw")] == pytest.approx(
+        [0.15, -0.15, 0.35]
+    )
+
+
 def test_stationary_xr_position_noise_does_not_change_cartesian_target(monkeypatch):
     xr = _xr_module()
     measured_pose = {
@@ -460,6 +545,21 @@ def test_lock_pose_requires_a_boolean():
         xr.XRControllerConfig(lock_pose=[0.0, 0.0, 0.0])
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"thumbstick_deadband": 1.0}, "thumbstick_deadband"),
+        ({"thumbstick_deadband": -0.1}, "thumbstick_deadband"),
+        ({"thumbstick_angular_speed_rad_s": 0.0}, "thumbstick_angular_speed_rad_s"),
+    ],
+)
+def test_thumbstick_config_rejects_unsafe_values(kwargs, message):
+    xr = _xr_module()
+
+    with pytest.raises(ValueError, match=message):
+        xr.XRControllerConfig(**kwargs)
+
+
 def test_xr_controller_discards_invalid_grip_pose():
     """An enumerated controller with an invalid grip pose must not command the robot."""
     xr = _xr_module()
@@ -491,6 +591,9 @@ def test_xr_controller_discards_invalid_grip_pose():
     assert action["trigger"] == 0.0
     assert action["a_button"] == 0.0
     assert action["b_button"] == 0.0
+    assert action["thumbstick_x"] == 0.0
+    assert action["thumbstick_y"] == 0.0
+    assert action["thumbstick_click"] == 0.0
 
 
 def test_xr_controller_reports_raw_and_transformed_grip_pose():
@@ -511,6 +614,9 @@ def test_xr_controller_reports_raw_and_transformed_grip_pose():
                 xr.ControllerInputIndex.TRIGGER_VALUE: 0.25,
                 xr.ControllerInputIndex.PRIMARY_CLICK: 1.0,
                 xr.ControllerInputIndex.SECONDARY_CLICK: 0.5,
+                xr.ControllerInputIndex.THUMBSTICK_X: -0.75,
+                xr.ControllerInputIndex.THUMBSTICK_Y: 0.6,
+                xr.ControllerInputIndex.THUMBSTICK_CLICK: 1.0,
             }
             return values[index]
 
@@ -543,6 +649,9 @@ def test_xr_controller_reports_raw_and_transformed_grip_pose():
     assert action["head_is_tracking"] is True
     assert action["a_button"] == 1.0
     assert action["b_button"] == 0.5
+    assert action["thumbstick_x"] == pytest.approx(-0.75)
+    assert action["thumbstick_y"] == pytest.approx(0.6)
+    assert action["thumbstick_click"] == 1.0
 
 
 def test_rpy_conversion_preserves_a_near_gimbal_lock_reference():
