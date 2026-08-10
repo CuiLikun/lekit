@@ -181,18 +181,12 @@ def _send_action_for_clutch_state(
 
     if robot.is_in_servo():
         robot.servo_enable(False)
-    gripper_action = (
-        {"gripper.pos": action["gripper.pos"]} if "gripper.pos" in action else None
-    )
+    gripper_action = {"gripper.pos": action["gripper.pos"]} if "gripper.pos" in action else None
     if gripper_action is not None:
         robot.send_action(gripper_action)
 
     held = (
-        {
-            key: float(observation[key])
-            for key in robot.action_features
-            if key in observation
-        }
+        {key: float(observation[key]) for key in robot.action_features if key in observation}
         if observation is not None
         else {}
     )
@@ -320,9 +314,7 @@ def build_device(cfg: "RecordConfig") -> tuple[JakaRobot, Device]:
     if cfg.robot.servo_filter_mode == "none":
         cfg.robot.servo_filter_mode = "cartesian_nlf"
     elif cfg.robot.servo_filter_mode != "cartesian_nlf":
-        raise ValueError(
-            "isaac_teleop_to_jaka.record requires cartesian_nlf for Cartesian Servo P control"
-        )
+        raise ValueError("isaac_teleop_to_jaka.record requires cartesian_nlf for Cartesian Servo P control")
 
     driver_module = sys.modules[JakaRobot.__module__]
     logging.info(
@@ -468,7 +460,24 @@ def _control_panel(
             robot_status.get("control_target_hz"),
         )
     )
-    table.add_row("Mode", mode)
+    episode_number = robot_status.get("episode_number")
+    episode_total = robot_status.get("episode_total")
+    episode_elapsed_s = robot_status.get("episode_elapsed_s")
+    if (
+        isinstance(episode_number, int)
+        and isinstance(episode_total, int)
+        and isinstance(episode_elapsed_s, (int, float))
+    ):
+        if robot_status.get("recording", False):
+            table.add_row(
+                "Episode",
+                f"{episode_number} / {episode_total}   {float(episode_elapsed_s):.1f} s",
+            )
+        else:
+            table.add_row(
+                "Reset",
+                f"after {episode_number} / {episode_total}   {float(episode_elapsed_s):.1f} s",
+            )
     table.add_row("Robot", _jaka_status_line(robot_status))
 
     position = {axis: action[f"ee.{axis}"] for axis in ("x", "y", "z") if f"ee.{axis}" in action}
@@ -497,11 +506,7 @@ def _control_panel(
                 _signed_horizontal_bar(delta, DELTA_POSITION_BAR_SPAN_M),
             )
 
-    return Panel(
-        table,
-        title="[bold cyan]JAKA Teleop[/bold cyan]",
-        border_style="cyan",
-    )
+    return Panel(table, title="JAKA Teleop", subtitle=mode)
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -537,6 +542,8 @@ def _record_loop(
     single_task: str | None = None,
     gripper_toggle: TriggerGripperToggle | None = None,
     control_trace: ControlTraceWriter | None = None,
+    episode_number: int | None = None,
+    episode_total: int | None = None,
 ) -> None:
     """Run one episode or reset phase of the Cartesian control loop.
 
@@ -607,6 +614,10 @@ def _record_loop(
             next_status_refresh_at = loop_start + 1.0
         robot_status["control_rate_hz"] = control_rate_hz
         robot_status["control_target_hz"] = float(fps)
+        robot_status["episode_number"] = episode_number
+        robot_status["episode_total"] = episode_total
+        robot_status["episode_elapsed_s"] = loop_start - start_t
+        robot_status["recording"] = record_frames
 
         if record_frames:
             action_frame = build_dataset_frame(dataset.features, sent_action, prefix=ACTION)
@@ -737,12 +748,16 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             loop_kwargs["live"] = live
             loop_kwargs["control_trace"] = control_trace
             recorded_episodes = 0
+            episode_total = dataset.num_episodes + cfg.dataset.num_episodes
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 logging.info(f"Recording episode {dataset.num_episodes}")
+                episode_number = dataset.num_episodes + 1
                 _record_loop(
                     **loop_kwargs,
                     dataset=dataset,
                     control_time_s=cfg.dataset.episode_time_s,
+                    episode_number=episode_number,
+                    episode_total=episode_total,
                 )
 
                 # ESC/q tears down the arm from the keyboard thread. Do not reset the
@@ -760,6 +775,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         **loop_kwargs,
                         dataset=None,
                         control_time_s=cfg.dataset.reset_time_s,
+                        episode_number=episode_number,
+                        episode_total=episode_total,
                     )
 
                 if events["rerecord_episode"]:

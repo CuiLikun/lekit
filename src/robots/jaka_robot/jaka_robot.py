@@ -237,6 +237,7 @@ class JakaRobotConfig(RobotConfig):
     ip: str = "192.168.1.31"
     type: str = "jaka_robot"
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
+    reset_joints: list[float] | None = None
 
     auto_power_on: bool = True
     auto_enable: bool = True

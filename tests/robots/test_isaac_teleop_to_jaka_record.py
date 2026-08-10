@@ -216,13 +216,19 @@ def test_control_panel_visualizes_only_position_delta(monkeypatch):
                 "servo_rate_hz": 100.0,
                 "control_rate_hz": 29.8,
                 "control_target_hz": 30.0,
+                "episode_number": 2,
+                "episode_total": 5,
+                "episode_elapsed_s": 12.36,
+                "recording": True,
             },
         )
     )
 
     rendered = output.getvalue()
     assert "JAKA Teleop" in rendered
-    assert "Mode" in rendered and "ENGAGED" in rendered
+    assert "Mode" not in rendered
+    assert "ENGAGED" in rendered
+    assert "Episode" in rendered and "2 / 5   12.4 s" in rendered
     assert "TCP(m/rad)" in rendered
     assert "[0.080, 0.230, 0.310, 0.100, 0.200, 0.300]" in rendered
     assert "Joint(rad)" in rendered
