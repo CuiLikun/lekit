@@ -232,7 +232,7 @@ class XRControllerConfig(IsaacTeleopConfig):
     servo_linear_acceleration_m_s2: float = 0.8
     """Maximum linear Servo P acceleration used by the teleoperation profile."""
 
-    servo_linear_jerk_m_s3: float = 8.0
+    servo_linear_jerk_m_s3: float = 1.0
     """Cartesian NLF linear jerk used by the teleoperation profile."""
 
     servo_angular_velocity_rad_s: float = 1.0
@@ -241,7 +241,7 @@ class XRControllerConfig(IsaacTeleopConfig):
     servo_angular_acceleration_rad_s2: float = 2.0
     """Maximum angular Servo P acceleration used by the teleoperation profile."""
 
-    servo_angular_jerk_rad_s3: float = 20.0
+    servo_angular_jerk_rad_s3: float = 8.0
     """Cartesian NLF angular jerk used by the teleoperation profile."""
 
     base_T_anchor: list[list[float]] | None = field(default=None)  # noqa: N815
@@ -773,6 +773,7 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
         enabled = requested_enabled and (
             not teleop_config.use_head_yaw or latched_base_t_anchor is not None
         )
+        is_release_frame = not enabled and prev_enabled
         if teleop_config.use_head_yaw and latched_base_t_anchor is not None:
             grip_pos, grip_quat = _transform_grip_pose(
                 raw_grip_pos, raw_grip_quat, latched_base_t_anchor
@@ -796,6 +797,7 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
             squeeze=squeeze,
             trigger=trigger,
             clutch_engaged=enabled,
+            clutch_released=is_release_frame,
         )
 
         # On the engage edge, latch the clutch home at the arm's MEASURED EE pose so

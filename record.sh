@@ -1,11 +1,10 @@
 #!/bin/bash
     # --robot.cameras="{ hand: {type: intelrealsense, serial_number_or_name: '342522070741', width: 640, height: 480, fps: 30}}" \
 
-python -m examples.isaac_teleop_to_jaka.record \
+uv run python -m examples.isaac_teleop_to_jaka.record \
     --robot.type=jaka_robot \
     --robot.ip=192.168.1.31 \
     --robot.id=jaka_arm \
-    --robot.servo_step_num=4 \
     --teleop.type=xr_controller \
     --teleop.lock_pose=True \
     --teleop.use_head_yaw=True \
@@ -17,4 +16,5 @@ python -m examples.isaac_teleop_to_jaka.record \
     --dataset.episode_time_s=9999 \
     --dataset.reset_time_s=5 \
     --dataset.streaming_encoding=True \
-    --dataset.push_to_hub=False
+    --dataset.push_to_hub=False \
+    "$@"

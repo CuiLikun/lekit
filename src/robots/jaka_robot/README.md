@@ -106,6 +106,13 @@ uv run python -m robots.jaka_robot.servo_p_debug \
 The diagnostic checks the filter call's SDK return code and restores no-filter
 mode during cleanup.
 
+When `servo_filter_mode="cartesian_nlf"`, the managed sender forwards the latest
+Cartesian target directly at 8 ms intervals. The controller-side NLF is the only
+velocity/acceleration/jerk trajectory filter; applying the same profile on the
+host would double the lag. JAKA documents Cartesian NLF translation in mm units,
+orientation in degrees, and recommends keeping linear jerk below 5000 mm/s^3 to
+avoid persistent motion around a fixed target.
+
 Add `--power-on --enable` only when the controller is not already ready. By
 default, states changed by the script are restored after the test. The script
 always exits Servo Move in `finally`, aborts when queue depth reaches 80 or

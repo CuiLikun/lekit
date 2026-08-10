@@ -121,7 +121,7 @@ python -m isaacteleop.cloudxr --accept-eula
 运行示例：
 
 ```bash
-python -m examples.isaac_teleop_to_jaka.record \
+uv run python -m examples.isaac_teleop_to_jaka.record \
     --robot.type=jaka_robot \
     --robot.ip=192.168.1.31 \
     --robot.id=jaka_arm \
@@ -143,9 +143,16 @@ python -m examples.isaac_teleop_to_jaka.record \
 
 ## 响应速度
 
-XR 默认线速度、加速度和 jerk 分别为 `0.15 m/s`、`0.8 m/s^2`、`8 m/s^3`。JAKA
-驱动以约 8 ms 周期插值并发送 Servo P。此前低速验证使用的 `0.02 m/s` 会使 15 cm 动作
-需要约 7.5 秒，它只适合方向确认，不代表正常遥操延迟。
+XR 默认线速度、加速度和 jerk 分别为 `0.15 m/s`、`0.8 m/s^2`、`1 m/s^3`。主机以
+8 ms 周期把最新目标持续发送给 Servo P；启用 `cartesian_nlf` 时，速度、加速度和 jerk
+只由 JAKA 控制器限制，主机不再重复插值。此前低速验证使用的 `0.02 m/s` 会使 15 cm
+动作需要约 7.5 秒，它只适合方向确认，不代表正常遥操延迟。
+
+JAKA 官方说明 Cartesian NLF 是积分式在线 S 曲线规划器，参数过大会在目标附近持续小幅
+波动，并建议线性 jerk 小于 `5000 mm/s^3`。A5 默认配置使用 `1 m/s^3`，即
+`1000 mm/s^3`；不要为了追求跟手直接把它调回 `8 m/s^3`。应先提高线速度或加速度，并
+通过 control trace 检查实际跟踪误差。松开 squeeze 时，程序会用该帧实测 TCP 替换尚未
+完成的目标；控制器内部 NLF 仍可能需要短暂减速，不能将其视为物理急停。
 
 不要先关闭 `cartesian_nlf` 来解决迟滞。该滤波器用于抑制固定目标附近的 Servo P 抖动；
 应先通过以下参数调整速度轮廓：
@@ -165,8 +172,8 @@ teleop.servo_linear_jerk_m_s3
 ```
 
 CSV 包含原始/转换后手柄位置、头显四元数、头显跟踪状态、clutch 锁存 yaw、
-requested/applied/actual TCP、内部 Servo target/commanded position、循环时间、发送频率和
-queue depth。方向问题应先比较原始手柄、锁存 yaw 与 requested TCP；速度问题应比较
+release edge、requested/applied/actual TCP、内部 Servo target/commanded position、循环时间、
+发送频率和 queue depth。方向问题应先比较原始手柄、锁存 yaw 与 requested TCP；速度问题应比较
 requested、applied、commanded 和 actual，避免把输入限幅误判为机器人延迟。
 
 ## 安全

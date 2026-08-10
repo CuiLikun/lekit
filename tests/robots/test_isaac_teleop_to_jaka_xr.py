@@ -47,6 +47,14 @@ def test_operator_yaw_generates_requested_transform():
     assert rotation @ np.array([np.cos(yaw), 0.0, np.sin(yaw)]) == pytest.approx([1.0, 0.0, 0.0])
 
 
+def test_default_cartesian_nlf_jerk_uses_a5_stable_profile():
+    xr = _xr_module()
+
+    config = xr.XRControllerConfig()
+    assert config.servo_linear_jerk_m_s3 == 1.0
+    assert config.servo_angular_jerk_rad_s3 == 8.0
+
+
 def test_static_calibration_decouples_captured_horizontal_motion():
     """Replay the right/forward vectors captured from the physical XR workstation."""
     xr = _xr_module()
@@ -208,7 +216,9 @@ def test_head_relative_mapping_tracks_operator_heading_at_each_engage(monkeypatc
     origin_facing_anchor = bundle["compute"](home)
     forward_facing_anchor = bundle["compute"](home)
     assert bundle["compute"](home) is None
+    assert bundle["telemetry"]["clutch_released"] is True
     origin_after_turn = bundle["compute"](home)
+    assert bundle["telemetry"]["clutch_released"] is False
     forward_after_turn = bundle["compute"](home)
 
     assert all(

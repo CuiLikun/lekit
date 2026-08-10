@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -48,6 +48,7 @@ COORD_BASE, COORD_JOINT, COORD_TOOL = 0, 1, 2
 IO_CABINET, IO_TOOL, IO_EXTEND = 0, 1, 2
 PLANNER_DISABLED, PLANNER_T, PLANNER_S = -1, 0, 1
 SERVO_CYCLE_S = 0.008
+SERVO_SPIN_THRESHOLD_S = 0.0005
 DEFAULT_SERVO_STEP_NUM = 1
 SERVO_QUEUE_MAX = 100
 
@@ -146,6 +147,29 @@ def _approach_vector(current: np.ndarray, target: np.ndarray, max_delta: float) 
     if distance <= max_delta or distance == 0.0:
         return target.copy()
     return current + delta * (max_delta / distance)
+
+
+def _wait_for_servo_deadline(
+    deadline: float,
+    *,
+    stop: threading.Event,
+    clock: Callable[[], float] = time.monotonic,
+    spin_threshold_s: float = SERVO_SPIN_THRESHOLD_S,
+) -> bool:
+    """Wait until one Servo deadline; return false when shutdown is requested."""
+
+    while True:
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return not stop.is_set()
+        if remaining > spin_threshold_s:
+            if stop.wait(remaining - spin_threshold_s):
+                return False
+            continue
+        while clock() < deadline:
+            if stop.is_set():
+                return False
+        return not stop.is_set()
 
 
 def _euler_to_quaternion(rpy: np.ndarray) -> np.ndarray:
@@ -550,15 +574,15 @@ class JakaRobot(Robot):
                 )
                 self._call("servo_move_use_joint_NLF", result)
             elif mode == "cartesian_nlf":
-                # JAKA's Cartesian filter takes linear values in mm-based SDK units;
-                # the LeRobot-facing config stores metres.
+                # JAKA's Cartesian NLF uses mm for translation and degrees for
+                # orientation; the LeRobot-facing config uses metres and radians.
                 result = self.rc.servo_move_use_carte_NLF(
                     self.config.servo_eef_max_velocity_m_s * 1000.0,
                     self.config.servo_eef_max_acceleration_m_s2 * 1000.0,
                     self.config.servo_filter_eef_max_jerk_m_s3 * 1000.0,
-                    self.config.servo_eef_max_angular_velocity_rad_s,
-                    self.config.servo_eef_max_angular_acceleration_rad_s2,
-                    self.config.servo_filter_eef_max_angular_jerk_rad_s3,
+                    math.degrees(self.config.servo_eef_max_angular_velocity_rad_s),
+                    math.degrees(self.config.servo_eef_max_angular_acceleration_rad_s2),
+                    math.degrees(self.config.servo_filter_eef_max_angular_jerk_rad_s3),
                 )
                 self._call("servo_move_use_carte_NLF", result)
 
@@ -1188,14 +1212,33 @@ class JakaRobot(Robot):
             self._servo_target = target
             self._servo_target_updated_at = time.monotonic()
 
+    def cancel_eef_motion(self, measured_pose: Any) -> None:
+        """Cancel pending Cartesian motion at a measured TCP pose.
+
+        This replaces both sides of the host-side Servo state so the next frame
+        is sent directly at the measured pose instead of being clamped relative
+        to an older hand target. The controller may still need time to decelerate
+        its internal Cartesian NLF trajectory.
+        """
+
+        measured = _vector(measured_pose, name="measured TCP pose").copy()
+        with self._servo_state_lock:
+            if not self._servo_active or self._servo_representation != "eef":
+                raise RuntimeError("Cartesian Servo Move must be active to cancel EEF motion.")
+            self._servo_target = measured.copy()
+            self._servo_commanded_position = measured.copy()
+            self._servo_target_updated_at = time.monotonic()
+            self._servo_linear_velocity.fill(0.0)
+            self._servo_angular_speed = 0.0
+            self._last_eef_target = measured.copy()
+
     def _servo_worker(self) -> None:
         period_s = SERVO_CYCLE_S
         deadline = time.monotonic()
         last_frame_at: float | None = None
         try:
             while not self._servo_stop.is_set():
-                wait_s = deadline - time.monotonic()
-                if wait_s > 0 and self._servo_stop.wait(wait_s):
+                if not _wait_for_servo_deadline(deadline, stop=self._servo_stop):
                     return
                 frame_at = time.monotonic()
                 if last_frame_at is not None:
@@ -1274,6 +1317,16 @@ class JakaRobot(Robot):
 
     def _step_servo_eef(self, period_s: float) -> np.ndarray:
         assert self._servo_commanded_position is not None and self._servo_target is not None
+
+        if self.config.servo_filter_mode == "cartesian_nlf":
+            # The controller-side NLF already applies Cartesian velocity,
+            # acceleration, and jerk limits. Interpolating the same target here
+            # applies the motion profile twice and creates substantial teleop lag.
+            self._servo_commanded_position = self._servo_target.copy()
+            self._servo_linear_velocity.fill(0.0)
+            self._servo_angular_speed = 0.0
+            return self._servo_commanded_position.copy()
+
         commanded = self._servo_commanded_position.copy()
 
         translation_error = self._servo_target[:3] - commanded[:3]

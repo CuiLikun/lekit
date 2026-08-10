@@ -27,7 +27,7 @@ def test_trigger_gripper_toggle_changes_state_only_on_press_edges(monkeypatch):
     assert toggle.apply(action, observation, 0.8)["gripper.pos"] == 0.0
 
 
-def test_hold_latch_keeps_last_command_on_engage_release(monkeypatch):
+def test_hold_latch_captures_measured_pose_on_engage_release(monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
     record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
     latch = record_module.HoldLatch(["ee.x", "ee.y", "ee.z"])
@@ -36,9 +36,10 @@ def test_hold_latch_keeps_last_command_on_engage_release(monkeypatch):
 
     assert latch.resolve(None, measured) == measured
     assert latch.resolve(commanded, measured) == commanded
-    # Feedback is still lagging at the release edge; the commanded target must hold.
+    # Releasing the deadman cancels any pending controller trajectory at the
+    # measured pose instead of continuing toward the old hand target.
     lagging_feedback = {"ee.x": 0.24, "ee.y": 0.20, "ee.z": 0.30}
-    assert latch.resolve(None, lagging_feedback) == commanded
+    assert latch.resolve(None, lagging_feedback) == lagging_feedback
 
 
 def test_dataset_features_are_lerobot_metadata_compatible(tmp_path):
@@ -208,6 +209,7 @@ def test_control_trace_records_disengaged_hold_and_servo_targets(monkeypatch, tm
                 observation={**target, "ee.x": actual_x},
                 telemetry={
                     "clutch_engaged": False,
+                    "clutch_released": True,
                     "squeeze": 0.0,
                     "trigger": 0.0,
                     "grip_pos": (0.1, 0.2, 0.3),
@@ -234,6 +236,7 @@ def test_control_trace_records_disengaged_hold_and_servo_targets(monkeypatch, tm
     assert len(rows) == 2
     assert rows[1]["action_source"] == "hold"
     assert rows[1]["clutch_engaged"] == "False"
+    assert rows[1]["clutch_released"] == "True"
     assert float(rows[1]["target_step_norm_m"]) == 0.0
     assert float(rows[1]["tracking_error_x"]) == pytest.approx(0.0001)
     assert float(rows[1]["servo_target_x"]) == pytest.approx(0.4)

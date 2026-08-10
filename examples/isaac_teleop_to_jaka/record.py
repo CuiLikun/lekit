@@ -22,12 +22,11 @@ the JAKA SDK ``servo_p`` Cartesian Servo Move. No host-side inverse kinematics.
 
 Usage:
 
-python -m examples.isaac_teleop_to_jaka.record \
+uv run python -m examples.isaac_teleop_to_jaka.record \
     --robot.type=jaka_robot \
     --robot.ip=192.168.1.31 \
     --robot.id=jaka_arm \
     --robot.cameras="{ hand: {type: intelrealsense, serial_number_or_name: '342522070741', width: 640, height: 480, fps: 30}}" \
-    --robot.servo_step_num=4 \
     --teleop.type=xr_controller \
     --teleop.lock_pose="[0.0, 0.0, 0.0]" \
     --teleop.use_head_yaw=true \
@@ -95,30 +94,22 @@ DELTA_POSITION_DISPLAY_DEADBAND_M = 0.0002
 
 
 class HoldLatch:
-    """Hold the last commanded action while the device is idle.
+    """Hold the measured pose captured on the first idle frame.
 
-    The first idle frame has no prior command, so it is initialized from measured
-    feedback. Once control has started, however, the last command is the stable
-    hold target. Re-reading feedback at the engage-release edge would replace a
-    still-tracking target with the lagging measured pose and make the arm visibly
-    retract.
+    Capturing feedback at the deadman release edge prevents the controller from
+    continuing toward a hand target that the arm has not reached yet.
     """
 
     def __init__(self, action_keys: list[str]):
         self._action_keys = action_keys
-        self._last_action: dict[str, float] | None = None
         self._held: dict[str, float] | None = None
 
     def resolve(self, action: dict | None, obs: dict) -> dict:
         if action is not None:
-            self._last_action = dict(action)
             self._held = None
-            return self._last_action
+            return dict(action)
         if self._held is None:
-            if self._last_action is not None:
-                self._held = dict(self._last_action)
-            else:
-                self._held = {k: float(obs[k]) for k in self._action_keys if k in obs}
+            self._held = {k: float(obs[k]) for k in self._action_keys if k in obs}
         return self._held
 
 
@@ -270,6 +261,16 @@ def build_device(cfg: "RecordConfig") -> tuple[JakaRobot, Device]:
         raise ValueError(
             "isaac_teleop_to_jaka.record requires cartesian_nlf for Cartesian Servo P control"
         )
+
+    driver_module = sys.modules[JakaRobot.__module__]
+    logging.info(
+        "[JAKA-SERVO] driver=%s filter=%s linear(v=%.3f m/s, a=%.3f m/s^2, j=%.3f m/s^3) ",
+        Path(driver_module.__file__).resolve(),
+        cfg.robot.servo_filter_mode,
+        getattr(cfg.robot, "servo_eef_max_velocity_m_s", math.nan),
+        getattr(cfg.robot, "servo_eef_max_acceleration_m_s2", math.nan),
+        getattr(cfg.robot, "servo_filter_eef_max_jerk_m_s3", math.nan),
+    )
 
     robot = make_robot_from_config(cfg.robot)
     robot.connect()
@@ -516,6 +517,9 @@ def _record_loop(
             if events["stop_recording"]:
                 break
             raise
+        if device.telemetry.get("clutch_released"):
+            eef_keys = ("ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw")
+            robot.cancel_eef_motion([float(obs[key]) for key in eef_keys])
         action = gripper_toggle.apply(
             hold.resolve(raw, obs),
             obs,

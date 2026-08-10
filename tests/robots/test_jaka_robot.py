@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import math
 import threading
 import time
 
+import numpy as np
 import pytest
 
 from robots.jaka_robot import jaka_robot as driver
@@ -122,6 +124,35 @@ def servo_calls(rc: FakeRC, operation: str) -> list[tuple]:
     return [call for call in rc.calls if call[0] == operation]
 
 
+def test_servo_deadline_wait_reserves_a_short_precision_window():
+    now = [0.0]
+    waits: list[float] = []
+
+    def clock() -> float:
+        now[0] += 0.0001
+        return now[0]
+
+    class FakeStop:
+        def wait(self, duration: float) -> bool:
+            waits.append(duration)
+            now[0] += duration
+            return False
+
+        def is_set(self) -> bool:
+            return False
+
+    completed = driver._wait_for_servo_deadline(
+        0.008,
+        stop=FakeStop(),
+        clock=clock,
+        spin_threshold_s=0.0005,
+    )
+
+    assert completed is True
+    assert waits == pytest.approx([0.0074])
+    assert now[0] >= 0.008
+
+
 @pytest.fixture
 def robot(monkeypatch):
     rc = FakeRC()
@@ -201,9 +232,63 @@ def test_cartesian_servo_filter_uses_sdk_units(monkeypatch):
     arm.connect()
     try:
         calls = servo_calls(rc, "servo_move_use_carte_NLF")
-        assert calls == [("servo_move_use_carte_NLF", 50.0, 200.0, 1500.0, 0.5, 1.0, 2.5)]
+        assert calls == [
+            (
+                "servo_move_use_carte_NLF",
+                50.0,
+                200.0,
+                1500.0,
+                math.degrees(0.5),
+                math.degrees(1.0),
+                math.degrees(2.5),
+            )
+        ]
     finally:
         arm.disconnect()
+
+
+def test_cartesian_nlf_is_the_only_eef_trajectory_filter():
+    arm = driver.JakaRobot(
+        driver.JakaRobotConfig(
+            ip="10.0.0.2",
+            servo_filter_mode="cartesian_nlf",
+            servo_eef_max_velocity_m_s=0.15,
+            servo_eef_max_acceleration_m_s2=0.8,
+        )
+    )
+    initial = np.array([0.1, 0.2, 0.3, 0.1, 0.2, 0.3])
+    target = np.array([0.13, 0.2, 0.3, 0.2, 0.2, 0.3])
+    arm._servo_commanded_position = initial.copy()
+    arm._servo_target = target.copy()
+    arm._servo_linear_velocity.fill(0.0)
+    arm._servo_angular_speed = 0.0
+
+    frame = arm._step_servo_eef(driver.SERVO_CYCLE_S)
+
+    # The controller-side NLF already enforces velocity, acceleration, and jerk.
+    # Host interpolation here would apply those limits twice and add large lag.
+    assert frame == pytest.approx(target)
+
+
+def test_cancel_eef_motion_replaces_pending_target_with_measured_pose():
+    arm = driver.JakaRobot(driver.JakaRobotConfig(ip="10.0.0.2"))
+    pending = np.array([0.3, 0.2, 0.3, 0.2, 0.2, 0.3])
+    measured = np.array([0.24, 0.2, 0.3, 0.1, 0.2, 0.3])
+    arm._servo_active = True
+    arm._servo_representation = "eef"
+    arm._servo_target = pending.copy()
+    arm._servo_commanded_position = pending.copy()
+    arm._last_eef_target = pending.copy()
+    arm._servo_linear_velocity[:] = 0.1
+    arm._servo_angular_speed = 0.2
+
+    arm.cancel_eef_motion(measured)
+
+    assert arm._servo_target == pytest.approx(measured)
+    assert arm._servo_commanded_position == pytest.approx(measured)
+    assert arm._last_eef_target == pytest.approx(measured)
+    assert arm._servo_linear_velocity == pytest.approx(np.zeros(3))
+    assert arm._servo_angular_speed == 0.0
 
 
 def test_recent_observation_is_reused_by_eef_action(robot):
