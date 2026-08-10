@@ -47,11 +47,12 @@ def test_operator_yaw_generates_requested_transform():
     assert rotation @ np.array([np.cos(yaw), 0.0, np.sin(yaw)]) == pytest.approx([1.0, 0.0, 0.0])
 
 
-def test_default_cartesian_nlf_jerk_uses_a5_stable_profile():
+def test_default_cartesian_nlf_uses_a5_balanced_profile():
     xr = _xr_module()
 
     config = xr.XRControllerConfig()
-    assert config.servo_linear_jerk_m_s3 == 1.0
+    assert config.servo_linear_velocity_m_s == 0.2
+    assert config.servo_linear_jerk_m_s3 == 3.0
     assert config.servo_angular_jerk_rad_s3 == 8.0
 
 

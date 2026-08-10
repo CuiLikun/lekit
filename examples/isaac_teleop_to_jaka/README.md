@@ -143,14 +143,14 @@ uv run python -m examples.isaac_teleop_to_jaka.record \
 
 ## 响应速度
 
-XR 默认线速度、加速度和 jerk 分别为 `0.15 m/s`、`0.8 m/s^2`、`1 m/s^3`。主机以
+XR 默认线速度、加速度和 jerk 分别为 `0.20 m/s`、`0.8 m/s^2`、`3 m/s^3`。主机以
 8 ms 周期把最新目标持续发送给 Servo P；启用 `cartesian_nlf` 时，速度、加速度和 jerk
 只由 JAKA 控制器限制，主机不再重复插值。此前低速验证使用的 `0.02 m/s` 会使 15 cm
 动作需要约 7.5 秒，它只适合方向确认，不代表正常遥操延迟。
 
 JAKA 官方说明 Cartesian NLF 是积分式在线 S 曲线规划器，参数过大会在目标附近持续小幅
-波动，并建议线性 jerk 小于 `5000 mm/s^3`。A5 默认配置使用 `1 m/s^3`，即
-`1000 mm/s^3`；不要为了追求跟手直接把它调回 `8 m/s^3`。应先提高线速度或加速度，并
+波动，并建议线性 jerk 小于 `5000 mm/s^3`。A5 默认配置使用 `3 m/s^3`，即
+`3000 mm/s^3`；不要为了追求跟手直接把它调回 `8 m/s^3`。应先提高线速度或加速度，并
 通过 control trace 检查实际跟踪误差。Servo Move 只在 squeeze engage 期间启用；松开时
 程序退出 Servo Move，避免 Cartesian NLF 继续积分尚未完成的目标。控制器仍可能需要短暂
 减速，不能将其视为物理急停。

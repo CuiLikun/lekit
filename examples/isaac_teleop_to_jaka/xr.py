@@ -226,13 +226,13 @@ class XRControllerConfig(IsaacTeleopConfig):
     use_head_yaw: bool = True
     """Latch headset yaw on each clutch engage so translation follows operator heading."""
 
-    servo_linear_velocity_m_s: float = 0.15
+    servo_linear_velocity_m_s: float = 0.2
     """Maximum linear Servo P velocity used by the teleoperation profile."""
 
     servo_linear_acceleration_m_s2: float = 0.8
     """Maximum linear Servo P acceleration used by the teleoperation profile."""
 
-    servo_linear_jerk_m_s3: float = 1.0
+    servo_linear_jerk_m_s3: float = 3.0
     """Cartesian NLF linear jerk used by the teleoperation profile."""
 
     servo_angular_velocity_rad_s: float = 1.0
