@@ -22,6 +22,8 @@ _TRACE_FIELDS = (
     "squeeze",
     "trigger",
     "frame_ms",
+    "control_rate_hz",
+    "control_target_hz",
     *(f"grip_{axis}_m" for axis in ("x", "y", "z")),
     *(f"raw_grip_{axis}_m" for axis in ("x", "y", "z")),
     "head_is_tracking",
@@ -146,6 +148,8 @@ class ControlTraceWriter:
         telemetry: Mapping[str, Any],
         servo_status: Mapping[str, Any],
         frame_ms: float,
+        control_rate_hz: float | None,
+        control_target_hz: float,
     ) -> None:
         if self._writer is None or self._stream is None:
             raise RuntimeError("ControlTraceWriter must be entered before writing")
@@ -171,6 +175,8 @@ class ControlTraceWriter:
             "squeeze": _number(telemetry.get("squeeze")),
             "trigger": _number(telemetry.get("trigger")),
             "frame_ms": frame_ms,
+            "control_rate_hz": control_rate_hz,
+            "control_target_hz": control_target_hz,
             "grip_x_m": grip_pos[0],
             "grip_y_m": grip_pos[1],
             "grip_z_m": grip_pos[2],

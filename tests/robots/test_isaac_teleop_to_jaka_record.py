@@ -42,6 +42,21 @@ def test_hold_latch_captures_measured_pose_on_engage_release(monkeypatch):
     assert latch.resolve(None, lagging_feedback) == lagging_feedback
 
 
+def test_loop_rate_monitor_measures_a_rolling_wall_clock_window(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+    monitor = record_module.LoopRateMonitor(window_s=1.0)
+
+    assert monitor.update(10.0) is None
+    for index in range(1, 11):
+        measured = monitor.update(10.0 + index * 0.1)
+    assert measured == pytest.approx(10.0)
+
+    # Old samples leave the rolling window instead of diluting the current rate.
+    assert monitor.update(11.5) == pytest.approx(6.0)
+    assert monitor.update(12.0) == pytest.approx(2.0)
+
+
 def test_arm_servo_follows_clutch_lifecycle_and_preserves_hold_action(monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
     record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
@@ -126,7 +141,7 @@ def test_dataset_features_are_lerobot_metadata_compatible(tmp_path):
     assert features.items() <= metadata.features.items()
 
 
-def test_control_panel_calls_pass_frame_duration():
+def test_control_panel_calls_use_compact_signature():
     source_path = Path(__file__).parents[2] / "examples/isaac_teleop_to_jaka/record.py"
     tree = ast.parse(source_path.read_text())
     calls = [
@@ -138,7 +153,7 @@ def test_control_panel_calls_pass_frame_duration():
     ]
 
     assert calls
-    assert all(len(call.args) == 5 for call in calls)
+    assert all(len(call.args) == 4 for call in calls)
 
 
 def test_signed_horizontal_bar_has_stable_width_and_direction(monkeypatch):
@@ -163,20 +178,69 @@ def test_control_panel_visualizes_only_position_delta(monkeypatch):
 
     console.print(
         record_module._control_panel(
-            {},
-            {"ee.x": 0.1, "ee.y": 0.2, "ee.z": 0.3},
-            {"ee.x": 0.08, "ee.y": 0.23, "ee.z": 0.31},
-            {},
-            8.0,
+            {
+                "clutch_engaged": True,
+                "head_is_tracking": True,
+                "grip_pos": (0.1, 0.2, 0.3),
+                "grip_quat": (0.0, 0.0, 0.0, 1.0),
+                "squeeze": 1.0,
+                "trigger": 0.5,
+            },
+            {
+                "ee.x": 0.1,
+                "ee.y": 0.2,
+                "ee.z": 0.3,
+                "ee.roll": 0.1,
+                "ee.pitch": 0.2,
+                "ee.yaw": 0.3,
+            },
+            {
+                "ee.x": 0.08,
+                "ee.y": 0.23,
+                "ee.z": 0.31,
+                "ee.roll": 0.1,
+                "ee.pitch": 0.2,
+                "ee.yaw": 0.3,
+                "gripper.pos": 1.0,
+                "joint_1.pos": 0.12349,
+                "joint_2.pos": -1.23456,
+                "joint_3.pos": 2.34567,
+                "joint_4.pos": -3.14159,
+                "joint_5.pos": 0.0004,
+                "joint_6.pos": -0.0006,
+            },
+            {
+                "powered_on": True,
+                "enabled": True,
+                "servo_on": True,
+                "servo_rate_hz": 100.0,
+                "control_rate_hz": 29.8,
+                "control_target_hz": 30.0,
+            },
         )
     )
 
     rendered = output.getvalue()
-    assert "delta.position_m" in rendered
-    assert "X -0.0200 m" in rendered
-    assert "Y +0.0300 m" in rendered
-    assert "Z +0.0100 m" in rendered
+    assert "JAKA Teleop" in rendered
+    assert "Mode" in rendered and "ENGAGED" in rendered
+    assert "TCP(m/rad)" in rendered
+    assert "[0.080, 0.230, 0.310, 0.100, 0.200, 0.300]" in rendered
+    assert "Joint(rad)" in rendered
+    assert "[0.123, -1.235, 2.346, -3.142, 0.000, -0.001]" in rendered
+    assert "Grip" in rendered
+    assert "Error" in rendered
+    assert "LOOP" in rendered and "29.8 / 30.0 Hz" in rendered
+    assert "X -20.0 mm" in rendered
+    assert "Y +30.0 mm" in rendered
+    assert "Z +10.0 mm" in rendered
     assert "XYZ movement" not in rendered
+    assert "grip_pos" not in rendered
+    assert "grip_quat" not in rendered
+    assert "squeeze" not in rendered
+    assert "trigger" not in rendered
+    assert "orientation" not in rendered
+    assert "panel:" not in rendered
+    assert "frame:" not in rendered
     assert "█" in rendered
 
 
@@ -192,14 +256,13 @@ def test_control_panel_deadbands_submillimetre_feedback_noise(monkeypatch):
             {"ee.x": 0.1, "ee.y": 0.2, "ee.z": 0.3},
             {"ee.x": 0.1001, "ee.y": 0.1999, "ee.z": 0.30015},
             {},
-            8.0,
         )
     )
 
     rendered = output.getvalue()
-    assert "X +0.0000 m" in rendered
-    assert "Y +0.0000 m" in rendered
-    assert "Z +0.0000 m" in rendered
+    assert "X +0.0 mm" in rendered
+    assert "Y +0.0 mm" in rendered
+    assert "Z +0.0 mm" in rendered
 
 
 def test_jaka_status_contains_controller_and_servo_details(monkeypatch):
@@ -248,8 +311,7 @@ def test_jaka_status_line_shows_only_three_color_coded_states(monkeypatch):
         {"powered_on": True, "enabled": False, "servo_on": True, "servo_sender_active": True}
     )
 
-    assert line.plain == "powered_on=True  enabled=False  servo_on=True"
-    assert [span.style for span in line.spans] == ["green", "white", "green"]
+    assert line.plain == "POWER ON   ENABLED OFF   SERVO ON"
 
 
 def test_control_trace_records_disengaged_hold_and_servo_targets(monkeypatch, tmp_path):
@@ -294,6 +356,8 @@ def test_control_trace_records_disengaged_hold_and_servo_targets(monkeypatch, tm
                     "send_rate_hz": 125.0,
                 },
                 frame_ms=8.0,
+                control_rate_hz=29.5,
+                control_target_hz=30.0,
             )
 
     with path.open(newline="", encoding="utf-8") as stream:
@@ -303,6 +367,8 @@ def test_control_trace_records_disengaged_hold_and_servo_targets(monkeypatch, tm
     assert rows[1]["action_source"] == "hold"
     assert rows[1]["clutch_engaged"] == "False"
     assert rows[1]["clutch_released"] == "True"
+    assert float(rows[1]["control_rate_hz"]) == pytest.approx(29.5)
+    assert float(rows[1]["control_target_hz"]) == pytest.approx(30.0)
     assert float(rows[1]["target_step_norm_m"]) == 0.0
     assert float(rows[1]["tracking_error_x"]) == pytest.approx(0.0001)
     assert float(rows[1]["servo_target_x"]) == pytest.approx(0.4)

@@ -50,6 +50,7 @@ import logging
 import math
 import sys
 import time
+from collections import deque
 from collections.abc import Callable
 from contextlib import nullcontext, suppress
 from dataclasses import asdict, dataclass, field
@@ -89,6 +90,7 @@ from .xr import CLOUDXR_ENV_FILE, IsaacTeleopConfig, make_xr_device
 DELTA_POSITION_BAR_SPAN_M = 0.05
 DELTA_POSITION_BAR_WIDTH = 31
 DELTA_POSITION_DISPLAY_DEADBAND_M = 0.0002
+CONTROL_RATE_WINDOW_S = 1.0
 
 # ── Hold latch ──────────────────────────────────────────────────────────────
 
@@ -111,6 +113,31 @@ class HoldLatch:
         if self._held is None:
             self._held = {k: float(obs[k]) for k in self._action_keys if k in obs}
         return self._held
+
+
+class LoopRateMonitor:
+    """Measure control-loop frequency over a rolling wall-clock window."""
+
+    def __init__(self, window_s: float = CONTROL_RATE_WINDOW_S):
+        if not math.isfinite(window_s) or window_s <= 0:
+            raise ValueError("loop-rate window must be positive and finite")
+        self.window_s = float(window_s)
+        self._starts: deque[float] = deque()
+
+    def update(self, loop_started_at: float) -> float | None:
+        if not math.isfinite(loop_started_at):
+            raise ValueError("loop start time must be finite")
+        if self._starts and loop_started_at <= self._starts[-1]:
+            raise ValueError("loop start times must increase monotonically")
+
+        self._starts.append(float(loop_started_at))
+        cutoff = loop_started_at - self.window_s
+        while len(self._starts) > 2 and self._starts[0] < cutoff:
+            self._starts.popleft()
+        if len(self._starts) < 2:
+            return None
+        elapsed = self._starts[-1] - self._starts[0]
+        return (len(self._starts) - 1) / elapsed
 
 
 class TriggerGripperToggle:
@@ -341,12 +368,6 @@ def build_device(cfg: "RecordConfig") -> tuple[JakaRobot, Device]:
 # ── Control panel ───────────────────────────────────────────────────────────
 
 
-def _rounded(values: object | None) -> list[float] | None:
-    if values is None:
-        return None
-    return [round(float(v), 4) for v in values]  # type: ignore[union-attr]
-
-
 def _signed_horizontal_bar(value: float, span: float, *, width: int = DELTA_POSITION_BAR_WIDTH) -> Text:
     """Render a fixed-width bar with negative values left of center."""
 
@@ -394,12 +415,36 @@ def _jaka_status(robot: JakaRobot) -> dict[str, Any]:
 
 def _jaka_status_line(robot_status: dict[str, Any]) -> Text:
     line = Text()
-    for index, key in enumerate(("powered_on", "enabled", "servo_on")):
+    for index, (label, key) in enumerate(
+        (("POWER", "powered_on"), ("ENABLED", "enabled"), ("SERVO", "servo_on"))
+    ):
         if index:
-            line.append("  ")
+            line.append("   ")
         active = bool(robot_status.get(key, False))
-        line.append(f"{key}={active}", style="green" if active else "white")
+        line.append(f"{label} ", style="dim")
+        line.append("ON" if active else "OFF", style="green" if active else "yellow")
+    servo_rate_hz = robot_status.get("servo_rate_hz")
+    if isinstance(servo_rate_hz, (int, float)) and servo_rate_hz > 0:
+        line.append(f"   {servo_rate_hz:.1f} Hz", style="dim")
     return line
+
+
+def _control_rate_line(measured_hz: object, target_hz: object) -> Text:
+    try:
+        measured = float(measured_hz)
+        target = float(target_hz)
+    except (TypeError, ValueError):
+        return Text("warming up", style="dim")
+    if not math.isfinite(measured) or not math.isfinite(target) or measured < 0 or target <= 0:
+        return Text("unavailable", style="yellow")
+
+    ratio = measured / target
+    style = "green" if ratio >= 0.95 else "yellow" if ratio >= 0.8 else "bold red"
+    return Text(f"{measured:.1f} / {target:.1f} Hz", style=style)
+
+
+def _format_six_vector(values: list[object]) -> str:
+    return "[" + ", ".join(f"{float(value):.3f}" for value in values) + "]"
 
 
 def _control_panel(
@@ -407,74 +452,56 @@ def _control_panel(
     action: dict[str, float],
     obs: dict,
     robot_status: dict[str, Any],
-    frame_ms: float,
 ) -> Panel:
-    start = time.perf_counter()
     table = Table.grid(padding=(0, 1))
     table.add_column(no_wrap=True)
     table.add_column()
 
-    table.add_row(Text("XR hand", style="bold bright_yellow"), "")
-    table.add_row("grip_pos_m", str(_rounded(telemetry.get("grip_pos"))))
-    table.add_row("grip_quat_xyzw", str(_rounded(telemetry.get("grip_quat"))))
-    table.add_row("squeeze", str(round(float(telemetry.get("squeeze", 0.0)), 4)))
-    table.add_row("trigger", str(round(float(telemetry.get("trigger", 0.0)), 4)))
-    table.add_row("clutch_engaged", str(telemetry.get("clutch_engaged")))
+    engaged = bool(telemetry.get("clutch_engaged", False))
+    mode = Text("ENGAGED" if engaged else "HOLD", style="bold green" if engaged else "bold yellow")
+    if telemetry.get("head_is_tracking") is False:
+        mode.append("   XR TRACKING LOST", style="bold red")
+    mode.append("   LOOP ", style="dim")
+    mode.append_text(
+        _control_rate_line(
+            robot_status.get("control_rate_hz"),
+            robot_status.get("control_target_hz"),
+        )
+    )
+    table.add_row("Mode", mode)
+    table.add_row("Robot", _jaka_status_line(robot_status))
 
     position = {axis: action[f"ee.{axis}"] for axis in ("x", "y", "z") if f"ee.{axis}" in action}
-    orientation = {axis: action[f"ee.{axis}"] for axis in ("roll", "pitch", "yaw") if f"ee.{axis}" in action}
-
-    table.add_row("", "")
-    table.add_row(Text("JAKA command", style="bold bright_green"), "")
-    table.add_row("ee_target.position_m", str({k: round(v, 4) for k, v in position.items()}))
-    table.add_row("ee_target.orientation_rad", str({k: round(v, 4) for k, v in orientation.items()}))
-    if "gripper.pos" in action:
-        table.add_row("gripper_pos", str(round(float(action["gripper.pos"]), 4)))
-
-    # Actual measured EE pose, read from the robot's get_observation(). JAKA exposes
-    # the same ee.* keys (m + rad) as the action, so we can diff against the command
-    # directly. Missing keys (e.g. right after connect) degrade gracefully.
     actual_pos = {axis: obs[f"ee.{axis}"] for axis in ("x", "y", "z") if f"ee.{axis}" in obs}
-    actual_ori = {axis: obs[f"ee.{axis}"] for axis in ("roll", "pitch", "yaw") if f"ee.{axis}" in obs}
     pos_delta = {k: actual_pos[k] - position[k] for k in actual_pos if k in position}
-    ori_delta = {
-        k: round((actual_ori[k] - orientation[k] + math.pi) % (2 * math.pi) - math.pi, 4)
-        for k in actual_ori
-        if k in orientation
-    }
-    table.add_row("", "")
-    table.add_row(Text("JAKA actual", style="bold bright_cyan"), "")
-    table.add_row("ee_actual.position_m", str({k: round(v, 4) for k, v in actual_pos.items()}))
-    table.add_row("ee_actual.orientation_rad", str({k: round(v, 4) for k, v in actual_ori.items()}))
+
+    tcp_keys = ("ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw")
+    if all(key in obs for key in tcp_keys):
+        table.add_row("TCP(m/rad)", _format_six_vector([obs[key] for key in tcp_keys]))
+    joint_values = [obs.get(f"joint_{index}.pos") for index in range(1, 7)]
+    if all(value is not None for value in joint_values):
+        table.add_row("Joint(rad)", _format_six_vector(joint_values))
+    if "gripper.pos" in obs:
+        table.add_row("Grip", f"{float(obs['gripper.pos']):.2f}")
     if pos_delta:
-        table.add_row("delta.position_m", f"range ±{DELTA_POSITION_BAR_SPAN_M:.3f} m")
+        error_norm_mm = math.sqrt(sum(delta**2 for delta in pos_delta.values())) * 1000.0
+        table.add_row("Error", f"{error_norm_mm:.1f} mm")
         for axis in ("x", "y", "z"):
             if axis not in pos_delta:
                 continue
-            # JAKA TCP feedback is quantized/noisy by roughly a tenth of a
-            # millimetre at rest. Keep that measurement noise from making the
-            # live panel flicker while retaining larger tracking errors.
             delta = pos_delta[axis]
             if abs(delta) < DELTA_POSITION_DISPLAY_DEADBAND_M:
                 delta = 0.0
             table.add_row(
-                f"{axis.upper()} {delta:+.4f} m",
+                f"{axis.upper()} {delta * 1000:+.1f} mm",
                 _signed_horizontal_bar(delta, DELTA_POSITION_BAR_SPAN_M),
             )
-    if ori_delta:
-        table.add_row("delta.orientation_rad", str(ori_delta))
 
-    table.add_row("", "")
-    table.add_row(Text("JAKA status", style="bold magenta"), _jaka_status_line(robot_status))
-
-    panel_ms = (time.perf_counter() - start) * 1000
-    panel = Panel(
+    return Panel(
         table,
-        title="[bold cyan]Control frame[/bold cyan]",
+        title="[bold cyan]JAKA Teleop[/bold cyan]",
         border_style="cyan",
-        subtitle=f"[dim]panel: {panel_ms:.2f} ms | frame: {frame_ms:.2f} ms[/dim]",
     )
-    return panel
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -517,6 +544,7 @@ def _record_loop(
     reposition during reset, but frames are not recorded.
     """
     control_interval = 1.0 / fps
+    rate_monitor = LoopRateMonitor()
     hold = HoldLatch(action_keys)
     gripper_toggle = gripper_toggle or TriggerGripperToggle()
     robot_status: dict[str, Any] = {}
@@ -527,6 +555,7 @@ def _record_loop(
 
     while timestamp < control_time_s:
         loop_start = time.perf_counter()
+        control_rate_hz = rate_monitor.update(loop_start)
 
         if events["exit_early"]:
             events["exit_early"] = False
@@ -576,6 +605,8 @@ def _record_loop(
         if loop_start >= next_status_refresh_at:
             robot_status = _jaka_status(robot)
             next_status_refresh_at = loop_start + 1.0
+        robot_status["control_rate_hz"] = control_rate_hz
+        robot_status["control_target_hz"] = float(fps)
 
         if record_frames:
             action_frame = build_dataset_frame(dataset.features, sent_action, prefix=ACTION)
@@ -594,6 +625,8 @@ def _record_loop(
                 telemetry=device.telemetry,
                 servo_status=robot.get_servo_status(),
                 frame_ms=frame_ms,
+                control_rate_hz=control_rate_hz,
+                control_target_hz=float(fps),
             )
         live.update(
             _control_panel(
@@ -601,7 +634,6 @@ def _record_loop(
                 action,
                 obs,
                 robot_status,
-                frame_ms,
             ),
             refresh=True,
         )
