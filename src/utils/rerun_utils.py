@@ -39,10 +39,10 @@ class RerunLogger:
     _CAMERA_ORDER = ("head", "left", "right")
     _IMG_PREFIX = "observation.images."
     _EPISODE_FONT_SCALE = 1.0
-    _EPISODE_FONT_THICKNESS = 2
+    _EPISODE_FONT_THICKNESS = 1
     _EPISODE_TOP_MARGIN_PX = 12
     _STATUS_FONT_SCALE = 1.0
-    _STATUS_FONT_THICKNESS = 2
+    _STATUS_FONT_THICKNESS = 1
     _STATUS_LINE_GAP_PX = 10
 
     def __init__(self, url: str = "rerun+http://127.0.0.1:9876/proxy", max_queue_size: int = 10):

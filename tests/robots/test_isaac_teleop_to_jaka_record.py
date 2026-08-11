@@ -345,11 +345,16 @@ def test_rerun_logger_draws_recording_state_below_episode_number():
     assert np.count_nonzero(paused) > np.count_nonzero(episode_only)
 
 
-def test_record_loop_skips_timed_out_camera_frame_without_stopping_control(monkeypatch):
+def test_record_loop_reuses_last_camera_frame_after_timeout(monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
     record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
     schema_robot = JakaRobot(JakaRobotConfig(ip="127.0.0.1"))
     features = build_dataset_features(schema_robot, use_videos=False)
+    features["observation.images.hand"] = {
+        "dtype": "video",
+        "shape": (2, 2, 3),
+        "names": ["height", "width", "channels"],
+    }
     observation = {
         key: float(index) / 10
         for index, key in enumerate(schema_robot.observation_features, start=1)
@@ -363,16 +368,19 @@ def test_record_loop_skips_timed_out_camera_frame_without_stopping_control(monke
             self.read_count = 0
             self.send_count = 0
             self.servo_on = False
+            self.cameras = {"hand": SimpleNamespace(use_rgb=True, use_depth=False)}
 
         def get_observation(self):
             self.read_count += 1
+            current = dict(observation)
             if self.read_count == 2:
                 raise record_module.JakaCameraTimeoutError(
                     "hand",
-                    observation,
+                    current,
                     TimeoutError("latest frame is too old"),
                 )
-            return dict(observation)
+            current["hand"] = np.full((2, 2, 3), self.read_count, dtype=np.uint8)
+            return current
 
         def is_in_servo(self):
             return self.servo_on
@@ -460,7 +468,43 @@ def test_record_loop_skips_timed_out_camera_frame_without_stopping_control(monke
     assert robot.read_count == 4
     assert robot.send_count == 4
     assert device.compute_count == 4
-    assert len(dataset.frames) == 2
+    assert len(dataset.frames) == 3
+    images = [frame["observation.images.hand"] for frame in dataset.frames]
+    np.testing.assert_array_equal(images[0], np.full((2, 2, 3), 1, dtype=np.uint8))
+    np.testing.assert_array_equal(images[1], images[0])
+    np.testing.assert_array_equal(images[2], np.full((2, 2, 3), 3, dtype=np.uint8))
+
+
+def test_reuse_latest_camera_frames_reads_stale_driver_buffer_when_cache_is_empty(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+    rgb = np.full((2, 2, 3), 7, dtype=np.uint8)
+    depth = np.full((2, 2, 1), 9, dtype=np.uint16)
+    calls: list[tuple[str, int]] = []
+
+    class FakeCamera:
+        use_rgb = True
+        use_depth = True
+
+        def read_latest(self, *, max_age_ms):
+            calls.append(("rgb", max_age_ms))
+            return rgb
+
+        def read_latest_depth(self, *, max_age_ms):
+            calls.append(("depth", max_age_ms))
+            return depth
+
+    robot = SimpleNamespace(cameras={"hand": FakeCamera()})
+    observation: dict[str, object] = {}
+    latest_frames: dict[str, object] = {}
+
+    assert record_module._reuse_latest_camera_frames(robot, observation, latest_frames)
+    assert observation["hand"] is rgb
+    assert observation["hand_depth"] is depth
+    assert calls == [
+        ("rgb", record_module.CAMERA_FALLBACK_MAX_AGE_MS),
+        ("depth", record_module.CAMERA_FALLBACK_MAX_AGE_MS),
+    ]
 
 
 def test_episode_save_keeps_live_active_while_suppressing_progress(monkeypatch):

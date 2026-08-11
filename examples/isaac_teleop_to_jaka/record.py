@@ -96,6 +96,9 @@ DELTA_POSITION_DISPLAY_DEADBAND_M = 0.0002
 CONTROL_RATE_WINDOW_S = 1.0
 BUTTON_THRESHOLD = 0.5
 DEFAULT_RESET_HOLD_S = 1.0
+# Used only after the normal freshness check fails. The read remains non-blocking and
+# returns the camera driver's newest buffered image, while the panel reports the timeout.
+CAMERA_FALLBACK_MAX_AGE_MS = 2_147_483_647
 
 # ── Hold latch ──────────────────────────────────────────────────────────────
 
@@ -323,6 +326,50 @@ def _send_action_for_clutch_state(
     if gripper_target is not None:
         held["gripper.pos"] = float(gripper_target)
     return held
+
+
+def _reuse_latest_camera_frames(
+    robot: JakaRobot,
+    observation: dict[str, Any],
+    latest_frames: dict[str, Any],
+) -> bool:
+    """Fill missing camera streams from their last valid frame.
+
+    ``JakaRobot.get_observation`` may return arm state and partial camera data when one
+    camera times out. Keeping the cache per stream handles RGB/depth and cameras that
+    were not reached after the failing stream.
+    """
+
+    camera_keys: list[str] = []
+    for name, camera in getattr(robot, "cameras", {}).items():
+        if getattr(camera, "use_rgb", True):
+            camera_keys.append(name)
+        if getattr(camera, "use_depth", False):
+            camera_keys.append(f"{name}_depth")
+
+    cameras = getattr(robot, "cameras", {})
+    for key in camera_keys:
+        if key in observation:
+            latest_frames[key] = observation[key]
+        elif key in latest_frames:
+            observation[key] = latest_frames[key]
+        else:
+            camera_name = key.removesuffix("_depth")
+            camera = cameras.get(camera_name)
+            read_latest = getattr(
+                camera,
+                "read_latest_depth" if key.endswith("_depth") else "read_latest",
+                None,
+            )
+            if read_latest is None:
+                continue
+            try:
+                observation[key] = read_latest(max_age_ms=CAMERA_FALLBACK_MAX_AGE_MS)
+                latest_frames[key] = observation[key]
+            except (RuntimeError, TimeoutError):
+                continue
+
+    return all(key in observation for key in camera_keys)
 
 
 # ── Keyboard control ────────────────────────────────────────────────────────
@@ -785,24 +832,27 @@ def _record_loop(
     camera_timeout_count = 0
     rerun_frame_index = 0
     rerun_status_dirty = False
+    latest_camera_frames: dict[str, Any] = {}
 
     while not events["stop_recording"]:
         loop_start = time.perf_counter()
         control_rate_hz = rate_monitor.update(loop_start)
 
-        camera_frame_valid = True
         try:
             obs = robot.get_observation()
         except JakaCameraTimeoutError as exc:
             if events["stop_recording"]:
                 break
             obs = exc.observation
-            camera_frame_valid = False
             camera_timeout_count += 1
         except Exception:
             if events["stop_recording"]:
                 break
             raise
+
+        # A timeout still produces a complete logical timestep. Reuse only the
+        # missing camera streams, while preserving the freshly measured arm state.
+        camera_frame_valid = _reuse_latest_camera_frames(robot, obs, latest_camera_frames)
 
         if events["stop_recording"]:
             break
@@ -881,11 +931,7 @@ def _record_loop(
             pause_changed = episode.toggle_pause(loop_start)
             rerun_status_dirty = rerun_status_dirty or pause_changed
 
-        if (
-            episode.is_recording
-            and control_time_s > 0
-            and episode.elapsed_s(loop_start) >= control_time_s
-        ):
+        if episode.is_recording and control_time_s > 0 and episode.elapsed_s(loop_start) >= control_time_s:
             episode.toggle_recording(loop_start)
             episode_finished = True
 
@@ -919,9 +965,7 @@ def _record_loop(
             action_frame = build_dataset_frame(dataset.features, sent_action, prefix=ACTION)
             dataset.add_frame({**obs_frame, **action_frame, "task": single_task})
             if rerun_logger is not None:
-                rerun_frame = {
-                    key: value for key, value in obs.items() if key.endswith(".pos")
-                }
+                rerun_frame = {key: value for key, value in obs.items() if key.endswith(".pos")}
                 rerun_frame.update(
                     task=single_task,
                     episode_number=episode_number,
@@ -1092,10 +1136,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     loop_kwargs["control_trace"] = control_trace
                     recorded_episodes = 0
                     episode_total = dataset.num_episodes + cfg.dataset.num_episodes
-                    while (
-                        recorded_episodes < cfg.dataset.num_episodes
-                        and not events["stop_recording"]
-                    ):
+                    while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                         episode_number = dataset.num_episodes + 1
                         outcome = _record_loop(
                             **loop_kwargs,
