@@ -851,8 +851,6 @@ def _record_loop(
     robot_status: dict[str, Any] = {}
     next_status_refresh_at = 0.0
     camera_timeout_count = 0
-    rerun_frame_index = 0
-    rerun_status_dirty = False
     latest_camera_frames: dict[str, Any] = {}
 
     while not events["stop_recording"]:
@@ -923,7 +921,6 @@ def _record_loop(
             and rerun_logger is not None
         ):
             rerun_logger.switch_record()
-            rerun_frame_index = 0
 
         if reset_requested:
             if dataset.has_pending_frames():
@@ -943,16 +940,44 @@ def _record_loop(
             )
             live.update(_control_panel(device.telemetry, action, obs, robot_status))
             live.refresh()
+            if rerun_logger is not None:
+                reset_joints = getattr(robot.config, "reset_joints", None)
+                reset_action = (
+                    {f"joint_{index}.pos": value for index, value in enumerate(reset_joints, start=1)}
+                    if reset_joints is not None
+                    else {}
+                )
+                rerun_frame = {
+                    f"observation.{key}": value
+                    for key, value in obs.items()
+                    if np.isscalar(value) and not isinstance(value, (str, bytes))
+                }
+                rerun_frame.update(
+                    {
+                        f"action.{key}": value
+                        for key, value in reset_action.items()
+                        if np.isscalar(value) and not isinstance(value, (str, bytes))
+                    }
+                )
+                rerun_frame.update(
+                    task=single_task,
+                    episode_number=episode_number,
+                    record_state=episode.state,
+                )
+                if control_rate_hz is not None:
+                    rerun_frame["metrics.loop_rate_hz"] = control_rate_hz
+                for name, camera in getattr(robot, "cameras", {}).items():
+                    if getattr(camera, "use_rgb", True) and name in obs:
+                        rerun_frame[f"observation.images.{name}"] = obs[name]
+                rerun_logger.log(rerun_frame)
             _reset_robot(robot)
             device.rearm()
             hold = HoldLatch(action_keys)
             episode.finish_reset()
             continue
 
-        pause_changed = False
         if pause_requested and not toggle_requested:
-            pause_changed = episode.toggle_pause(loop_start)
-            rerun_status_dirty = rerun_status_dirty or pause_changed
+            episode.toggle_pause(loop_start)
 
         if episode.is_recording and control_time_s > 0 and episode.elapsed_s(loop_start) >= control_time_s:
             episode.toggle_recording(loop_start)
@@ -987,41 +1012,35 @@ def _record_loop(
             obs_frame = build_dataset_frame(dataset.features, obs, prefix=OBS_STR)
             action_frame = build_dataset_frame(dataset.features, sent_action, prefix=ACTION)
             dataset.add_frame({**obs_frame, **action_frame, "task": single_task})
-            if rerun_logger is not None:
-                rerun_frame = {key: value for key, value in obs.items() if key.endswith(".pos")}
-                rerun_frame.update(
-                    task=single_task,
-                    episode_number=episode_number,
-                    record_state=episode.state,
-                    framestep=rerun_frame_index,
-                )
-                for name, camera in getattr(robot, "cameras", {}).items():
-                    if getattr(camera, "use_rgb", True) and name in obs:
-                        rerun_frame[f"observation.images.{name}"] = obs[name]
-                rerun_logger.log(rerun_frame)
-                rerun_frame_index += 1
-                rerun_status_dirty = False
-        elif (
-            rerun_status_dirty
-            and episode.is_paused
-            and camera_frame_valid
-            and rerun_logger is not None
-            and rerun_frame_index > 0
-        ):
-            pause_frame = {
-                "task": single_task,
-                "episode_number": episode_number,
-                "record_state": episode.state,
-                "framestep": rerun_frame_index - 1,
+
+        if rerun_logger is not None:
+            rerun_action = {**action, "gripper.pos": gripper_toggle.position}
+            rerun_frame = {
+                f"observation.{key}": value
+                for key, value in obs.items()
+                if np.isscalar(value) and not isinstance(value, (str, bytes))
             }
+            rerun_frame.update(
+                {
+                    f"action.{key}": value
+                    for key, value in rerun_action.items()
+                    if np.isscalar(value) and not isinstance(value, (str, bytes))
+                }
+            )
+            rerun_frame.update(
+                task=single_task,
+                episode_number=episode_number,
+                record_state=episode.state,
+            )
+            if control_rate_hz is not None:
+                rerun_frame["metrics.loop_rate_hz"] = control_rate_hz
             for name, camera in getattr(robot, "cameras", {}).items():
                 if getattr(camera, "use_rgb", True) and name in obs:
-                    pause_frame[f"observation.images.{name}"] = obs[name]
-            rerun_logger.log(pause_frame)
-            rerun_status_dirty = False
+                    rerun_frame[f"observation.images.{name}"] = obs[name]
+            rerun_logger.log(rerun_frame)
 
         # Work time of this iteration: obs read + compute + target update + record.
-        # The robot-owned 8 ms sender continues independently if this loop is late.
+        # The robot-owned Servo sender continues independently if this loop is late.
         frame_ms = (time.perf_counter() - loop_start) * 1000
         if control_trace is not None:
             control_trace.write_frame(

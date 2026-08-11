@@ -1239,7 +1239,8 @@ class JakaRobot(Robot):
             self._servo_target_updated_at = time.monotonic()
 
     def _servo_worker(self) -> None:
-        period_s = SERVO_CYCLE_S
+        step_num = self.config.servo_step_num
+        period_s = self.servo_frame_period_s(step_num)
         deadline = time.monotonic()
         last_frame_at: float | None = None
         try:
@@ -1277,9 +1278,9 @@ class JakaRobot(Robot):
                         frame = self._step_servo_eef(period_s)
 
                 if representation == "joints":
-                    queue_depth = self._send_servo_joint_frame(frame, step_num=1)
+                    queue_depth = self._send_servo_joint_frame(frame, step_num=step_num)
                 else:
-                    queue_depth = self._send_servo_eef_frame(frame, step_num=1)
+                    queue_depth = self._send_servo_eef_frame(frame, step_num=step_num)
 
                 with self._servo_state_lock:
                     self._servo_frames_sent += 1

@@ -575,6 +575,27 @@ def test_servo_sender_continues_at_eight_ms_and_stops_before_controller_exit(rob
     assert rc.calls[-1] == ("servo_move_enable", False)
 
 
+def test_servo_sender_honors_configured_step_period(monkeypatch):
+    rc = FakeRC()
+    monkeypatch.setattr(driver, "create_rc", lambda _ip: rc)
+    arm = driver.JakaRobot(
+        driver.JakaRobotConfig(
+            ip="10.0.0.2",
+            auto_enable_servo=False,
+            servo_step_num=2,
+        )
+    )
+    arm.connect()
+    try:
+        arm.servo_enable(True, representation="eef")
+        wait_until(lambda: len(servo_calls(rc, "servo_p")) >= 3)
+
+        assert {call[3] for call in servo_calls(rc, "servo_p")} == {2}
+        assert arm.servo_frame_period_s() == pytest.approx(0.016)
+    finally:
+        arm.disconnect()
+
+
 def test_servo_enable_waits_for_the_first_controller_frame(monkeypatch):
     rc = FakeRC()
     monkeypatch.setattr(driver, "create_rc", lambda _ip: rc)

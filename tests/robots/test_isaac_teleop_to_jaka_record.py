@@ -177,9 +177,11 @@ def test_record_loop_pauses_dataset_and_updates_rerun_status(monkeypatch):
         for index, key in enumerate(schema_robot.observation_features, start=1)
         if isinstance(schema_robot.observation_features[key], type)
     }
+    observation["hand"] = np.full((2, 2, 3), 7, dtype=np.uint8)
 
     class FakeRobot:
         action_features = schema_robot.action_features
+        cameras = {"hand": SimpleNamespace(use_rgb=True, use_depth=False)}
 
         def get_observation(self):
             return dict(observation)
@@ -277,16 +279,26 @@ def test_record_loop_pauses_dataset_and_updates_rerun_status(monkeypatch):
     assert outcome == "completed"
     assert len(dataset.frames) == 3
     assert rerun.switches == 1
-    assert [frame["framestep"] for frame in rerun.frames] == [0, 0, 1, 2]
+    assert len(rerun.frames) == 8
     assert [frame["record_state"] for frame in rerun.frames] == [
+        "ready",
+        "ready",
         "recording",
+        "pause",
         "pause",
         "recording",
         "recording",
+        "ready",
     ]
-    recorded_rerun_frames = [frame for frame in rerun.frames if frame["record_state"] == "recording"]
-    assert all("joint_1.pos" in frame for frame in recorded_rerun_frames)
-    assert all("gripper.pos" in frame for frame in recorded_rerun_frames)
+    assert all("observation.images.hand" in frame for frame in rerun.frames)
+    assert all("observation.joint_1.pos" in frame for frame in rerun.frames)
+    assert all("observation.ee.x" in frame for frame in rerun.frames)
+    assert all("action.ee.x" in frame for frame in rerun.frames)
+    assert all("action.gripper.pos" in frame for frame in rerun.frames)
+    assert all("action.joint_1.pos" not in frame for frame in rerun.frames)
+    assert "metrics.loop_rate_hz" not in rerun.frames[0]
+    assert all("metrics.loop_rate_hz" in frame for frame in rerun.frames[1:])
+    assert all("framestep" not in frame for frame in rerun.frames)
     assert all(frame["task"] == "test" for frame in rerun.frames)
     assert all(frame["episode_number"] == 2 for frame in rerun.frames)
 
@@ -411,12 +423,13 @@ def test_rerun_logger_detects_pos_fields_and_logs_direct_curves(monkeypatch):
     logger = rerun_module.RerunLogger.__new__(rerun_module.RerunLogger)
     logger._rec = object()
     logger._joint_count = None
-    logger._position_keys = []
+    logger._curve_keys = []
     logger._camera_slots = []
     logger._image_keys = []
     logger._next_frame_seq = 0
     logger._blueprint_sent = True
     logger._queue = FakeQueue()
+    logger._enqueue_blueprint = lambda: None
 
     monkeypatch.setattr(rerun_module.rr, "set_time", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(rerun_module.rr, "Scalars", float)
@@ -426,12 +439,24 @@ def test_rerun_logger_detects_pos_fields_and_logs_direct_curves(monkeypatch):
         lambda path, value, **_kwargs: logged.append((path, value)),
     )
 
-    logger.log({"joint_1.pos": 0.1, "joint_2.pos": 0.2, "gripper.pos": 0.25})
-    logger._log_sync({"joint_1.pos": 0.1, "joint_2.pos": 0.2, "gripper.pos": 0.25})
+    frame = {
+        "observation.joint_1.pos": 0.1,
+        "action.joint_1.pos": 0.2,
+        "observation.ee.x": 0.3,
+        "action.ee.x": 0.4,
+        "observation.gripper.pos": 0.25,
+        "action.gripper.pos": 1.0,
+        "metrics.loop_rate_hz": 29.5,
+    }
+    logger.log(frame)
+    logger._log_sync(frame)
 
-    assert logger._position_keys == ["joint_1.pos", "joint_2.pos", "gripper.pos"]
-    assert ("joint_1.pos", 0.1) in logged
-    assert ("gripper.pos", 0.25) in logged
+    assert set(logger._curve_keys) == set(frame)
+    assert logger._curve_group_name("observation.ee.x") == "tcp_position"
+    assert logger._curve_group_name("action.ee.roll") == "tcp_orientation"
+    assert ("observation.joint_1.pos", 0.1) in logged
+    assert ("action.ee.x", 0.4) in logged
+    assert ("metrics.loop_rate_hz", 29.5) in logged
 
 
 def test_rerun_logger_keeps_latest_frame_when_queue_is_full(monkeypatch):
@@ -439,7 +464,7 @@ def test_rerun_logger_keeps_latest_frame_when_queue_is_full(monkeypatch):
     rerun_module = importlib.import_module("src.utils.rerun_utils")
     logger = rerun_module.RerunLogger.__new__(rerun_module.RerunLogger)
     logger._joint_count = 0
-    logger._position_keys = []
+    logger._curve_keys = []
     logger._camera_slots = []
     logger._image_keys = []
     logger._blueprint_sent = True

@@ -68,6 +68,7 @@ class RerunLogger:
     # collide with "head". Anything not in the table falls to the end.
     _CAMERA_ORDER = ("head", "left", "right")
     _IMG_PREFIX = "observation.images."
+    _CURVE_PREFIXES = ("observation.", "action.", "metrics.")
     _EPISODE_FONT_SCALE = 1.0
     _EPISODE_FONT_THICKNESS = 1
     _EPISODE_TOP_MARGIN_PX = 12
@@ -78,7 +79,7 @@ class RerunLogger:
     def __init__(self, url: str = "rerun+http://127.0.0.1:9876/proxy", max_queue_size: int = 10):
         self._url = url
         self._joint_count: int | None = None
-        self._position_keys: list[str] = []
+        self._curve_keys: list[str] = []
         self._blueprint_sent = False
         self._next_frame_seq = 0
         # Camera slots are inferred from available observation.images.* keys.
@@ -125,9 +126,12 @@ class RerunLogger:
             )
             for i in range(1, self._joint_count + 1)
         ]
-        position_views = [
-            rr.blueprint.TimeSeriesView(origin="/", contents=[key], name=key.removesuffix(".pos"))
-            for key in self._position_keys
+        curve_groups: dict[str, list[str]] = {}
+        for key in self._curve_keys:
+            curve_groups.setdefault(self._curve_group_name(key), []).append(key)
+        curve_views = [
+            rr.blueprint.TimeSeriesView(origin="/", contents=keys, name=name)
+            for name, keys in curve_groups.items()
         ]
 
         def grid(views, columns):
@@ -139,7 +143,7 @@ class RerunLogger:
             )
 
         top_row = grid(camera_views, len(camera_views)) if camera_views else None
-        bottom_views = [*joint_views, *position_views]
+        bottom_views = [*joint_views, *curve_views]
         bottom_row = grid(bottom_views, min(4, len(bottom_views))) if bottom_views else None
 
         if top_row and bottom_row:
@@ -155,18 +159,79 @@ class RerunLogger:
         return rr.blueprint.Blueprint(layout)
 
     @staticmethod
-    def _is_position_scalar(key: str, value) -> bool:
-        if not key.endswith(".pos"):
+    def _is_curve_scalar(key: str, value) -> bool:
+        if key.startswith(RerunLogger._IMG_PREFIX):
+            return False
+        if not key.endswith(".pos") and not key.startswith(RerunLogger._CURVE_PREFIXES):
             return False
         try:
             return bool(np.isfinite(float(value)))
         except (TypeError, ValueError):
             return False
 
+    @staticmethod
+    def _curve_group_name(key: str) -> str:
+        signal = key
+        for prefix in RerunLogger._CURVE_PREFIXES:
+            if signal.startswith(prefix):
+                signal = signal[len(prefix) :]
+                break
+        if signal in ("ee.x", "ee.y", "ee.z"):
+            return "tcp_position"
+        if signal in ("ee.roll", "ee.pitch", "ee.yaw"):
+            return "tcp_orientation"
+        return signal.removesuffix(".pos")
+
+    def _update_schema(self, data: dict) -> None:
+        previous = (
+            self._joint_count,
+            tuple(self._camera_slots),
+            tuple(self._image_keys),
+            tuple(self._curve_keys),
+        )
+
+        image_keys = set(self._image_keys)
+        image_keys.update(key for key in data if key.startswith(self._IMG_PREFIX))
+        tail = lambda key: key[len(self._IMG_PREFIX) :]  # noqa: E731
+        self._camera_slots = sorted(
+            image_keys,
+            key=lambda key: (
+                next((i for i, name in enumerate(self._CAMERA_ORDER) if tail(key).startswith(name)), 999),
+                key,
+            ),
+        )
+        self._image_keys = sorted(image_keys)
+
+        state = data.get("observation.state")
+        if self._joint_count is None:
+            self._joint_count = len(state) if state is not None else 0
+        elif state is not None:
+            self._joint_count = max(self._joint_count, len(state))
+
+        curve_keys = set(self._curve_keys)
+        curve_keys.update(key for key, value in data.items() if self._is_curve_scalar(key, value))
+        self._curve_keys = sorted(
+            curve_keys,
+            key=lambda key: (
+                self._curve_group_name(key),
+                not key.startswith("observation."),
+                key,
+            ),
+        )
+
+        current = (
+            self._joint_count,
+            tuple(self._camera_slots),
+            tuple(self._image_keys),
+            tuple(self._curve_keys),
+        )
+        if current != previous:
+            self._blueprint_sent = False
+
     def _enqueue_blueprint(self) -> None:
         if self._blueprint_sent or self._joint_count is None:
             return
-        key = (self._joint_count, tuple(self._camera_slots), tuple(self._position_keys))
+        key = (self._joint_count, tuple(self._camera_slots), tuple(self._curve_keys))
         if self._cached_blueprint_key != key:
             self._cached_blueprint = self._build_blueprint()
             self._cached_blueprint_key = key
@@ -182,7 +247,9 @@ class RerunLogger:
         -------------
         ``observation.images.*``           : np.ndarray HWC uint8, dynamic camera count (1..3)
         ``observation.state``              : array-like, used to infer joint count (optional)
-        ``*.pos``                          : scalar position signals such as ``joint_1.pos`` and ``gripper.pos`` (optional)
+        ``observation.*`` / ``action.*``   : finite scalar feedback and action curves (optional)
+        ``metrics.*``                      : finite scalar runtime metrics (optional)
+        ``*.pos``                          : legacy direct position signals (optional)
         ``task``                           : str, task instruction; overlaid on each camera image as a Rerun-native 2D label (optional)
         ``episode_number``                 : current episode number shown at image center (optional)
         ``record_state``                   : ``recording``/``pause`` status shown below the episode number (optional)
@@ -190,24 +257,7 @@ class RerunLogger:
         ``policy``                         : array-like (optional)
         ``framestep``                      : int (optional). If missing, an internal increasing sequence is used.
         """
-        if self._joint_count is None:
-            slots = [k for k in data if k.startswith(self._IMG_PREFIX)]
-            tail = lambda k: k[len(self._IMG_PREFIX) :]  # noqa
-            self._camera_slots = sorted(
-                slots,
-                key=lambda k: (
-                    next((i for i, p in enumerate(self._CAMERA_ORDER) if tail(k).startswith(p)), 999),
-                    k,
-                ),
-            )
-            self._image_keys = slots  # all present camera keys, unsorted
-            state = data.get("observation.state")
-            self._joint_count = len(state) if state is not None else 0
-            position_keys = [key for key, value in data.items() if self._is_position_scalar(key, value)]
-            self._position_keys = sorted(
-                position_keys,
-                key=lambda key: (not key.startswith("joint_"), key),
-            )
+        self._update_schema(data)
 
         # switch_record() resets the blueprint flag while retaining the inferred
         # schema, so each new recording needs another enqueue here.
@@ -462,7 +512,7 @@ class RerunLogger:
                 rr.log(f"teleop/{i + 1}", rr.Scalars(float(data["teleop"][i])), recording=self._rec)
             if data.get("policy") is not None:
                 rr.log(f"policy/{i + 1}", rr.Scalars(float(data["policy"][i])), recording=self._rec)
-        for key in self._position_keys:
+        for key in self._curve_keys:
             value = data.get(key)
             if value is not None:
                 rr.log(key, rr.Scalars(float(value)), recording=self._rec)
