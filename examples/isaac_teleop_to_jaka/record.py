@@ -865,7 +865,11 @@ def _record_loop(
                 rerun_frame = {
                     key: value for key, value in obs.items() if key.endswith(".pos")
                 }
-                rerun_frame.update(task=single_task, framestep=rerun_frame_index)
+                rerun_frame.update(
+                    task=single_task,
+                    episode_number=episode_number,
+                    framestep=rerun_frame_index,
+                )
                 for name, camera in getattr(robot, "cameras", {}).items():
                     if getattr(camera, "use_rgb", True) and name in obs:
                         rerun_frame[f"observation.images.{name}"] = obs[name]

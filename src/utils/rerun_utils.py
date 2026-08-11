@@ -72,7 +72,11 @@ class RerunLogger:
         camera_views = [
             rr.blueprint.Spatial2DView(
                 origin="/",
-                contents=[slot, f"overlays/{slot}/task_label"],
+                contents=[
+                    slot,
+                    f"overlays/{slot}/task_label",
+                    f"overlays/{slot}/episode_label",
+                ],
                 name=slot,
             )
             for slot in self._camera_slots
@@ -142,6 +146,7 @@ class RerunLogger:
         ``observation.state``              : array-like, used to infer joint count (optional)
         ``*.pos``                          : scalar position signals such as ``joint_1.pos`` and ``gripper.pos`` (optional)
         ``task``                           : str, task instruction; overlaid on each camera image as a Rerun-native 2D label (optional)
+        ``episode_number``                 : current episode number shown at image center (optional)
         ``teleop``                         : array-like (optional)
         ``policy``                         : array-like (optional)
         ``framestep``                      : int (optional). If missing, an internal increasing sequence is used.
@@ -284,6 +289,7 @@ class RerunLogger:
         self._next_frame_seq = frame_seq + 1
 
         task = data.get("task")
+        episode_number = data.get("episode_number")
         for name in self._image_keys:
             img = data.get(name)
             if img is None:
@@ -300,6 +306,18 @@ class RerunLogger:
                     rr.Points2D(
                         [(w / 2.0, h - 24)],
                         labels=[task],
+                        show_labels=True,
+                        radii=[0.0],
+                    ),
+                    recording=self._rec,
+                )
+            if episode_number is not None:
+                h, w = arr.shape[:2]
+                rr.log(
+                    f"overlays/{name}/episode_label",
+                    rr.Points2D(
+                        [(w / 2.0, h / 2.0)],
+                        labels=[f"Episode {episode_number}"],
                         show_labels=True,
                         radii=[0.0],
                     ),

@@ -228,6 +228,7 @@ def test_record_loop_only_buffers_frames_between_a_press_edges(monkeypatch):
         dataset=dataset,
         control_time_s=60,
         single_task="test",
+        episode_number=2,
         rerun_logger=rerun,
     )
 
@@ -238,6 +239,7 @@ def test_record_loop_only_buffers_frames_between_a_press_edges(monkeypatch):
     assert all("joint_1.pos" in frame for frame in rerun.frames)
     assert all("gripper.pos" in frame for frame in rerun.frames)
     assert all(frame["task"] == "test" for frame in rerun.frames)
+    assert all(frame["episode_number"] == 2 for frame in rerun.frames)
 
 
 def test_rerun_logger_detects_pos_fields_and_logs_direct_curves(monkeypatch):
@@ -272,6 +274,47 @@ def test_rerun_logger_detects_pos_fields_and_logs_direct_curves(monkeypatch):
     assert logger._position_keys == ["joint_1.pos", "joint_2.pos", "gripper.pos"]
     assert ("joint_1.pos", 0.1) in logged
     assert ("gripper.pos", 0.25) in logged
+
+
+def test_rerun_logger_overlays_episode_number_at_image_center(monkeypatch):
+    rerun_module = importlib.import_module("src.utils.rerun_utils")
+    logged: list[tuple[str, object]] = []
+    points: list[tuple[list[tuple[float, float]], list[str]]] = []
+    logger = rerun_module.RerunLogger.__new__(rerun_module.RerunLogger)
+    logger._rec = object()
+    logger._joint_count = 0
+    logger._position_keys = []
+    logger._image_keys = ["observation.images.hand"]
+    logger._next_frame_seq = 0
+
+    class FakeImage:
+        def compress(self):
+            return self
+
+    monkeypatch.setattr(logger, "_to_hwc_uint8_numpy", lambda _image: SimpleNamespace(shape=(100, 200, 3)))
+    monkeypatch.setattr(rerun_module.rr, "set_time", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(rerun_module.rr, "Image", lambda _array: FakeImage())
+    monkeypatch.setattr(
+        rerun_module.rr,
+        "Points2D",
+        lambda positions, *, labels, **_kwargs: points.append((positions, labels)) or object(),
+    )
+    monkeypatch.setattr(
+        rerun_module.rr,
+        "log",
+        lambda path, value, **_kwargs: logged.append((path, value)),
+    )
+
+    logger._log_sync(
+        {
+            "observation.images.hand": object(),
+            "episode_number": 4,
+            "framestep": 0,
+        }
+    )
+
+    assert points == [([(100.0, 50.0)], ["Episode 4"])]
+    assert any(path == "overlays/observation.images.hand/episode_label" for path, _ in logged)
 
 
 def test_record_loop_skips_timed_out_camera_frame_without_stopping_control(monkeypatch):
