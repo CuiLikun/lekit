@@ -27,6 +27,37 @@ def test_trigger_gripper_toggle_changes_state_only_on_press_edges(monkeypatch):
     assert toggle.apply(action, observation, 0.8)["gripper.pos"] == 0.0
 
 
+def test_gripper_toggle_preserves_target_in_disengaged_hold_frames(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+
+    class FakeRobot:
+        action_features = ["gripper.pos"]
+
+        def is_in_servo(self):
+            return False
+
+        def send_action(self, action, *, use_servo=True):
+            return dict(action)
+
+    observation = {"gripper.pos": 0.0}
+    hold = record_module.HoldLatch(["gripper.pos"])
+    toggle = record_module.TriggerGripperToggle()
+    recorded = []
+    for trigger in (1.0, 0.0, 1.0, 0.0):
+        action = toggle.apply(hold.resolve(None, observation), observation, trigger)
+        sent_action = record_module._send_action_for_clutch_state(
+            FakeRobot(),
+            action,
+            engaged=False,
+            observation=observation,
+            gripper_target=toggle.position,
+        )
+        recorded.append(sent_action["gripper.pos"])
+
+    assert recorded == [1.0, 1.0, 0.0, 0.0]
+
+
 def test_controller_buttons_emit_one_a_edge_and_one_b_long_press(monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
     record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
@@ -156,6 +187,17 @@ def test_record_loop_only_buffers_frames_between_a_press_edges(monkeypatch):
         def refresh(self):
             pass
 
+    class FakeRerun:
+        def __init__(self):
+            self.switches = 0
+            self.frames = []
+
+        def switch_record(self):
+            self.switches += 1
+
+        def log(self, frame):
+            self.frames.append(frame)
+
     monkeypatch.setattr(record_module, "_jaka_status", lambda _robot: {})
     monkeypatch.setattr(record_module, "precise_sleep", lambda _duration: None)
     monkeypatch.setattr(
@@ -166,6 +208,7 @@ def test_record_loop_only_buffers_frames_between_a_press_edges(monkeypatch):
         ),
     )
     dataset = FakeDataset()
+    rerun = FakeRerun()
     events = {
         "exit_early": False,
         "toggle_recording": False,
@@ -185,10 +228,50 @@ def test_record_loop_only_buffers_frames_between_a_press_edges(monkeypatch):
         dataset=dataset,
         control_time_s=60,
         single_task="test",
+        rerun_logger=rerun,
     )
 
     assert outcome == "completed"
     assert len(dataset.frames) == 2
+    assert rerun.switches == 1
+    assert [frame["framestep"] for frame in rerun.frames] == [0, 1]
+    assert all("joint_1.pos" in frame for frame in rerun.frames)
+    assert all("gripper.pos" in frame for frame in rerun.frames)
+    assert all(frame["task"] == "test" for frame in rerun.frames)
+
+
+def test_rerun_logger_detects_pos_fields_and_logs_direct_curves(monkeypatch):
+    rerun_module = importlib.import_module("src.utils.rerun_utils")
+    logged: list[tuple[str, float]] = []
+
+    class FakeQueue:
+        def put_nowait(self, _item):
+            pass
+
+    logger = rerun_module.RerunLogger.__new__(rerun_module.RerunLogger)
+    logger._rec = object()
+    logger._joint_count = None
+    logger._position_keys = []
+    logger._camera_slots = []
+    logger._image_keys = []
+    logger._next_frame_seq = 0
+    logger._blueprint_sent = True
+    logger._queue = FakeQueue()
+
+    monkeypatch.setattr(rerun_module.rr, "set_time", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(rerun_module.rr, "Scalars", float)
+    monkeypatch.setattr(
+        rerun_module.rr,
+        "log",
+        lambda path, value, **_kwargs: logged.append((path, value)),
+    )
+
+    logger.log({"joint_1.pos": 0.1, "joint_2.pos": 0.2, "gripper.pos": 0.25})
+    logger._log_sync({"joint_1.pos": 0.1, "joint_2.pos": 0.2, "gripper.pos": 0.25})
+
+    assert logger._position_keys == ["joint_1.pos", "joint_2.pos", "gripper.pos"]
+    assert ("joint_1.pos", 0.1) in logged
+    assert ("gripper.pos", 0.25) in logged
 
 
 def test_record_loop_skips_timed_out_camera_frame_without_stopping_control(monkeypatch):

@@ -38,7 +38,8 @@ uv run python -m examples.isaac_teleop_to_jaka.record \
     --dataset.episode_time_s=9999 \
     --dataset.reset_time_s=5 \
     --dataset.streaming_encoding=True \
-    --dataset.push_to_hub=False
+    --dataset.push_to_hub=False \
+    --rerun_url="rerun+http://127.0.0.1:9876/proxy"
 
 The XR trigger toggles the gripper between closed (0) and open (1) on each press.
 Press A to start or finish an episode and hold B to reset the robot. Keyboard
@@ -83,6 +84,7 @@ from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging
 from robots.jaka_robot import JakaCameraTimeoutError, JakaRobot, JakaRobotConfig
 from robots.jaka_robot.dataset_features import build_dataset_features
+from src.utils.rerun_utils import RerunLogger
 
 from .control_trace import ControlTraceWriter
 from .xr import CLOUDXR_ENV_FILE, IsaacTeleopConfig, make_xr_device
@@ -149,6 +151,14 @@ class TriggerGripperToggle:
         self.threshold = threshold
         self._position: float | None = None
         self._pressed = False
+
+    @property
+    def position(self) -> float:
+        """Return the latest latched gripper target."""
+
+        if self._position is None:
+            raise RuntimeError("gripper position is unavailable before the first observation")
+        return self._position
 
     def apply(self, action: dict, obs: dict, trigger: float) -> dict:
         if self._position is None:
@@ -246,13 +256,17 @@ def _send_action_for_clutch_state(
     *,
     engaged: bool,
     observation: dict | None = None,
+    gripper_target: float | None = None,
 ) -> dict:
     """Run Cartesian Servo only while the XR deadman is engaged."""
 
     if engaged:
         if not robot.is_in_servo():
             robot.servo_enable(True, representation="eef")
-        return robot.send_action(action)
+        applied = robot.send_action(action)
+        if gripper_target is not None:
+            applied["gripper.pos"] = float(gripper_target)
+        return applied
 
     if robot.is_in_servo():
         robot.servo_enable(False)
@@ -266,6 +280,8 @@ def _send_action_for_clutch_state(
         else {}
     )
     held.update(action)
+    if gripper_target is not None:
+        held["gripper.pos"] = float(gripper_target)
     return held
 
 
@@ -620,6 +636,8 @@ class RecordConfig:
     control_trace_csv: Path | None = None
     control_trace_flush_frames: int = 30
     reset_hold_s: float = DEFAULT_RESET_HOLD_S
+    # Optional Rerun endpoint. Leave unset to keep recording fully local.
+    rerun_url: str | None = None
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.reset_hold_s) or self.reset_hold_s <= 0:
@@ -700,6 +718,7 @@ def _record_loop(
     episode_number: int | None = None,
     episode_total: int | None = None,
     reset_hold_s: float = DEFAULT_RESET_HOLD_S,
+    rerun_logger: RerunLogger | None = None,
 ) -> str:
     """Stay ready until A starts an episode, then return when A finishes it."""
 
@@ -714,6 +733,7 @@ def _record_loop(
     robot_status: dict[str, Any] = {}
     next_status_refresh_at = 0.0
     camera_timeout_count = 0
+    rerun_frame_index = 0
 
     while not events["stop_recording"]:
         loop_start = time.perf_counter()
@@ -768,7 +788,17 @@ def _record_loop(
                 dataset.clear_episode_buffer()
             episode.discard()
 
+        was_recording = episode.is_recording
         episode_finished = episode.toggle_recording(loop_start) if toggle_requested else False
+        if (
+            toggle_requested
+            and not was_recording
+            and episode.is_recording
+            and not reset_requested
+            and rerun_logger is not None
+        ):
+            rerun_logger.switch_record()
+            rerun_frame_index = 0
 
         if reset_requested:
             if dataset.has_pending_frames():
@@ -808,6 +838,7 @@ def _record_loop(
                 action,
                 engaged=bool(device.telemetry.get("clutch_engaged", False)),
                 observation=obs,
+                gripper_target=gripper_toggle.position,
             )
         except Exception:
             if events["stop_recording"]:
@@ -830,6 +861,16 @@ def _record_loop(
             obs_frame = build_dataset_frame(dataset.features, obs, prefix=OBS_STR)
             action_frame = build_dataset_frame(dataset.features, sent_action, prefix=ACTION)
             dataset.add_frame({**obs_frame, **action_frame, "task": single_task})
+            if rerun_logger is not None:
+                rerun_frame = {
+                    key: value for key, value in obs.items() if key.endswith(".pos")
+                }
+                rerun_frame.update(task=single_task, framestep=rerun_frame_index)
+                for name, camera in getattr(robot, "cameras", {}).items():
+                    if getattr(camera, "use_rgb", True) and name in obs:
+                        rerun_frame[f"observation.images.{name}"] = obs[name]
+                rerun_logger.log(rerun_frame)
+                rerun_frame_index += 1
 
         # Work time of this iteration: obs read + compute + target update + record.
         # The robot-owned 8 ms sender continues independently if this loop is late.
@@ -886,6 +927,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     dataset: LeRobotDataset | None = None
     dataset_managed = False
     listener = None
+    rerun_logger: RerunLogger | None = None
     try:
         if cfg.resume:
             dataset = LeRobotDataset.resume(
@@ -921,6 +963,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             )
 
         listener, events = init_keyboard_listener()
+        if cfg.rerun_url:
+            rerun_logger = RerunLogger(url=cfg.rerun_url)
 
         # The recorder commands Cartesian Servo Move. JAKA still returns its
         # full fixed action schema so joint feedback is recorded in the action
@@ -940,6 +984,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             "gripper_toggle": TriggerGripperToggle(),
             "buttons": ControllerButtons(cfg.reset_hold_s),
             "reset_hold_s": cfg.reset_hold_s,
+            "rerun_logger": rerun_logger,
         }
 
         initial_panel = Panel(
@@ -999,6 +1044,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         if listener is not None:
             with suppress(Exception):
                 listener.stop()
+
+        if rerun_logger is not None:
+            with suppress(Exception):
+                rerun_logger.flush(timeout=1.0)
+            with suppress(Exception):
+                rerun_logger.stop()
 
         if dataset is not None and not dataset_managed:
             dataset.finalize()

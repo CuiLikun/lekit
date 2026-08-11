@@ -1,3 +1,5 @@
+import contextlib
+import logging
 import queue
 import threading
 import time
@@ -39,6 +41,7 @@ class RerunLogger:
     def __init__(self, url: str = "rerun+http://127.0.0.1:9876/proxy", max_queue_size: int = 10):
         self._url = url
         self._joint_count: int | None = None
+        self._position_keys: list[str] = []
         self._blueprint_sent = False
         self._next_frame_seq = 0
         # Camera slots are inferred from available observation.images.* keys.
@@ -82,6 +85,10 @@ class RerunLogger:
             )
             for i in range(1, self._joint_count + 1)
         ]
+        position_views = [
+            rr.blueprint.TimeSeriesView(origin="/", contents=[key], name=key.removesuffix(".pos"))
+            for key in self._position_keys
+        ]
 
         def grid(views, columns):
             return rr.blueprint.Grid(
@@ -92,7 +99,8 @@ class RerunLogger:
             )
 
         top_row = grid(camera_views, len(camera_views)) if camera_views else None
-        bottom_row = grid(joint_views, min(4, len(joint_views))) if joint_views else None
+        bottom_views = [*joint_views, *position_views]
+        bottom_row = grid(bottom_views, min(4, len(bottom_views))) if bottom_views else None
 
         if top_row and bottom_row:
             layout = rr.blueprint.Grid(top_row, bottom_row, grid_columns=1, row_shares=[1, 1], column_shares=[1])
@@ -104,10 +112,19 @@ class RerunLogger:
             return None
         return rr.blueprint.Blueprint(layout)
 
+    @staticmethod
+    def _is_position_scalar(key: str, value) -> bool:
+        if not key.endswith(".pos"):
+            return False
+        try:
+            return bool(np.isfinite(float(value)))
+        except (TypeError, ValueError):
+            return False
+
     def _enqueue_blueprint(self) -> None:
         if self._blueprint_sent or self._joint_count is None:
             return
-        key = (self._joint_count, tuple(self._camera_slots))
+        key = (self._joint_count, tuple(self._camera_slots), tuple(self._position_keys))
         if self._cached_blueprint_key != key:
             self._cached_blueprint = self._build_blueprint()
             self._cached_blueprint_key = key
@@ -122,7 +139,8 @@ class RerunLogger:
         Expected keys
         -------------
         ``observation.images.*``           : np.ndarray HWC uint8, dynamic camera count (1..3)
-        ``observation.state``              : array-like, used to infer joint count
+        ``observation.state``              : array-like, used to infer joint count (optional)
+        ``*.pos``                          : scalar position signals such as ``joint_1.pos`` and ``gripper.pos`` (optional)
         ``task``                           : str, task instruction; overlaid on each camera image as a Rerun-native 2D label (optional)
         ``teleop``                         : array-like (optional)
         ``policy``                         : array-like (optional)
@@ -139,13 +157,22 @@ class RerunLogger:
                 ),
             )
             self._image_keys = slots  # all present camera keys, unsorted
-            self._joint_count = len(data["observation.state"])
-            self._enqueue_blueprint()
+            state = data.get("observation.state")
+            self._joint_count = len(state) if state is not None else 0
+            position_keys = [
+                key for key, value in data.items() if self._is_position_scalar(key, value)
+            ]
+            self._position_keys = sorted(
+                position_keys,
+                key=lambda key: (not key.startswith("joint_"), key),
+            )
 
-        try:
+        # switch_record() resets the blueprint flag while retaining the inferred
+        # schema, so each new recording needs another enqueue here.
+        self._enqueue_blueprint()
+
+        with contextlib.suppress(queue.Full):
             self._queue.put_nowait((self._CMD_LOG, data))
-        except queue.Full:
-            pass  # drop the newest frame; viewer prefers liveness over backlog
 
     def switch_record(self) -> None:
         """Switch to a new recording_id (e.g., when starting a new episode).
@@ -224,9 +251,9 @@ class RerunLogger:
                     self._connect_stream()
                     self._next_frame_seq = 0
             except Exception:
-                import traceback
-
-                traceback.print_exc()
+                # Rerun is auxiliary to control and recording. Keep worker failures
+                # out of stdout/stderr so they cannot corrupt a live Rich panel.
+                logging.getLogger(__name__).debug("Rerun logging failed", exc_info=True)
             finally:
                 self._queue.task_done()
 
@@ -279,9 +306,16 @@ class RerunLogger:
                     recording=self._rec,
                 )
 
+        state = data.get("observation.state")
         for i in range(self._joint_count):
-            rr.log(f"states/{i + 1}", rr.Scalars(float(data["observation.state"][i])), recording=self._rec)
+            if state is None:
+                break
+            rr.log(f"states/{i + 1}", rr.Scalars(float(state[i])), recording=self._rec)
             if data.get("teleop") is not None:
                 rr.log(f"teleop/{i + 1}", rr.Scalars(float(data["teleop"][i])), recording=self._rec)
             if data.get("policy") is not None:
                 rr.log(f"policy/{i + 1}", rr.Scalars(float(data["policy"][i])), recording=self._rec)
+        for key in self._position_keys:
+            value = data.get(key)
+            if value is not None:
+                rr.log(key, rr.Scalars(float(value)), recording=self._rec)
