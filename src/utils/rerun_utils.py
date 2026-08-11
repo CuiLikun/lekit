@@ -38,7 +38,7 @@ class RerunLogger:
     # collide with "head". Anything not in the table falls to the end.
     _CAMERA_ORDER = ("head", "left", "right")
     _IMG_PREFIX = "observation.images."
-    _EPISODE_FONT_SCALE = 1.5
+    _EPISODE_FONT_SCALE = 1.0
     _EPISODE_FONT_THICKNESS = 2
     _EPISODE_TOP_MARGIN_PX = 12
     _STATUS_FONT_SCALE = 1.0
@@ -113,7 +113,9 @@ class RerunLogger:
         bottom_row = grid(bottom_views, min(4, len(bottom_views))) if bottom_views else None
 
         if top_row and bottom_row:
-            layout = rr.blueprint.Grid(top_row, bottom_row, grid_columns=1, row_shares=[1, 1], column_shares=[1])
+            layout = rr.blueprint.Grid(
+                top_row, bottom_row, grid_columns=1, row_shares=[1, 1], column_shares=[1]
+            )
         elif top_row:
             layout = top_row
         elif bottom_row:
@@ -171,9 +173,7 @@ class RerunLogger:
             self._image_keys = slots  # all present camera keys, unsorted
             state = data.get("observation.state")
             self._joint_count = len(state) if state is not None else 0
-            position_keys = [
-                key for key, value in data.items() if self._is_position_scalar(key, value)
-            ]
+            position_keys = [key for key, value in data.items() if self._is_position_scalar(key, value)]
             self._position_keys = sorted(
                 position_keys,
                 key=lambda key: (not key.startswith("joint_"), key),
