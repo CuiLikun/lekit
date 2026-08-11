@@ -663,9 +663,13 @@ def _save_episode_quietly(dataset: LeRobotDataset) -> None:
 
 @contextmanager
 def _stable_live(renderable: Any, **kwargs: Any) -> Iterator[Live]:
-    """Run Live without leaving partial tall-panel rows in terminal scrollback."""
+    """Run a manually refreshed Live panel with stable terminal cleanup.
 
-    live = Live(renderable, transient=True, **kwargs)
+    This follows the dashboard's ``screen=False``/``auto_refresh=False`` model so
+    panel updates cannot race a background refresh while the renderable changes height.
+    """
+
+    live = Live(renderable, screen=False, auto_refresh=False, transient=True, **kwargs)
     live.start()
     try:
         yield live
@@ -782,7 +786,8 @@ def _record_loop(
                 recording=False,
                 record_state=episode.state,
             )
-            live.update(_control_panel(device.telemetry, action, obs, robot_status), refresh=True)
+            live.update(_control_panel(device.telemetry, action, obs, robot_status))
+            live.refresh()
             _reset_robot(robot)
             device.rearm()
             hold = HoldLatch(action_keys)
@@ -848,9 +853,9 @@ def _record_loop(
                 action,
                 obs,
                 robot_status,
-            ),
-            refresh=True,
+            )
         )
+        live.refresh()
 
         if episode_finished:
             return "completed"
@@ -956,9 +961,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         ):
             dataset_managed = True
             try:
-                with _stable_live(
-                    initial_panel, refresh_per_second=max(cfg.dataset.fps, 1)
-                ) as live:
+                with _stable_live(initial_panel) as live:
                     loop_kwargs["live"] = live
                     loop_kwargs["control_trace"] = control_trace
                     recorded_episodes = 0

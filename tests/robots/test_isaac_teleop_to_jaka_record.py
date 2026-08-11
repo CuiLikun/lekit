@@ -153,6 +153,9 @@ def test_record_loop_only_buffers_frames_between_a_press_edges(monkeypatch):
         def update(self, *_args, **_kwargs):
             pass
 
+        def refresh(self):
+            pass
+
     monkeypatch.setattr(record_module, "_jaka_status", lambda _robot: {})
     monkeypatch.setattr(record_module, "precise_sleep", lambda _duration: None)
     monkeypatch.setattr(
@@ -270,6 +273,9 @@ def test_record_loop_skips_timed_out_camera_frame_without_stopping_control(monke
         def update(self, *_args, **_kwargs):
             pass
 
+        def refresh(self):
+            pass
+
     monkeypatch.setattr(record_module, "_jaka_status", lambda _robot: {})
     monkeypatch.setattr(record_module, "precise_sleep", lambda _duration: None)
     robot = FakeRobot()
@@ -340,6 +346,8 @@ def test_stable_live_clears_dynamic_render_before_printing_final_panel(monkeypat
     class FakeLive:
         def __init__(self, renderable, **kwargs):
             assert kwargs["transient"] is True
+            assert kwargs["screen"] is False
+            assert kwargs["auto_refresh"] is False
             self.renderable = renderable
             self.console = FakeConsole()
 
@@ -355,7 +363,7 @@ def test_stable_live_clears_dynamic_render_before_printing_final_panel(monkeypat
 
     monkeypatch.setattr(record_module, "Live", FakeLive)
 
-    with record_module._stable_live("initial", refresh_per_second=30) as live:
+    with record_module._stable_live("initial") as live:
         live.renderable = "final panel"
 
     assert calls == [
