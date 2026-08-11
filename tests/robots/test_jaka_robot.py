@@ -193,6 +193,31 @@ def test_joint_action_is_servo_bounded_and_observation_uses_si_units(robot):
     assert arm.send_relative_action({"gripper.pos": 0.1})["gripper.pos"] == pytest.approx(0.6)
 
 
+def test_camera_timeout_preserves_current_arm_observation(robot):
+    arm, _rc = robot
+
+    class StaleCamera:
+        use_rgb = True
+        use_depth = False
+        is_connected = True
+
+        def read_latest(self):
+            raise TimeoutError("latest frame is too old")
+
+        def disconnect(self):
+            pass
+
+    arm.cameras["hand"] = StaleCamera()
+
+    with pytest.raises(driver.JakaCameraTimeoutError) as exc_info:
+        arm.get_observation()
+
+    assert exc_info.value.camera_name == "hand"
+    assert exc_info.value.observation["joint_2.pos"] == pytest.approx(0.1)
+    assert exc_info.value.observation["ee.z"] == pytest.approx(0.3)
+    assert "hand" not in exc_info.value.observation
+
+
 def test_cartesian_action_is_servo_bounded_and_converted_to_mm(monkeypatch):
     rc = FakeRC()
     monkeypatch.setattr(driver, "create_rc", lambda _ip: rc)

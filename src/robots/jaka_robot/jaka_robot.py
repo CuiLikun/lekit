@@ -73,6 +73,20 @@ class JakaError(RuntimeError):
         super().__init__(f"JAKA {operation} failed ({self.code}): {detail}")
 
 
+class JakaCameraTimeoutError(TimeoutError):
+    """A camera timeout carrying the current non-camera robot observation."""
+
+    def __init__(
+        self,
+        camera_name: str,
+        observation: RobotObservation,
+        cause: TimeoutError,
+    ):
+        self.camera_name = camera_name
+        self.observation = dict(observation)
+        super().__init__(f"JAKA camera {camera_name!r} timed out: {cause}")
+
+
 def _sdk_directory() -> Path:
     return Path(__file__).resolve().parent
 
@@ -714,10 +728,13 @@ class JakaRobot(Robot):
             }
             self._last_observation_at = time.monotonic()
         for name, camera in self.cameras.items():
-            if getattr(camera, "use_rgb", True):
-                observation[name] = camera.read_latest()
-            if getattr(camera, "use_depth", False):
-                observation[f"{name}_depth"] = camera.read_latest_depth()
+            try:
+                if getattr(camera, "use_rgb", True):
+                    observation[name] = camera.read_latest()
+                if getattr(camera, "use_depth", False):
+                    observation[f"{name}_depth"] = camera.read_latest_depth()
+            except TimeoutError as exc:
+                raise JakaCameraTimeoutError(name, observation, exc) from exc
         return observation
 
     def _cached_arm_observation(self, *, max_age_s: float = 0.1) -> dict[str, float] | None:

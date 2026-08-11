@@ -188,6 +188,121 @@ def test_record_loop_only_buffers_frames_between_a_press_edges(monkeypatch):
     assert len(dataset.frames) == 2
 
 
+def test_record_loop_skips_timed_out_camera_frame_without_stopping_control(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+    schema_robot = JakaRobot(JakaRobotConfig(ip="127.0.0.1"))
+    features = build_dataset_features(schema_robot, use_videos=False)
+    observation = {
+        key: float(index) / 10
+        for index, key in enumerate(schema_robot.observation_features, start=1)
+        if isinstance(schema_robot.observation_features[key], type)
+    }
+
+    class FakeRobot:
+        action_features = schema_robot.action_features
+
+        def __init__(self):
+            self.read_count = 0
+            self.send_count = 0
+            self.servo_on = False
+
+        def get_observation(self):
+            self.read_count += 1
+            if self.read_count == 2:
+                raise record_module.JakaCameraTimeoutError(
+                    "hand",
+                    observation,
+                    TimeoutError("latest frame is too old"),
+                )
+            return dict(observation)
+
+        def is_in_servo(self):
+            return self.servo_on
+
+        def servo_enable(self, enabled, *, representation="joints"):
+            self.servo_on = enabled
+
+        def send_action(self, action, *, use_servo=True):
+            self.send_count += 1
+            sent = {key: observation[key] for key in self.action_features if key in observation}
+            sent.update(action)
+            return sent
+
+    class FakeDevice:
+        def __init__(self):
+            self.telemetry = {}
+            self._a_values = iter((1.0, 0.0, 0.0, 1.0))
+            self.compute_count = 0
+
+        def compute(self, obs):
+            assert "ee.x" in obs
+            self.compute_count += 1
+            self.telemetry.update(
+                a_button=next(self._a_values),
+                b_button=0.0,
+                trigger=0.0,
+                clutch_engaged=True,
+            )
+            return {
+                key: obs[key]
+                for key in ("ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw")
+            }
+
+        def rearm(self):
+            pass
+
+    class FakeDataset:
+        def __init__(self):
+            self.features = features
+            self.frames = []
+
+        def add_frame(self, frame):
+            self.frames.append(frame)
+
+        def has_pending_frames(self):
+            return bool(self.frames)
+
+        def clear_episode_buffer(self):
+            self.frames.clear()
+
+    class FakeLive:
+        def update(self, *_args, **_kwargs):
+            pass
+
+    monkeypatch.setattr(record_module, "_jaka_status", lambda _robot: {})
+    monkeypatch.setattr(record_module, "precise_sleep", lambda _duration: None)
+    robot = FakeRobot()
+    device = FakeDevice()
+    dataset = FakeDataset()
+    events = {
+        "exit_early": False,
+        "toggle_recording": False,
+        "reset_robot": False,
+        "rerecord_episode": False,
+        "stop_recording": False,
+    }
+
+    outcome = record_module._record_loop(
+        robot,
+        device,
+        [key for key in schema_robot.action_features if key.startswith("ee.")]
+        + ["gripper.pos"],
+        events,
+        30,
+        FakeLive(),
+        dataset=dataset,
+        control_time_s=60,
+        single_task="test",
+    )
+
+    assert outcome == "completed"
+    assert robot.read_count == 4
+    assert robot.send_count == 4
+    assert device.compute_count == 4
+    assert len(dataset.frames) == 2
+
+
 def test_episode_save_keeps_live_active_while_suppressing_progress(monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
     record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
@@ -585,6 +700,21 @@ def test_jaka_status_line_shows_only_three_color_coded_states(monkeypatch):
     )
 
     assert line.plain == "POWER ON   ENABLED OFF   SERVO ON"
+
+
+def test_jaka_status_line_reports_camera_timeout_count():
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+
+    line = record_module._jaka_status_line(
+        {
+            "powered_on": True,
+            "enabled": True,
+            "servo_on": False,
+            "camera_timeout_count": 3,
+        }
+    )
+
+    assert line.plain.endswith("CAM TIMEOUT 3")
 
 
 def test_control_trace_records_disengaged_hold_and_servo_targets(monkeypatch, tmp_path):

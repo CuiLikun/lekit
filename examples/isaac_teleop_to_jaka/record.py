@@ -81,7 +81,7 @@ from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging
-from robots.jaka_robot import JakaRobot, JakaRobotConfig
+from robots.jaka_robot import JakaCameraTimeoutError, JakaRobot, JakaRobotConfig
 from robots.jaka_robot.dataset_features import build_dataset_features
 
 from .control_trace import ControlTraceWriter
@@ -497,6 +497,9 @@ def _jaka_status_line(robot_status: dict[str, Any]) -> Text:
     servo_rate_hz = robot_status.get("servo_rate_hz")
     if isinstance(servo_rate_hz, (int, float)) and servo_rate_hz > 0:
         line.append(f"   {servo_rate_hz:.1f} Hz", style="dim")
+    camera_timeout_count = robot_status.get("camera_timeout_count", 0)
+    if isinstance(camera_timeout_count, int) and camera_timeout_count > 0:
+        line.append(f"   CAM TIMEOUT {camera_timeout_count}", style="yellow")
     return line
 
 
@@ -706,13 +709,21 @@ def _record_loop(
     episode = EpisodeController()
     robot_status: dict[str, Any] = {}
     next_status_refresh_at = 0.0
+    camera_timeout_count = 0
 
     while not events["stop_recording"]:
         loop_start = time.perf_counter()
         control_rate_hz = rate_monitor.update(loop_start)
 
+        camera_frame_valid = True
         try:
             obs = robot.get_observation()
+        except JakaCameraTimeoutError as exc:
+            if events["stop_recording"]:
+                break
+            obs = exc.observation
+            camera_frame_valid = False
+            camera_timeout_count += 1
         except Exception:
             if events["stop_recording"]:
                 break
@@ -808,8 +819,9 @@ def _record_loop(
         robot_status["episode_elapsed_s"] = episode.elapsed_s(loop_start)
         robot_status["recording"] = episode.is_recording
         robot_status["record_state"] = episode.state
+        robot_status["camera_timeout_count"] = camera_timeout_count
 
-        if episode.is_recording:
+        if episode.is_recording and camera_frame_valid:
             obs_frame = build_dataset_frame(dataset.features, obs, prefix=OBS_STR)
             action_frame = build_dataset_frame(dataset.features, sent_action, prefix=ACTION)
             dataset.add_frame({**obs_frame, **action_frame, "task": single_task})
@@ -966,7 +978,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
                         if events["stop_recording"]:
                             break
-                        if outcome == "completed":
+                        if outcome == "completed" and dataset.has_pending_frames():
                             _save_episode_quietly(dataset)
                             recorded_episodes += 1
             finally:
