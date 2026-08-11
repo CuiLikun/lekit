@@ -42,10 +42,10 @@ uv run python -m examples.isaac_teleop_to_jaka.record \
     --rerun_url="rerun+http://127.0.0.1:9876/proxy"
 
 The XR trigger toggles the gripper between closed (0) and open (1) on each press.
-Press A to start or finish an episode, tap B to pause/resume it, and hold B to
-reset the robot. Keyboard shortcuts provide the same controls: Right/n/a toggles
-recording, Space pauses/resumes, b resets, Left/r discards the current episode,
-and Esc/q stops immediately.
+Tap A to start or finish an episode, hold A to discard it and record it again, tap B
+to pause/resume it, and hold B to reset the robot. Keyboard shortcuts provide the
+same controls: Right/n/a toggles recording, Space pauses/resumes, b resets, Left/r
+discards the current episode, and Esc/q stops immediately.
 """
 
 import logging
@@ -182,26 +182,47 @@ class TriggerGripperToggle:
 
 
 class ControllerButtons:
-    """Convert XR A edges and B short/long presses into control commands."""
+    """Convert XR A/B short and long presses into control commands."""
 
     def __init__(self, reset_hold_s: float = DEFAULT_RESET_HOLD_S):
         if not math.isfinite(reset_hold_s) or reset_hold_s <= 0:
             raise ValueError("reset hold duration must be positive and finite")
         self.reset_hold_s = float(reset_hold_s)
         self._a_pressed = False
+        self._a_pressed_at: float | None = None
+        self._a_fired = False
         self._b_pressed_at: float | None = None
         self._b_fired = False
 
     def update(
         self, a_value: float, b_value: float, now: float, *, tracking: bool = True
-    ) -> tuple[bool, bool, bool]:
+    ) -> tuple[bool, bool, bool, bool]:
         if not tracking:
+            self._a_pressed = False
+            self._a_pressed_at = None
+            self._a_fired = False
             self._b_pressed_at = None
             self._b_fired = False
-            return False, False, False
+            return False, False, False, False
 
         a_pressed = math.isfinite(a_value) and a_value >= BUTTON_THRESHOLD
-        toggle_recording = a_pressed and not self._a_pressed
+        toggle_recording = False
+        rerecord_episode = False
+        if a_pressed:
+            if not self._a_pressed:
+                self._a_pressed_at = now
+            elif (
+                not self._a_fired
+                and self._a_pressed_at is not None
+                and now - self._a_pressed_at >= self.reset_hold_s
+            ):
+                self._a_fired = True
+                rerecord_episode = True
+        elif self._a_pressed and not self._a_fired:
+            toggle_recording = True
+        if not a_pressed:
+            self._a_pressed_at = None
+            self._a_fired = False
         self._a_pressed = a_pressed
 
         b_pressed = math.isfinite(b_value) and b_value >= BUTTON_THRESHOLD
@@ -220,7 +241,7 @@ class ControllerButtons:
         elif not self._b_fired and now - self._b_pressed_at >= self.reset_hold_s:
             self._b_fired = True
             reset_robot = True
-        return toggle_recording, toggle_pause, reset_robot
+        return toggle_recording, toggle_pause, reset_robot, rerecord_episode
 
 
 class EpisodeController:
@@ -679,7 +700,7 @@ def _control_panel(
         )
     table.add_row(
         "Controls",
-        "A/n rec | B tap/Space pause | B hold/b reset | stick XY pitch/yaw | click+X roll | r redo | q quit",
+        "A/n rec | A hold redo | B pause | B hold reset | Left/r redo | XY pitch/yaw | X roll | q quit",
     )
     table.add_row("Robot", _jaka_status_line(robot_status))
 
@@ -873,7 +894,7 @@ def _record_loop(
         if events["stop_recording"]:
             break
 
-        a_toggle, b_pause, b_reset = buttons.update(
+        a_toggle, b_pause, b_reset, a_rerecord = buttons.update(
             float(device.telemetry.get("a_button", 0.0)),
             float(device.telemetry.get("b_button", 0.0)),
             loop_start,
@@ -882,13 +903,15 @@ def _record_loop(
         toggle_requested = a_toggle or bool(events.pop("toggle_recording", False))
         pause_requested = b_pause or bool(events.pop("toggle_pause", False))
         reset_requested = b_reset or bool(events.pop("reset_robot", False))
-        discard_requested = bool(events.pop("rerecord_episode", False))
+        discard_requested = a_rerecord or bool(events.pop("rerecord_episode", False))
         events["exit_early"] = False
 
         if discard_requested:
             if dataset.has_pending_frames():
                 dataset.clear_episode_buffer()
             episode.discard()
+            toggle_requested = False
+            pause_requested = False
 
         was_active = episode.is_active
         episode_finished = episode.toggle_recording(loop_start) if toggle_requested else False

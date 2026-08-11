@@ -59,28 +59,37 @@ def test_gripper_toggle_preserves_target_in_disengaged_hold_frames(monkeypatch):
     assert recorded == [1.0, 1.0, 0.0, 0.0]
 
 
-def test_controller_buttons_distinguish_b_short_and_long_presses(monkeypatch):
+def test_controller_buttons_distinguish_a_b_short_and_long_presses(monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
     record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
     buttons = record_module.ControllerButtons(reset_hold_s=1.0)
 
-    assert buttons.update(0.0, 0.0, 10.0) == (False, False, False)
-    assert buttons.update(1.0, 0.0, 10.1) == (True, False, False)
-    assert buttons.update(1.0, 0.0, 10.2) == (False, False, False)
-    assert buttons.update(0.0, 1.0, 10.3) == (False, False, False)
-    assert buttons.update(0.0, 0.0, 10.5) == (False, True, False)
-    assert buttons.update(0.0, 1.0, 11.0) == (False, False, False)
-    assert buttons.update(0.0, 1.0, 11.9) == (False, False, False)
-    assert buttons.update(0.0, 1.0, 12.0) == (False, False, True)
-    assert buttons.update(0.0, 1.0, 13.0) == (False, False, False)
-    assert buttons.update(0.0, 0.0, 13.1) == (False, False, False)
-    assert buttons.update(0.0, 1.0, 14.0) == (False, False, False)
-    assert buttons.update(0.0, 0.0, 15.1) == (False, False, True)
+    assert buttons.update(0.0, 0.0, 10.0) == (False, False, False, False)
+    assert buttons.update(1.0, 0.0, 10.1) == (False, False, False, False)
+    assert buttons.update(1.0, 0.0, 10.2) == (False, False, False, False)
+    assert buttons.update(0.0, 0.0, 10.3) == (True, False, False, False)
+
+    assert buttons.update(0.0, 1.0, 10.4) == (False, False, False, False)
+    assert buttons.update(0.0, 0.0, 10.6) == (False, True, False, False)
+    assert buttons.update(0.0, 1.0, 11.0) == (False, False, False, False)
+    assert buttons.update(0.0, 1.0, 11.9) == (False, False, False, False)
+    assert buttons.update(0.0, 1.0, 12.0) == (False, False, True, False)
+    assert buttons.update(0.0, 1.0, 13.0) == (False, False, False, False)
+    assert buttons.update(0.0, 0.0, 13.1) == (False, False, False, False)
+    assert buttons.update(0.0, 1.0, 14.0) == (False, False, False, False)
+    assert buttons.update(0.0, 0.0, 15.1) == (False, False, True, False)
+
+    assert buttons.update(1.0, 0.0, 16.0) == (False, False, False, False)
+    assert buttons.update(1.0, 0.0, 16.9) == (False, False, False, False)
+    assert buttons.update(1.0, 0.0, 17.0) == (False, False, False, True)
+    assert buttons.update(1.0, 0.0, 18.0) == (False, False, False, False)
+    assert buttons.update(0.0, 0.0, 18.1) == (False, False, False, False)
 
     tracking_safe = record_module.ControllerButtons(reset_hold_s=1.0)
-    assert tracking_safe.update(1.0, 0.0, 20.0) == (True, False, False)
-    assert tracking_safe.update(0.0, 0.0, 20.1, tracking=False) == (False, False, False)
-    assert tracking_safe.update(1.0, 0.0, 20.2) == (False, False, False)
+    assert tracking_safe.update(1.0, 0.0, 20.0) == (False, False, False, False)
+    assert tracking_safe.update(0.0, 0.0, 20.1, tracking=False) == (False, False, False, False)
+    assert tracking_safe.update(1.0, 0.0, 20.2) == (False, False, False, False)
+    assert tracking_safe.update(0.0, 0.0, 20.3) == (True, False, False, False)
 
 
 def test_keyboard_space_requests_pause(monkeypatch):
@@ -184,8 +193,8 @@ def test_record_loop_pauses_dataset_and_updates_rerun_status(monkeypatch):
     class FakeDevice:
         def __init__(self):
             self.telemetry = {}
-            self._a_values = iter((0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0))
-            self._b_values = iter((0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0))
+            self._a_values = iter((0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0))
+            self._b_values = iter((0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0))
 
         def compute(self, _obs):
             self.telemetry.update(
@@ -268,11 +277,11 @@ def test_record_loop_pauses_dataset_and_updates_rerun_status(monkeypatch):
     assert outcome == "completed"
     assert len(dataset.frames) == 3
     assert rerun.switches == 1
-    assert [frame["framestep"] for frame in rerun.frames] == [0, 1, 1, 2]
+    assert [frame["framestep"] for frame in rerun.frames] == [0, 0, 1, 2]
     assert [frame["record_state"] for frame in rerun.frames] == [
         "recording",
-        "recording",
         "pause",
+        "recording",
         "recording",
     ]
     recorded_rerun_frames = [frame for frame in rerun.frames if frame["record_state"] == "recording"]
@@ -282,12 +291,121 @@ def test_record_loop_pauses_dataset_and_updates_rerun_status(monkeypatch):
     assert all(frame["episode_number"] == 2 for frame in rerun.frames)
 
 
+def test_record_loop_discards_attempt_and_records_same_episode_again(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+    schema_robot = JakaRobot(JakaRobotConfig(ip="127.0.0.1"))
+    features = build_dataset_features(schema_robot, use_videos=False)
+    observation = {
+        key: float(index) / 10
+        for index, key in enumerate(schema_robot.observation_features, start=1)
+        if isinstance(schema_robot.observation_features[key], type)
+    }
+
+    class FakeRobot:
+        action_features = schema_robot.action_features
+
+        def get_observation(self):
+            return dict(observation)
+
+        def is_in_servo(self):
+            return False
+
+        def send_action(self, action, *, use_servo=True):
+            return dict(action)
+
+    class FakeDevice:
+        telemetry = {
+            "a_button": 0.0,
+            "b_button": 0.0,
+            "trigger": 0.0,
+            "clutch_engaged": False,
+        }
+
+        def compute(self, _obs):
+            return None
+
+        def rearm(self):
+            pass
+
+    class FakeButtons:
+        def __init__(self):
+            self.commands = iter(
+                (
+                    (True, False, False, False),
+                    (False, False, False, False),
+                    (False, False, False, True),
+                    (True, False, False, False),
+                    (False, False, False, False),
+                    (True, False, False, False),
+                )
+            )
+
+        def update(self, *_args, **_kwargs):
+            return next(self.commands)
+
+    class FakeDataset:
+        def __init__(self):
+            self.features = features
+            self.frames = []
+            self.clear_calls = 0
+
+        def add_frame(self, frame):
+            self.frames.append(frame)
+
+        def has_pending_frames(self):
+            return bool(self.frames)
+
+        def clear_episode_buffer(self):
+            self.clear_calls += 1
+            self.frames.clear()
+
+    class FakeLive:
+        def update(self, *_args, **_kwargs):
+            pass
+
+        def refresh(self):
+            pass
+
+    monkeypatch.setattr(record_module, "_jaka_status", lambda _robot: {})
+    monkeypatch.setattr(record_module, "precise_sleep", lambda _duration: None)
+    dataset = FakeDataset()
+    events = {
+        "exit_early": False,
+        "toggle_recording": False,
+        "toggle_pause": False,
+        "reset_robot": False,
+        "rerecord_episode": False,
+        "stop_recording": False,
+    }
+
+    outcome = record_module._record_loop(
+        FakeRobot(),
+        FakeDevice(),
+        [key for key in schema_robot.action_features if key.startswith("ee.")]
+        + ["gripper.pos"],
+        events,
+        30,
+        FakeLive(),
+        dataset=dataset,
+        control_time_s=60,
+        single_task="test",
+        buttons=FakeButtons(),
+        episode_number=3,
+    )
+
+    assert outcome == "completed"
+    assert dataset.clear_calls == 1
+    assert len(dataset.frames) == 2
+
+
 def test_rerun_logger_detects_pos_fields_and_logs_direct_curves(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
     rerun_module = importlib.import_module("src.utils.rerun_utils")
     logged: list[tuple[str, float]] = []
 
     class FakeQueue:
-        def put_nowait(self, _item):
+        def put_latest(self, _item, _log_command):
             pass
 
     logger = rerun_module.RerunLogger.__new__(rerun_module.RerunLogger)
@@ -314,6 +432,30 @@ def test_rerun_logger_detects_pos_fields_and_logs_direct_curves(monkeypatch):
     assert logger._position_keys == ["joint_1.pos", "joint_2.pos", "gripper.pos"]
     assert ("joint_1.pos", 0.1) in logged
     assert ("gripper.pos", 0.25) in logged
+
+
+def test_rerun_logger_keeps_latest_frame_when_queue_is_full(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    rerun_module = importlib.import_module("src.utils.rerun_utils")
+    logger = rerun_module.RerunLogger.__new__(rerun_module.RerunLogger)
+    logger._joint_count = 0
+    logger._position_keys = []
+    logger._camera_slots = []
+    logger._image_keys = []
+    logger._blueprint_sent = True
+    logger._queue = rerun_module._LatestLogQueue(maxsize=2)
+    blueprint = (logger._CMD_BLUEPRINT, object())
+    logger._queue.put(blueprint)
+
+    logger.log({"framestep": 0})
+    logger.log({"framestep": 1})
+    logger.log({"framestep": 2})
+
+    queued_items = list(logger._queue.queue)
+    assert queued_items[0] == blueprint
+    queued_steps = [item[1]["framestep"] for item in queued_items if item[0] == logger._CMD_LOG]
+    assert queued_steps == [2]
+    assert logger._queue.unfinished_tasks == 2
 
 
 def test_rerun_logger_draws_episode_number_large_at_image_top_center():
@@ -373,7 +515,7 @@ def test_record_loop_reuses_last_camera_frame_after_timeout(monkeypatch):
         def get_observation(self):
             self.read_count += 1
             current = dict(observation)
-            if self.read_count == 2:
+            if self.read_count == 3:
                 raise record_module.JakaCameraTimeoutError(
                     "hand",
                     current,
@@ -397,7 +539,7 @@ def test_record_loop_reuses_last_camera_frame_after_timeout(monkeypatch):
     class FakeDevice:
         def __init__(self):
             self.telemetry = {}
-            self._a_values = iter((1.0, 0.0, 0.0, 1.0))
+            self._a_values = iter((1.0, 0.0, 0.0, 0.0, 1.0, 0.0))
             self.compute_count = 0
 
         def compute(self, obs):
@@ -465,14 +607,15 @@ def test_record_loop_reuses_last_camera_frame_after_timeout(monkeypatch):
     )
 
     assert outcome == "completed"
-    assert robot.read_count == 4
-    assert robot.send_count == 4
-    assert device.compute_count == 4
-    assert len(dataset.frames) == 3
+    assert robot.read_count == 6
+    assert robot.send_count == 6
+    assert device.compute_count == 6
+    assert len(dataset.frames) == 4
     images = [frame["observation.images.hand"] for frame in dataset.frames]
-    np.testing.assert_array_equal(images[0], np.full((2, 2, 3), 1, dtype=np.uint8))
+    np.testing.assert_array_equal(images[0], np.full((2, 2, 3), 2, dtype=np.uint8))
     np.testing.assert_array_equal(images[1], images[0])
-    np.testing.assert_array_equal(images[2], np.full((2, 2, 3), 3, dtype=np.uint8))
+    np.testing.assert_array_equal(images[2], np.full((2, 2, 3), 4, dtype=np.uint8))
+    np.testing.assert_array_equal(images[3], np.full((2, 2, 3), 5, dtype=np.uint8))
 
 
 def test_reuse_latest_camera_frames_reads_stale_driver_buffer_when_cache_is_empty(monkeypatch):
@@ -791,11 +934,12 @@ def test_control_panel_visualizes_only_position_delta(monkeypatch):
     assert "RECORDING" in rendered
     assert "ENGAGED" in rendered
     assert "Episode" in rendered and "2 / 5   12.4 s" in rendered
-    assert "A/n rec" in rendered and "B tap/Space pause" in rendered
-    assert "B hold/b reset" in rendered and "stick XY pitch/yaw" in rendered
-    assert "click+X roll" in rendered
+    assert "A/n rec" in rendered and "A hold redo" in rendered
+    assert "B pause" in rendered and "B hold reset" in rendered
+    assert "XY pitch/yaw" in rendered
+    assert "X roll" in rendered and "Left/r redo" in rendered
     controls_line = next(line for line in rendered.splitlines() if "Controls" in line)
-    assert "stick XY pitch/yaw" in controls_line and "click+X roll" in controls_line
+    assert "XY pitch/yaw" in controls_line and "X roll" in controls_line
     assert "TCP(m/rad)" in rendered
     assert "[0.080, 0.230, 0.310, 0.100, 0.200, 0.300]" in rendered
     assert "Joint(rad)" in rendered

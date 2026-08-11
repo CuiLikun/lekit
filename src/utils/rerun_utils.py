@@ -1,4 +1,3 @@
-import contextlib
 import logging
 import queue
 import threading
@@ -9,6 +8,37 @@ import cv2
 import numpy as np
 import rerun as rr
 import torch
+
+
+class _LatestLogQueue(queue.Queue):
+    """FIFO command queue that coalesces pending live-view frames."""
+
+    def put_latest(self, item: tuple, log_command: int) -> bool:
+        """Replace queued log frames while preserving ordered control commands."""
+
+        with self.not_full:
+            pending = list(self.queue)
+            retained = [
+                queued
+                for queued in pending
+                if not isinstance(queued, tuple) or not queued or queued[0] != log_command
+            ]
+            dropped = len(pending) - len(retained)
+            if dropped:
+                self.queue.clear()
+                self.queue.extend(retained)
+                self.unfinished_tasks -= dropped
+                if self.unfinished_tasks == 0:
+                    self.all_tasks_done.notify_all()
+                self.not_full.notify_all()
+
+            if self.maxsize > 0 and self._qsize() >= self.maxsize:
+                return False
+
+            self._put(item)
+            self.unfinished_tasks += 1
+            self.not_empty.notify()
+            return True
 
 
 class RerunLogger:
@@ -23,7 +53,7 @@ class RerunLogger:
         - ``rerun+http://localhost:9876/proxy``  — same as above (localhost alias)
         - ``rerun+http://192.168.1.10:9876/proxy`` — connect to a remote viewer over gRPC
     max_queue_size: int
-        Maximum queued frames.  Oldest frame is dropped when full.
+        Maximum queued commands. At most one pending live-view frame is retained.
     """
 
     _CMD_LOG = 0
@@ -66,7 +96,7 @@ class RerunLogger:
         )
         self._connect_stream()
 
-        self._queue: queue.Queue[tuple] = queue.Queue(maxsize=max_queue_size)
+        self._queue: _LatestLogQueue = _LatestLogQueue(maxsize=max_queue_size)
         self._stopped = threading.Event()
         self._thread = threading.Thread(target=self._worker, daemon=True, name="RerunLogger")
         self._thread.start()
@@ -183,8 +213,7 @@ class RerunLogger:
         # schema, so each new recording needs another enqueue here.
         self._enqueue_blueprint()
 
-        with contextlib.suppress(queue.Full):
-            self._queue.put_nowait((self._CMD_LOG, data))
+        self._queue.put_latest((self._CMD_LOG, data), self._CMD_LOG)
 
     def switch_record(self) -> None:
         """Switch to a new recording_id (e.g., when starting a new episode).
