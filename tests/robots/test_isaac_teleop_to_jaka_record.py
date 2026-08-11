@@ -5,6 +5,7 @@ import io
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from rich.console import Console
 
@@ -276,45 +277,19 @@ def test_rerun_logger_detects_pos_fields_and_logs_direct_curves(monkeypatch):
     assert ("gripper.pos", 0.25) in logged
 
 
-def test_rerun_logger_overlays_episode_number_at_image_center(monkeypatch):
+def test_rerun_logger_draws_episode_number_large_at_image_top_center():
     rerun_module = importlib.import_module("src.utils.rerun_utils")
-    logged: list[tuple[str, object]] = []
-    points: list[tuple[list[tuple[float, float]], list[str]]] = []
     logger = rerun_module.RerunLogger.__new__(rerun_module.RerunLogger)
-    logger._rec = object()
-    logger._joint_count = 0
-    logger._position_keys = []
-    logger._image_keys = ["observation.images.hand"]
-    logger._next_frame_seq = 0
+    image = np.zeros((100, 300, 3), dtype=np.uint8)
 
-    class FakeImage:
-        def compress(self):
-            return self
+    result = logger._draw_episode_label(image, 4)
 
-    monkeypatch.setattr(logger, "_to_hwc_uint8_numpy", lambda _image: SimpleNamespace(shape=(100, 200, 3)))
-    monkeypatch.setattr(rerun_module.rr, "set_time", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(rerun_module.rr, "Image", lambda _array: FakeImage())
-    monkeypatch.setattr(
-        rerun_module.rr,
-        "Points2D",
-        lambda positions, *, labels, **_kwargs: points.append((positions, labels)) or object(),
-    )
-    monkeypatch.setattr(
-        rerun_module.rr,
-        "log",
-        lambda path, value, **_kwargs: logged.append((path, value)),
-    )
-
-    logger._log_sync(
-        {
-            "observation.images.hand": object(),
-            "episode_number": 4,
-            "framestep": 0,
-        }
-    )
-
-    assert points == [([(100.0, 50.0)], ["Episode 4"])]
-    assert any(path == "overlays/observation.images.hand/episode_label" for path, _ in logged)
+    assert result is not image
+    ys, xs = np.where(np.any(result != 0, axis=2))
+    assert ys.min() <= logger._EPISODE_TOP_MARGIN_PX + 2
+    assert ys.max() < 75
+    assert (xs.min() + xs.max()) / 2 == pytest.approx(150.0, abs=2.0)
+    assert np.count_nonzero(result) > 0
 
 
 def test_record_loop_skips_timed_out_camera_frame_without_stopping_control(monkeypatch):

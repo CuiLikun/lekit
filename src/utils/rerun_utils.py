@@ -5,6 +5,7 @@ import threading
 import time
 import uuid
 
+import cv2
 import numpy as np
 import rerun as rr
 import torch
@@ -37,6 +38,9 @@ class RerunLogger:
     # collide with "head". Anything not in the table falls to the end.
     _CAMERA_ORDER = ("head", "left", "right")
     _IMG_PREFIX = "observation.images."
+    _EPISODE_FONT_SCALE = 2.0
+    _EPISODE_FONT_THICKNESS = 2
+    _EPISODE_TOP_MARGIN_PX = 12
 
     def __init__(self, url: str = "rerun+http://127.0.0.1:9876/proxy", max_queue_size: int = 10):
         self._url = url
@@ -75,7 +79,6 @@ class RerunLogger:
                 contents=[
                     slot,
                     f"overlays/{slot}/task_label",
-                    f"overlays/{slot}/episode_label",
                 ],
                 name=slot,
             )
@@ -281,6 +284,58 @@ class RerunLogger:
             return np.clip(arr * 255.0, 0, 255).astype(np.uint8)
         return np.clip(arr, 0, 255).astype(np.uint8)
 
+    def _draw_episode_label(self, image: np.ndarray, episode_number) -> np.ndarray:
+        """Draw a large top-centered episode label on a Rerun-only image copy."""
+
+        output = np.ascontiguousarray(image.copy())
+        height, width = output.shape[:2]
+        text = f"Episode {episode_number}"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = self._EPISODE_FONT_SCALE
+        (text_width, text_height), _ = cv2.getTextSize(
+            text,
+            font,
+            scale,
+            self._EPISODE_FONT_THICKNESS,
+        )
+        available_width = max(width - 2 * self._EPISODE_TOP_MARGIN_PX, 1)
+        if text_width > available_width:
+            scale *= available_width / text_width
+            (text_width, text_height), _ = cv2.getTextSize(
+                text,
+                font,
+                scale,
+                self._EPISODE_FONT_THICKNESS,
+            )
+
+        origin = (
+            max((width - text_width) // 2, 0),
+            min(self._EPISODE_TOP_MARGIN_PX + text_height, height - 1),
+        )
+        color = (255, 255, 255) if output.ndim == 3 else 255
+        outline = (0, 0, 0) if output.ndim == 3 else 0
+        cv2.putText(
+            output,
+            text,
+            origin,
+            font,
+            scale,
+            outline,
+            self._EPISODE_FONT_THICKNESS + 4,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            output,
+            text,
+            origin,
+            font,
+            scale,
+            color,
+            self._EPISODE_FONT_THICKNESS,
+            cv2.LINE_AA,
+        )
+        return output
+
     def _log_sync(self, data: dict) -> None:
         frame_seq = data.get("framestep")
         frame_seq = self._next_frame_seq if frame_seq is None else int(frame_seq)
@@ -295,6 +350,8 @@ class RerunLogger:
             if img is None:
                 continue
             arr = self._to_hwc_uint8_numpy(img)
+            if episode_number is not None:
+                arr = self._draw_episode_label(arr, episode_number)
             rr.log(name, rr.Image(arr).compress(), recording=self._rec)
             # Overlay the task string at the bottom-center of the image via a
             # Rerun-native 2D archetype. The Spatial2DView pulls this entity
@@ -311,19 +368,6 @@ class RerunLogger:
                     ),
                     recording=self._rec,
                 )
-            if episode_number is not None:
-                h, w = arr.shape[:2]
-                rr.log(
-                    f"overlays/{name}/episode_label",
-                    rr.Points2D(
-                        [(w / 2.0, h / 2.0)],
-                        labels=[f"Episode {episode_number}"],
-                        show_labels=True,
-                        radii=[0.0],
-                    ),
-                    recording=self._rec,
-                )
-
         state = data.get("observation.state")
         for i in range(self._joint_count):
             if state is None:
