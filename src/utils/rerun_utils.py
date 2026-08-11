@@ -38,9 +38,12 @@ class RerunLogger:
     # collide with "head". Anything not in the table falls to the end.
     _CAMERA_ORDER = ("head", "left", "right")
     _IMG_PREFIX = "observation.images."
-    _EPISODE_FONT_SCALE = 2.0
+    _EPISODE_FONT_SCALE = 1.5
     _EPISODE_FONT_THICKNESS = 2
     _EPISODE_TOP_MARGIN_PX = 12
+    _STATUS_FONT_SCALE = 1.0
+    _STATUS_FONT_THICKNESS = 2
+    _STATUS_LINE_GAP_PX = 10
 
     def __init__(self, url: str = "rerun+http://127.0.0.1:9876/proxy", max_queue_size: int = 10):
         self._url = url
@@ -150,6 +153,7 @@ class RerunLogger:
         ``*.pos``                          : scalar position signals such as ``joint_1.pos`` and ``gripper.pos`` (optional)
         ``task``                           : str, task instruction; overlaid on each camera image as a Rerun-native 2D label (optional)
         ``episode_number``                 : current episode number shown at image center (optional)
+        ``record_state``                   : ``recording``/``pause`` status shown below the episode number (optional)
         ``teleop``                         : array-like (optional)
         ``policy``                         : array-like (optional)
         ``framestep``                      : int (optional). If missing, an internal increasing sequence is used.
@@ -284,8 +288,13 @@ class RerunLogger:
             return np.clip(arr * 255.0, 0, 255).astype(np.uint8)
         return np.clip(arr, 0, 255).astype(np.uint8)
 
-    def _draw_episode_label(self, image: np.ndarray, episode_number) -> np.ndarray:
-        """Draw a large top-centered episode label on a Rerun-only image copy."""
+    def _draw_episode_label(
+        self,
+        image: np.ndarray,
+        episode_number,
+        record_state: str | None = None,
+    ) -> np.ndarray:
+        """Draw the episode number and recorder state on a Rerun-only image copy."""
 
         output = np.ascontiguousarray(image.copy())
         height, width = output.shape[:2]
@@ -334,6 +343,52 @@ class RerunLogger:
             self._EPISODE_FONT_THICKNESS,
             cv2.LINE_AA,
         )
+
+        if record_state:
+            status_text = str(record_state).upper()
+            status_scale = self._STATUS_FONT_SCALE
+            (status_width, status_height), _ = cv2.getTextSize(
+                status_text,
+                font,
+                status_scale,
+                self._STATUS_FONT_THICKNESS,
+            )
+            if status_width > available_width:
+                status_scale *= available_width / status_width
+                (status_width, status_height), _ = cv2.getTextSize(
+                    status_text,
+                    font,
+                    status_scale,
+                    self._STATUS_FONT_THICKNESS,
+                )
+            status_origin = (
+                max((width - status_width) // 2, 0),
+                min(origin[1] + self._STATUS_LINE_GAP_PX + status_height, height - 1),
+            )
+            if output.ndim == 3:
+                status_color = (255, 210, 64) if status_text == "PAUSE" else (92, 230, 140)
+            else:
+                status_color = 255
+            cv2.putText(
+                output,
+                status_text,
+                status_origin,
+                font,
+                status_scale,
+                outline,
+                self._STATUS_FONT_THICKNESS + 4,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                output,
+                status_text,
+                status_origin,
+                font,
+                status_scale,
+                status_color,
+                self._STATUS_FONT_THICKNESS,
+                cv2.LINE_AA,
+            )
         return output
 
     def _log_sync(self, data: dict) -> None:
@@ -345,13 +400,14 @@ class RerunLogger:
 
         task = data.get("task")
         episode_number = data.get("episode_number")
+        record_state = data.get("record_state")
         for name in self._image_keys:
             img = data.get(name)
             if img is None:
                 continue
             arr = self._to_hwc_uint8_numpy(img)
             if episode_number is not None:
-                arr = self._draw_episode_label(arr, episode_number)
+                arr = self._draw_episode_label(arr, episode_number, record_state)
             rr.log(name, rr.Image(arr).compress(), recording=self._rec)
             # Overlay the task string at the bottom-center of the image via a
             # Rerun-native 2D archetype. The Spatial2DView pulls this entity

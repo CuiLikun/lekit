@@ -20,7 +20,7 @@ uv run python -m examples.isaac_teleop_to_jaka.record \
     --dataset.repo_id="sorel/pick-cube" \
     --dataset.single_task="pick up the tube from the pad" \
     --dataset.fps=30 \
-    --dataset.num_episodes=3 \
+    --dataset.num_episodes=20 \
     --dataset.episode_time_s=9999 \
     --dataset.streaming_encoding=True \
     --dataset.push_to_hub=False \

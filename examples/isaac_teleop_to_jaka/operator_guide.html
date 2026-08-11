@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f5f6f2">
+  <title>Isaac Teleop to JAKA | 现场采集指南</title>
+  <style>
+    :root {
+      --paper: #f5f6f2;
+      --ink: #17201d;
+      --muted: #65716b;
+      --line: #d8dfd8;
+      --panel: #ffffff;
+      --deep: #173b37;
+      --mint: #bfe8d6;
+      --green: #16805d;
+      --blue: #2e6f9e;
+      --sky: #dcecf4;
+      --amber: #a36b16;
+      --sun: #fff0c9;
+      --coral: #ad4c3f;
+      --rose: #f8dfdb;
+      --shadow: 0 16px 38px rgba(30, 50, 44, .08);
+      --radius: 8px;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--paper);
+      font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.6;
+    }
+    a { color: inherit; }
+    .shell { max-width: 1240px; margin: 0 auto; padding: 22px 28px 70px; }
+    .topbar {
+      display: flex; align-items: center; justify-content: space-between; gap: 20px;
+      padding-bottom: 18px; border-bottom: 1px solid var(--line);
+    }
+    .brand { display: flex; align-items: center; gap: 11px; font-weight: 780; letter-spacing: .01em; }
+    .brand-mark {
+      width: 34px; height: 34px; display: grid; place-items: center; color: var(--panel);
+      background: var(--deep); border-radius: 50%; font-size: 14px; font-weight: 800;
+    }
+    .brand small { display: block; color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; }
+    .top-actions { display: flex; gap: 8px; }
+    .tool {
+      border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 6px;
+      padding: 8px 11px; cursor: pointer; font: inherit; font-size: 13px; font-weight: 700;
+    }
+    .tool:hover { border-color: var(--green); color: var(--green); }
+    .hero {
+      display: grid; grid-template-columns: minmax(0, 1.08fr) minmax(360px, .92fr); gap: 44px;
+      align-items: center; min-height: 500px; padding: 54px 0 46px;
+    }
+    .eyebrow { color: var(--green); font-size: 12px; font-weight: 800; letter-spacing: .16em; text-transform: uppercase; }
+    h1 { margin: 12px 0 17px; max-width: 680px; font-size: clamp(38px, 5vw, 68px); line-height: 1.02; letter-spacing: -.045em; }
+    .hero-copy { max-width: 640px; color: var(--muted); font-size: 17px; }
+    .hero-copy strong { color: var(--ink); }
+    .hero-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 25px; }
+    .pill { display: inline-flex; align-items: center; gap: 7px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 99px; background: var(--panel); color: var(--muted); font-size: 12px; font-weight: 750; }
+    .pill i { display: block; width: 7px; height: 7px; border-radius: 50%; background: var(--green); }
+    .hero-visual {
+      min-height: 380px; position: relative; overflow: hidden; border: 1px solid #c8d6ce; border-radius: var(--radius);
+      background: #e7f1eb; box-shadow: var(--shadow);
+    }
+    .hero-visual::before { content: "FIELD MAP / A5 BASE FRAME"; position: absolute; top: 18px; left: 20px; color: #5b8174; font-size: 10px; font-weight: 800; letter-spacing: .18em; }
+    .hero-robot-img { width: 100%; height: 100%; min-height: 420px; display: block; object-fit: contain; }
+    .axis-note { position: absolute; right: 18px; bottom: 16px; max-width: 170px; padding: 10px 12px; background: rgba(255,255,255,.82); border-left: 3px solid var(--blue); color: var(--deep); font-size: 12px; font-weight: 750; }
+    .section { padding: 42px 0; border-top: 1px solid var(--line); }
+    .section-head { display: flex; align-items: end; justify-content: space-between; gap: 25px; margin-bottom: 24px; }
+    .section-kicker { color: var(--green); font-size: 11px; font-weight: 850; letter-spacing: .15em; text-transform: uppercase; }
+    h2 { margin: 5px 0 0; font-size: 30px; line-height: 1.12; letter-spacing: -.025em; }
+    .section-intro { max-width: 520px; margin: 0; color: var(--muted); font-size: 14px; }
+    .flow {
+      display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; border: 1px solid var(--line); background: var(--panel); border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow);
+    }
+    .flow-step { position: relative; min-height: 156px; padding: 22px 20px 20px; border-right: 1px solid var(--line); }
+    .flow-step:last-child { border-right: 0; }
+    .flow-step::after { content: "→"; position: absolute; right: -13px; top: 58px; z-index: 2; width: 25px; height: 25px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 50%; background: var(--panel); color: var(--green); font-weight: 900; }
+    .flow-step:last-child::after { display: none; }
+    .flow-num { color: var(--green); font: 800 12px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .flow-step h3 { margin: 19px 0 5px; font-size: 17px; }
+    .flow-step p { margin: 0; color: var(--muted); font-size: 13px; }
+    .prep-grid { display: grid; grid-template-columns: 1.05fr .95fr; gap: 20px; }
+    .panel { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); box-shadow: var(--shadow); }
+    .panel-pad { padding: 22px; }
+    .checklist { display: grid; gap: 13px; margin: 0; padding: 0; list-style: none; }
+    .checklist li { display: grid; grid-template-columns: 24px 1fr; gap: 11px; align-items: start; font-size: 14px; }
+    .check { width: 22px; height: 22px; display: grid; place-items: center; border: 1px solid #9ac7b3; border-radius: 50%; background: var(--mint); color: var(--green); font-size: 13px; font-weight: 900; }
+    .checklist strong { display: block; margin-bottom: 2px; }
+    .checklist span { color: var(--muted); font-size: 13px; }
+    .terminal { overflow: hidden; border-radius: 6px; background: #14201e; color: #ddf4e8; font: 12px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .terminal-bar { display: flex; gap: 6px; padding: 10px 13px; border-bottom: 1px solid #2c3d38; color: #8ea89e; font-size: 10px; letter-spacing: .1em; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #e77868; }
+    .dot:nth-child(2) { background: #e5ba59; } .dot:nth-child(3) { background: #6bc69c; }
+    pre { margin: 0; padding: 16px; overflow-x: auto; white-space: pre-wrap; }
+    .code-accent { color: #86d5ba; }
+    .copy-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 13px; border-top: 1px solid #2c3d38; color: #9bb9ad; font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .copy-btn { border: 1px solid #426258; border-radius: 4px; background: transparent; color: #d6f4e4; padding: 5px 8px; cursor: pointer; font: inherit; }
+    .vr-layout { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(290px, .6fr); gap: 20px; align-items: stretch; }
+    .vr-figure { margin: 0; min-width: 0; }
+    .vr-scroll { overflow-x: auto; border: 1px solid #b8c8bf; border-radius: var(--radius); background: #e9efeb; box-shadow: var(--shadow); }
+    .vr-stage { position: relative; min-width: 720px; }
+    .vr-stage img { display: block; width: 100%; height: auto; }
+    .vr-pin { position: absolute; width: 30px; height: 30px; display: grid; place-items: center; border: 3px solid #fff; border-radius: 50%; background: var(--deep); color: #fff; box-shadow: 0 3px 12px rgba(0,0,0,.28); font: 850 12px/1 ui-monospace, monospace; }
+    .vr-pin.one { left: 19%; top: 53%; } .vr-pin.two { left: 23%; top: 73%; } .vr-pin.three { left: 21%; top: 84%; } .vr-pin.four { left: 12%; top: 15%; } .vr-pin.five { left: 49%; top: 1.5%; background: var(--blue); }
+    .vr-figure figcaption { margin-top: 9px; color: var(--muted); font-size: 12px; }
+    .vr-guide { padding: 21px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); box-shadow: var(--shadow); }
+    .vr-guide h3 { margin: 0 0 14px; font-size: 18px; }
+    .vr-steps { display: grid; gap: 13px; margin: 0; padding: 0; list-style: none; counter-reset: vrstep; }
+    .vr-steps li { display: grid; grid-template-columns: 28px 1fr; gap: 10px; color: var(--muted); font-size: 13px; }
+    .vr-steps li::before { counter-increment: vrstep; content: counter(vrstep); width: 26px; height: 26px; display: grid; place-items: center; border-radius: 50%; background: var(--deep); color: white; font: 850 11px ui-monospace, monospace; }
+    .vr-steps strong { display: block; color: var(--ink); margin-bottom: 2px; }
+    .vr-settings { margin-top: 17px; padding-top: 15px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+    .vr-settings b { color: var(--green); }
+    .control-layout { display: grid; grid-template-columns: .92fr 1.08fr; gap: 20px; }
+    .control-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .control-table th { padding: 11px 14px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 11px; letter-spacing: .08em; text-align: left; text-transform: uppercase; }
+    .control-table td { padding: 13px 14px; border-bottom: 1px solid #edf0ec; vertical-align: top; }
+    .control-table tr:last-child td { border-bottom: 0; }
+    kbd { display: inline-block; min-width: 28px; padding: 3px 7px; border: 1px solid #bec9c2; border-bottom-width: 2px; border-radius: 4px; background: #fafbf9; color: var(--deep); font: 750 12px ui-monospace, SFMono-Regular, Menlo, monospace; text-align: center; }
+    .signal { display: flex; align-items: center; gap: 10px; }
+    .signal-bar { flex: 1; height: 9px; border-radius: 99px; background: #edf1ed; overflow: hidden; }
+    .signal-bar b { display: block; height: 100%; border-radius: inherit; background: var(--green); }
+    .states { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .state { padding: 17px; border: 1px solid var(--line); border-top: 4px solid var(--green); border-radius: var(--radius); background: var(--panel); }
+    .state.pause { border-top-color: #8d4f9d; } .state.reset { border-top-color: var(--amber); } .state.stop { border-top-color: var(--coral); }
+    .state-title { display: flex; align-items: center; gap: 8px; font-weight: 820; }
+    .state-title i { width: 9px; height: 9px; border-radius: 50%; background: var(--green); } .pause .state-title i { background: #8d4f9d; } .reset .state-title i { background: var(--amber); } .stop .state-title i { background: var(--coral); }
+    .state p { margin: 9px 0 0; color: var(--muted); font-size: 13px; }
+    .axis-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: stretch; }
+    .axis-card { padding: 22px; border: 1px solid #bad4e0; border-radius: var(--radius); background: var(--sky); }
+    .axis-card h3 { margin: 0 0 15px; color: #255a7c; font-size: 17px; }
+    .axis-line { display: flex; align-items: center; gap: 11px; margin: 10px 0; font-size: 14px; }
+    .axis-tag { width: 32px; height: 27px; display: grid; place-items: center; border-radius: 4px; background: var(--blue); color: #fff; font: 800 12px ui-monospace, monospace; }
+    .axis-line span { color: #3e5d6a; }
+    .axis-visual { display: grid; place-items: center; min-height: 285px; border: 1px solid #b4c2bb; border-radius: var(--radius); background: #eef5ef; }
+    .axis-visual svg { width: 100%; height: 100%; min-height: 285px; display: block; }
+    .rerun-layout { display: grid; grid-template-columns: 1.1fr .9fr; gap: 20px; }
+    .rerun-shot { min-height: 260px; padding: 18px; border: 1px solid #c7d5ce; border-radius: var(--radius); background: #e4efe8; }
+    .viewer { height: 220px; display: grid; grid-template-columns: 1.15fr .85fr; gap: 8px; padding: 10px; border: 1px solid #aebfb5; border-radius: 5px; background: #263832; }
+    .viewer-image { position: relative; overflow: hidden; border: 1px solid #668377; background: #bbd2c0; }
+    .viewer-image::before { content: "Episode 02 · RECORDING"; position: absolute; top: 11px; left: 50%; transform: translateX(-50%); z-index: 1; padding: 5px 9px; border-radius: 3px; background: rgba(16, 32, 27, .72); color: white; font-size: 17px; font-weight: 850; white-space: nowrap; }
+    .viewer-image::after { content: "CAMERA / hand"; position: absolute; left: 12px; bottom: 10px; color: #e9fff2; font: 10px ui-monospace, monospace; letter-spacing: .08em; }
+    .viewer-image .arm { position: absolute; left: 38%; bottom: 21%; width: 30%; height: 8px; transform: rotate(-30deg); border-radius: 8px; background: #e8f1e9; box-shadow: 42px -30px 0 -1px #e8f1e9; }
+    .viewer-chart { display: grid; align-content: end; gap: 9px; padding: 13px; border: 1px solid #506c5f; background: #192923; }
+    .chart-line { height: 46px; position: relative; border-bottom: 1px solid #3e594e; }
+    .chart-line::after { content: ""; position: absolute; inset: 11px 0 0; border-top: 2px solid #73d2a5; transform: skewY(-8deg); }
+    .chart-line:last-child::after { border-color: #e4be64; transform: skewY(8deg); }
+    .chart-label { color: #a8c4b5; font: 10px ui-monospace, monospace; }
+    .validation { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+    .validation li { display: flex; gap: 10px; align-items: baseline; color: var(--muted); font-size: 14px; }
+    .validation li::before { content: "✓"; color: var(--green); font-weight: 900; }
+    .warning { display: grid; grid-template-columns: 28px 1fr; gap: 13px; align-items: start; margin-top: 22px; padding: 16px 18px; border: 1px solid #e8c477; border-radius: var(--radius); background: var(--sun); color: #765016; }
+    .warning strong { color: #6c4611; }
+    .warning-icon { font-weight: 900; font-size: 20px; line-height: 1; }
+    .footer { display: flex; justify-content: space-between; gap: 20px; padding-top: 30px; color: var(--muted); font-size: 12px; }
+    .footer a { color: var(--green); font-weight: 750; }
+    @media (max-width: 900px) {
+      .hero, .prep-grid, .vr-layout, .control-layout, .axis-grid, .rerun-layout { grid-template-columns: 1fr; }
+      .hero { padding-top: 34px; }
+      .hero-visual { min-height: 320px; }
+      .hero-robot-img { min-height: 360px; }
+      .flow { grid-template-columns: repeat(2, 1fr); }
+      .flow-step:nth-child(2) { border-right: 0; }
+      .flow-step:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
+      .flow-step::after { display: none; }
+    }
+    @media (max-width: 590px) {
+      .shell { padding: 16px 16px 45px; }
+      .top-actions { display: none; }
+      h1 { font-size: 38px; }
+      .section { padding: 31px 0; }
+      .section-head { display: block; }
+      .section-intro { margin-top: 10px; }
+      .flow, .states { grid-template-columns: 1fr; }
+      .flow-step { border-right: 0; border-bottom: 1px solid var(--line); }
+      .flow-step:last-child { border-bottom: 0; }
+      .viewer { grid-template-columns: 1fr; height: 410px; }
+      .viewer-chart { min-height: 130px; }
+      .vr-stage { min-width: 700px; }
+      .footer { display: block; }
+    }
+    @media print {
+      body { background: white; }
+      .shell { max-width: none; padding: 0; }
+      .top-actions { display: none; }
+      .panel, .hero-visual, .flow { box-shadow: none; }
+      .vr-stage { min-width: 0; }
+      #controls { break-before: page; break-inside: auto; padding-top: 20px; padding-bottom: 20px; }
+      #controls .section-head { margin-bottom: 12px; }
+      #controls .control-table td { padding: 8px 10px; }
+      #controls .state { padding: 10px; }
+      #controls .state p { margin-top: 5px; font-size: 11px; }
+      .section { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">J5</span>
+        <div>ISAAC TELEOP → JAKA<small>A5 / DATA CAPTURE FIELD GUIDE</small></div>
+      </div>
+      <div class="top-actions">
+        <button class="tool" type="button" onclick="window.print()">打印这页</button>
+        <button class="tool" type="button" onclick="document.getElementById('run').scrollIntoView()">看启动检查</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div>
+          <div class="eyebrow">operator guide / capture day</div>
+          <h1>先把方向对上，<br><span style="color:var(--green)">再开始采集。</span></h1>
+          <p class="hero-copy">这页给现场操作者用。启动 CloudXR，确认 JAKA 坐标和站位，用 A 管回合，用短按 B 或 Space 暂停，再到 Rerun 看画面和曲线。方向、延迟、抖动或相机超时出现时，照着页面停下来处理。</p>
+          <div class="hero-meta">
+            <span class="pill"><i></i> JAKA A5 / Servo P</span>
+            <span class="pill"><i style="background:var(--blue)"></i> LeRobot / 30 Hz</span>
+            <span class="pill"><i style="background:var(--amber)"></i> XR / clutch + head yaw</span>
+          </div>
+        </div>
+        <div class="hero-visual" aria-label="JAKA 3D robot reference">
+          <img class="hero-robot-img" src="assets/jaka_a5_3d_reference.jpg" alt="JAKA 移动操作机器人三维产品参考图">
+          <div class="axis-note">按 squeeze 接合时锁存头显 yaw；松开后 TCP 保持目标，不跟随转头漂移。</div>
+        </div>
+      </section>
+
+      <section class="section" id="map">
+        <div class="section-head"><div><div class="section-kicker">one-line workflow</div><h2>每个回合照这 4 步走</h2></div><p class="section-intro">顺序固定下来，现场就少一个变量。先让设备可控，再让它写帧，机械臂运动时不要改参数。</p></div>
+        <div class="flow">
+          <div class="flow-step"><div class="flow-num">01 / CHECK</div><h3>先清场</h3><p>清空工作区，确认急停、负载、碰撞等级和相机都处于可用状态。</p></div>
+          <div class="flow-step"><div class="flow-num">02 / READY</div><h3>确认 READY</h3><p>站到机器人侧后方，看一眼面板。位置不合适时长按 B 复位。</p></div>
+          <div class="flow-step"><div class="flow-num">03 / RECORD</div><h3>按 A 开始</h3><p>按 A 后才会写入数据。A 再按一次结束，B 短按或 Space 可以暂停。</p></div>
+          <div class="flow-step"><div class="flow-num">04 / REVIEW</div><h3>检查这一回合</h3><p>在 Rerun 里确认相机、Episode、关节和夹爪曲线，再决定是否保留。</p></div>
+        </div>
+      </section>
+
+      <section class="section" id="run">
+        <div class="section-head"><div><div class="section-kicker">before motion</div><h2>启动后先别急着动</h2></div><p class="section-intro">下面四项都确认，再做第一组小动作。哪一项拿不准，就停在 READY 继续查。</p></div>
+        <div class="prep-grid">
+          <div class="panel panel-pad">
+            <ul class="checklist">
+              <li><b class="check">✓</b><div><strong>工作区与安全</strong><span>清掉工作区内的物体，确认 A5 负载、碰撞等级、tool frame、user frame 和急停设置。</span></div></li>
+              <li><b class="check">✓</b><div><strong>坐标和站位</strong><span>JAKA `+X` 向右、`+Y` 向前、`+Z` 向上，使用 `user_frame_id=0`。操作者站在机器人侧后方，与机器人同向。</span></div></li>
+              <li><b class="check">✓</b><div><strong>头显与手柄</strong><span>CloudXR 页面已连接，头显和右手柄姿态有效。第一次 squeeze 前站稳，面向自己认定的工作前方。</span></div></li>
+              <li><b class="check">✓</b><div><strong>相机与 Rerun</strong><span>RealSense 序列号、分辨率和 FPS 对得上。要看在线曲线时，再确认 Rerun viewer 已连接。</span></div></li>
+            </ul>
+          </div>
+          <div class="terminal" id="command-box">
+            <div class="terminal-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span style="margin-left:7px">capture / terminal</span></div>
+            <pre id="command-text"><span class="code-accent">uv run python -m</span> examples.isaac_teleop_to_jaka.record \
+  --robot.type=jaka_robot \
+  --robot.ip=192.168.1.31 \
+  --robot.id=jaka_arm \
+  --robot.user_frame_id=0 \
+  --teleop.type=xr_controller \
+  --teleop.use_head_yaw=true \
+  --teleop.lock_pose=true \
+  --dataset.repo_id="sorel/pick-cube" \
+  --dataset.fps=30 \
+  --dataset.num_episodes=3 \
+  --rerun_url="rerun+http://127.0.0.1:9876/proxy"</pre>
+            <div class="copy-row"><span>参数以 `record.py` 顶部示例和 README.md 为准</span><button class="copy-btn" type="button" onclick="copyCommand()">复制命令</button></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="vr-client">
+        <div class="section-head"><div><div class="section-kicker">inside headset</div><h2>在头显里完成 XR 连接</h2></div><p class="section-intro">头显里只做连接，不在这里改机器人参数。按图完成证书、CONNECT 和 Enter XR，图中的 IP 仅作示例，现场以终端输出为准。</p></div>
+        <div class="vr-layout">
+          <figure class="vr-figure">
+            <div class="vr-scroll" aria-label="Isaac Teleop Web Client reference screenshot">
+              <div class="vr-stage">
+                <img src="assets/isaac_teleop_web_client.jpg" alt="Isaac Teleop Web Client 设置页面，包含 CONNECT、Server IP、证书和 AR Immersive 选项">
+                <span class="vr-pin one">1</span><span class="vr-pin two">2</span><span class="vr-pin three">3</span><span class="vr-pin four">4</span><span class="vr-pin five">5</span>
+              </div>
+            </div>
+            <figcaption>这是页面参考图，移动端可以横向查看。图中的 `192.168.1.201` 不要照抄，使用终端打印出的工作站地址。</figcaption>
+          </figure>
+          <aside class="vr-guide">
+            <h3>按这 5 步进 XR</h3>
+            <ol class="vr-steps">
+              <li><div><strong>填工作站地址</strong>选择 `Manual Input IP:Port`，输入运行 record.py 的工作站 IP。</div></li>
+              <li><div><strong>先接受证书</strong>点击蓝色 `accept cert`，在新页面确认后返回原页面。</div></li>
+              <li><div><strong>保留 AR Immersive</strong>让透视环境保持可见，方便看真实机械臂和工作区。</div></li>
+              <li><div><strong>点击 CONNECT</strong>等待 CloudXR 页面确认连接成功。没有反馈时先查 IP 和证书。</div></li>
+              <li><div><strong>点击 Enter XR</strong>授权 WebXR，确认右手柄模型和控制面板都能看到。</div></li>
+            </ol>
+            <div class="vr-settings"><b>建议保持</b> Device Profile = Custom · Controller Model = Show · Panel Position = Center · Show control panel · Headless 关闭。</div>
+          </aside>
+        </div>
+        <div class="warning"><div class="warning-icon">!</div><div><strong>CONNECT 没反应时先查连接。</strong><br>确认头显和工作站在同一可达网络，再核对终端打印的 IP 与 `48322` 证书地址。</div></div>
+      </section>
+
+      <section class="section" id="controls">
+        <div class="section-head"><div><div class="section-kicker">hands on</div><h2>手柄负责动作，键盘负责兜底</h2></div><p class="section-intro">手柄用于连续遥操，键盘保留为备用和退出通道。面板状态要和你的动作一致，LOOP 接近 30 Hz 再继续采集。</p></div>
+        <div class="control-layout">
+          <div class="panel">
+            <table class="control-table">
+              <thead><tr><th>输入</th><th>动作</th><th>面板反馈</th></tr></thead>
+              <tbody>
+                <tr><td><kbd>A</kbd><br><kbd>a</kbd> / <kbd>n</kbd> / <kbd>→</kbd></td><td>开始或结束当前回合</td><td><strong>READY / RECORDING</strong></td></tr>
+                <tr><td><kbd>B</kbd> 短按<br><kbd>Space</kbd></td><td>暂停或恢复当前回合</td><td><strong>PAUSE / RECORDING</strong></td></tr>
+                <tr><td><kbd>B</kbd> 长按<br><kbd>b</kbd></td><td>执行 `reset_joints` 复位</td><td><strong>RESETTING</strong></td></tr>
+                <tr><td>squeeze</td><td>按住后接合 TCP 控制，松开后保持当前目标</td><td>ENGAGED / HOLD</td></tr>
+                <tr><td>trigger</td><td>每次按下切换夹爪目标</td><td><span class="signal"><span>gripper</span><span class="signal-bar"><b style="width:62%"></b></span></span></td></tr>
+                <tr><td>摇杆</td><td>上下调 pitch，左右调 yaw，按住摇杆再左右调 roll</td><td>LOCK_POSE 基准</td></tr>
+                <tr><td><kbd>r</kbd> / <kbd>←</kbd></td><td>放弃当前回合并回到等待状态</td><td><strong>READY</strong></td></tr>
+                <tr><td><kbd>Esc</kbd> / <kbd>q</kbd></td><td>停止采集并释放硬件</td><td>安全停止</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="states">
+            <div class="state"><div class="state-title"><i></i>READY</div><p>还没有写入当前回合。先确认站位和方向，再按 A。</p></div>
+            <div class="state"><div class="state-title"><i></i>RECORDING</div><p>正在写入数据。A 结束回合，B 短按或 Space 暂停，暂停时间不计入回合时长。</p></div>
+            <div class="state pause"><div class="state-title"><i></i>PAUSE</div><p>回合保留，当前不写帧。再次短按 B 或 Space 继续，机械臂控制仍保持运行。</p></div>
+            <div class="state reset"><div class="state-title"><i></i>RESETTING</div><p>B 长按触发。Servo 关闭后用 `send_action(..., use_servo=false)` 执行复位。</p></div>
+            <div class="state stop"><div class="state-title"><i></i>STOP</div><p>Esc/q 停止程序并释放硬件。需要停住 TCP 时先松开 squeeze。</p></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="axes">
+        <div class="section-head"><div><div class="section-kicker">coordinate sanity</div><h2>先用小动作把方向对上</h2></div><p class="section-intro">第一次接合只做三笔小动作。每次都看 TCP 是否跟手柄同向，方向不对就立刻松开 squeeze。</p></div>
+        <div class="axis-grid">
+          <div class="axis-card">
+            <h3>JAKA base frame</h3>
+            <div class="axis-line"><b class="axis-tag">+X</b><span>机器人右侧 / TCP 向右</span></div>
+            <div class="axis-line"><b class="axis-tag" style="background:var(--green)">+Y</b><span>机器人前方 / TCP 向前</span></div>
+            <div class="axis-line"><b class="axis-tag" style="background:var(--coral)">+Z</b><span>向上 / TCP 上升</span></div>
+            <p style="margin:18px 0 0;color:#4a6870;font-size:13px">`use_head_yaw=true` 时，每次 squeeze 接合只锁存一次头显水平 yaw。接合后转头不会让 TCP 漂移。</p>
+          </div>
+          <div class="axis-visual">
+            <svg viewBox="0 0 520 340" role="img" aria-label="操作者位于机器人侧后方，与机器人同向站位的俯视示意图">
+              <defs>
+                <pattern id="floorGrid" width="28" height="28" patternUnits="userSpaceOnUse"><path d="M28 0H0V28" fill="none" stroke="#d7e3dc" stroke-width="1"/></pattern>
+                <marker id="standForward" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#16805d"/></marker>
+                <marker id="standRight" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#2e6f9e"/></marker>
+              </defs>
+              <rect width="520" height="340" fill="url(#floorGrid)"/>
+              <rect x="125" y="32" width="270" height="118" rx="12" fill="#dfeae4" stroke="#93b1a2" stroke-width="2"/>
+              <text x="145" y="56" fill="#658176" font-size="11" font-weight="800" letter-spacing="1.3">ROBOT WORKSPACE / KEEP CLEAR</text>
+              <rect x="213" y="74" width="94" height="58" rx="10" fill="#fff" stroke="#173b37" stroke-width="4"/>
+              <circle cx="260" cy="92" r="18" fill="#d95b64" stroke="#8b2f38" stroke-width="3"/>
+              <path d="M260 74 L260 48" stroke="#8b2f38" stroke-width="9" stroke-linecap="round"/>
+              <path d="M260 49 L290 35" stroke="#8b2f38" stroke-width="7" stroke-linecap="round"/>
+              <text x="221" y="122" fill="#173b37" font-size="12" font-weight="850">JAKA / FRONT</text>
+              <path d="M260 74 L260 18" stroke="#16805d" stroke-width="4" marker-end="url(#standForward)"/>
+              <text x="270" y="28" fill="#16805d" font-size="13" font-weight="850">+Y FORWARD</text>
+              <path d="M307 104 L370 104" stroke="#2e6f9e" stroke-width="4" marker-end="url(#standRight)"/>
+              <text x="348" y="94" fill="#2e6f9e" font-size="13" font-weight="850">+X RIGHT</text>
+              <path d="M285 153 L342 202" stroke="#90a99e" stroke-width="2" stroke-dasharray="6 6"/>
+              <text x="293" y="180" fill="#6b8378" font-size="11" font-weight="750">SAFE GAP</text>
+              <circle cx="360" cy="235" r="27" fill="#bfe8d6" stroke="#173b37" stroke-width="3"/>
+              <path d="M340 226 Q360 202 380 226" fill="none" stroke="#173b37" stroke-width="7" stroke-linecap="round"/>
+              <circle cx="360" cy="235" r="5" fill="#173b37"/>
+              <path d="M360 208 L360 171" stroke="#16805d" stroke-width="4" marker-end="url(#standForward)"/>
+              <path d="M387 235 L435 235" stroke="#2e6f9e" stroke-width="4" marker-end="url(#standRight)"/>
+              <text x="371" y="165" fill="#16805d" font-size="12" font-weight="850">OPERATOR FORWARD</text>
+              <text x="409" y="225" fill="#2e6f9e" font-size="12" font-weight="850">RIGHT</text>
+              <text x="312" y="286" fill="#173b37" font-size="15" font-weight="900">OPERATOR</text>
+              <rect x="42" y="300" width="436" height="28" rx="4" fill="#173b37"/>
+              <text x="260" y="319" fill="#fff" font-size="12" font-weight="800" text-anchor="middle">同向站位 · 操作者在机器人侧后方（便于观察） · 面向 +Y</text>
+            </svg>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="rerun">
+        <div class="section-head"><div><div class="section-kicker">live review</div><h2>采完先在 Rerun 看一眼</h2></div><p class="section-intro">Viewer 里每个回合单独显示。相机顶部有 Episode 和 RECORDING/PAUSE，底部是任务文字，下面是关节与夹爪曲线。</p></div>
+        <div class="rerun-layout">
+          <div class="rerun-shot">
+            <div class="viewer">
+              <div class="viewer-image"><div class="arm"></div></div>
+              <div class="viewer-chart"><span class="chart-label">joint_1.pos</span><div class="chart-line"></div><span class="chart-label">gripper.pos</span><div class="chart-line"></div></div>
+            </div>
+          </div>
+          <div class="panel panel-pad">
+            <ul class="validation">
+              <li>Episode 号和当前回合一致，帧序从 0 开始增长。</li>
+              <li>暂停时画面显示 PAUSE，恢复后显示 RECORDING，暂停区间不写入数据集。</li>
+              <li>相机画面连续，顶部 Episode 标签在正中央。</li>
+              <li>`joint_1.pos ... joint_6.pos` 曲线没有明显断裂。</li>
+              <li>`gripper.pos` 在每次 trigger 后都保持正确目标值。</li>
+              <li>LOOP 接近 30 Hz，`CAM TIMEOUT` 没有持续增加。</li>
+            </ul>
+            <div class="warning"><div class="warning-icon">!</div><div><strong>遇到异常先停。</strong><br>方向反了、TCP 漂移、夹爪跳变或 `CAM TIMEOUT` 持续增加时，松开 squeeze，再按 Esc/q。记下现象和当时的面板状态，处理完再继续。</div></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="finish">
+        <div class="section-head"><div><div class="section-kicker">close the loop</div><h2>收尾时按顺序做</h2></div><p class="section-intro">A 结束当前回合，Esc/q 结束整次采集。给设备和数据集留出正常收尾时间。</p></div>
+        <div class="flow">
+          <div class="flow-step"><div class="flow-num">A / STOP EPISODE</div><h3>结束当前回合</h3><p>再次按 A，面板回到 READY，程序保存当前 episode。PAUSE 状态也用 A 结束。</p></div>
+          <div class="flow-step"><div class="flow-num">B / RESET</div><h3>准备下一回合</h3><p>位置不合适时长按 B，等 RESETTING 完成并回到 READY 后再开始。</p></div>
+          <div class="flow-step"><div class="flow-num">ESC / QUIT</div><h3>正常退出</h3><p>Esc/q 会停止程序，释放 XR 和硬件，并刷新 Rerun 队列。</p></div>
+          <div class="flow-step"><div class="flow-num">POST / ARCHIVE</div><h3>核对文件</h3><p>确认 dataset、视频、control trace 和 Rerun recording 都能找到。</p></div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>现场采集指南 · Isaac Teleop to JAKA · A5</span>
+      <span><a href="README.md">README</a> · <a href="record.py">record.py</a></span>
+    </footer>
+  </div>
+  <script>
+    function copyCommand() {
+      const text = document.getElementById('command-text').innerText;
+      navigator.clipboard.writeText(text).then(() => {
+        const button = document.querySelector('.copy-btn');
+        const original = button.textContent;
+        button.textContent = '已复制';
+        setTimeout(() => { button.textContent = original; }, 1400);
+      });
+    }
+  </script>
+</body>
+</html>

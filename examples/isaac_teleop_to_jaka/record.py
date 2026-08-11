@@ -42,9 +42,10 @@ uv run python -m examples.isaac_teleop_to_jaka.record \
     --rerun_url="rerun+http://127.0.0.1:9876/proxy"
 
 The XR trigger toggles the gripper between closed (0) and open (1) on each press.
-Press A to start or finish an episode and hold B to reset the robot. Keyboard
-shortcuts provide the same controls: Right/n/a toggles recording, b resets,
-Left/r discards the current episode, and Esc/q stops immediately.
+Press A to start or finish an episode, tap B to pause/resume it, and hold B to
+reset the robot. Keyboard shortcuts provide the same controls: Right/n/a toggles
+recording, Space pauses/resumes, b resets, Left/r discards the current episode,
+and Esc/q stops immediately.
 """
 
 import logging
@@ -178,7 +179,7 @@ class TriggerGripperToggle:
 
 
 class ControllerButtons:
-    """Convert XR A edges and B holds into one-shot control commands."""
+    """Convert XR A edges and B short/long presses into control commands."""
 
     def __init__(self, reset_hold_s: float = DEFAULT_RESET_HOLD_S):
         if not math.isfinite(reset_hold_s) or reset_hold_s <= 0:
@@ -190,19 +191,25 @@ class ControllerButtons:
 
     def update(
         self, a_value: float, b_value: float, now: float, *, tracking: bool = True
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, bool, bool]:
         if not tracking:
             self._b_pressed_at = None
             self._b_fired = False
-            return False, False
+            return False, False, False
 
         a_pressed = math.isfinite(a_value) and a_value >= BUTTON_THRESHOLD
         toggle_recording = a_pressed and not self._a_pressed
         self._a_pressed = a_pressed
 
         b_pressed = math.isfinite(b_value) and b_value >= BUTTON_THRESHOLD
+        toggle_pause = False
         reset_robot = False
         if not b_pressed:
+            if self._b_pressed_at is not None and not self._b_fired:
+                if now - self._b_pressed_at >= self.reset_hold_s:
+                    reset_robot = True
+                else:
+                    toggle_pause = True
             self._b_pressed_at = None
             self._b_fired = False
         elif self._b_pressed_at is None:
@@ -210,44 +217,77 @@ class ControllerButtons:
         elif not self._b_fired and now - self._b_pressed_at >= self.reset_hold_s:
             self._b_fired = True
             reset_robot = True
-        return toggle_recording, reset_robot
+        return toggle_recording, toggle_pause, reset_robot
 
 
 class EpisodeController:
-    """Track the explicit ready/recording/resetting recorder state."""
+    """Track the explicit ready/recording/pause/resetting recorder state."""
 
     def __init__(self):
         self.state = "ready"
         self.started_at: float | None = None
+        self.paused_at: float | None = None
+        self.total_paused_s = 0.0
 
     @property
     def is_recording(self) -> bool:
         return self.state == "recording"
 
+    @property
+    def is_active(self) -> bool:
+        return self.state in ("recording", "pause")
+
+    @property
+    def is_paused(self) -> bool:
+        return self.state == "pause"
+
+    def _clear_timing(self) -> None:
+        self.started_at = None
+        self.paused_at = None
+        self.total_paused_s = 0.0
+
     def toggle_recording(self, now: float) -> bool:
         if self.state == "ready":
             self.state = "recording"
             self.started_at = now
+            self.paused_at = None
+            self.total_paused_s = 0.0
             return False
-        if self.state == "recording":
+        if self.is_active:
             self.state = "ready"
-            self.started_at = None
+            self._clear_timing()
+            return True
+        return False
+
+    def toggle_pause(self, now: float) -> bool:
+        if self.state == "recording":
+            self.state = "pause"
+            self.paused_at = now
+            return True
+        if self.state == "pause":
+            if self.paused_at is not None:
+                self.total_paused_s += max(now - self.paused_at, 0.0)
+            self.paused_at = None
+            self.state = "recording"
             return True
         return False
 
     def discard(self) -> None:
         self.state = "ready"
-        self.started_at = None
+        self._clear_timing()
 
     def begin_reset(self) -> None:
         self.state = "resetting"
-        self.started_at = None
+        self._clear_timing()
 
     def finish_reset(self) -> None:
         self.state = "ready"
 
     def elapsed_s(self, now: float) -> float:
-        return max(now - self.started_at, 0.0) if self.started_at is not None else 0.0
+        if self.started_at is None:
+            return 0.0
+        effective_now = self.paused_at if self.is_paused and self.paused_at is not None else now
+        return max(effective_now - self.started_at - self.total_paused_s, 0.0)
 
 
 def _send_action_for_clutch_state(
@@ -300,6 +340,7 @@ def init_keyboard_listener(stop_callback: Callable[[], None] | None = None):
     events = {
         "exit_early": False,
         "toggle_recording": False,
+        "toggle_pause": False,
         "reset_robot": False,
         "rerecord_episode": False,
         "stop_recording": False,
@@ -309,6 +350,8 @@ def init_keyboard_listener(stop_callback: Callable[[], None] | None = None):
         key = name.lower()
         if key in ("right", "n", "a"):
             events["toggle_recording"] = True
+        elif key in ("space", " "):
+            events["toggle_pause"] = True
         elif key == "b":
             events["reset_robot"] = True
         elif key in ("left", "r"):
@@ -326,7 +369,8 @@ def init_keyboard_listener(stop_callback: Callable[[], None] | None = None):
         listener.start()
         logging.info(
             "Keyboard control via terminal - keep this terminal focused: "
-            "Right/n/a = start/end, b = reset, Left/r = discard, Esc/q = stop."
+            "Right/n/a = start/end, Space = pause/resume, b = reset, "
+            "Left/r = discard, Esc/q = stop."
         )
         return listener, events
 
@@ -334,7 +378,7 @@ def init_keyboard_listener(stop_callback: Callable[[], None] | None = None):
 
     listener = create_key_listener(
         on_key,
-        controls_help="Right/n/a=start/end, b=reset, Left/r=discard, Esc/q=quit",
+        controls_help="Right/n/a=start/end, Space=pause/resume, b=reset, Left/r=discard, Esc/q=quit",
     )
     return listener, events
 
@@ -552,9 +596,15 @@ def _control_panel(
     state_styles = {
         "ready": "bold cyan",
         "recording": "bold green",
+        "pause": "bold magenta",
         "resetting": "bold yellow",
     }
-    border_styles = {"ready": "cyan", "recording": "green", "resetting": "yellow"}
+    border_styles = {
+        "ready": "cyan",
+        "recording": "green",
+        "pause": "magenta",
+        "resetting": "yellow",
+    }
     mode = Text(record_state.upper(), style=state_styles.get(record_state, "bold white"))
     engaged = bool(telemetry.get("clutch_engaged", False))
     mode.append("   ")
@@ -582,7 +632,7 @@ def _control_panel(
         )
     table.add_row(
         "Controls",
-        "A/n rec | B/b reset | stick XY pitch/yaw | click+X roll | r redo | q quit",
+        "A/n rec | B tap/Space pause | B hold/b reset | stick XY pitch/yaw | click+X roll | r redo | q quit",
     )
     table.add_row("Robot", _jaka_status_line(robot_status))
 
@@ -734,6 +784,7 @@ def _record_loop(
     next_status_refresh_at = 0.0
     camera_timeout_count = 0
     rerun_frame_index = 0
+    rerun_status_dirty = False
 
     while not events["stop_recording"]:
         loop_start = time.perf_counter()
@@ -772,13 +823,14 @@ def _record_loop(
         if events["stop_recording"]:
             break
 
-        a_toggle, b_reset = buttons.update(
+        a_toggle, b_pause, b_reset = buttons.update(
             float(device.telemetry.get("a_button", 0.0)),
             float(device.telemetry.get("b_button", 0.0)),
             loop_start,
             tracking=bool(device.telemetry.get("controller_is_tracking", True)),
         )
         toggle_requested = a_toggle or bool(events.pop("toggle_recording", False))
+        pause_requested = b_pause or bool(events.pop("toggle_pause", False))
         reset_requested = b_reset or bool(events.pop("reset_robot", False))
         discard_requested = bool(events.pop("rerecord_episode", False))
         events["exit_early"] = False
@@ -788,11 +840,11 @@ def _record_loop(
                 dataset.clear_episode_buffer()
             episode.discard()
 
-        was_recording = episode.is_recording
+        was_active = episode.is_active
         episode_finished = episode.toggle_recording(loop_start) if toggle_requested else False
         if (
             toggle_requested
-            and not was_recording
+            and not was_active
             and episode.is_recording
             and not reset_requested
             and rerun_logger is not None
@@ -823,6 +875,11 @@ def _record_loop(
             hold = HoldLatch(action_keys)
             episode.finish_reset()
             continue
+
+        pause_changed = False
+        if pause_requested and not toggle_requested:
+            pause_changed = episode.toggle_pause(loop_start)
+            rerun_status_dirty = rerun_status_dirty or pause_changed
 
         if (
             episode.is_recording
@@ -868,6 +925,7 @@ def _record_loop(
                 rerun_frame.update(
                     task=single_task,
                     episode_number=episode_number,
+                    record_state=episode.state,
                     framestep=rerun_frame_index,
                 )
                 for name, camera in getattr(robot, "cameras", {}).items():
@@ -875,6 +933,25 @@ def _record_loop(
                         rerun_frame[f"observation.images.{name}"] = obs[name]
                 rerun_logger.log(rerun_frame)
                 rerun_frame_index += 1
+                rerun_status_dirty = False
+        elif (
+            rerun_status_dirty
+            and episode.is_paused
+            and camera_frame_valid
+            and rerun_logger is not None
+            and rerun_frame_index > 0
+        ):
+            pause_frame = {
+                "task": single_task,
+                "episode_number": episode_number,
+                "record_state": episode.state,
+                "framestep": rerun_frame_index - 1,
+            }
+            for name, camera in getattr(robot, "cameras", {}).items():
+                if getattr(camera, "use_rgb", True) and name in obs:
+                    pause_frame[f"observation.images.{name}"] = obs[name]
+            rerun_logger.log(pause_frame)
+            rerun_status_dirty = False
 
         # Work time of this iteration: obs read + compute + target update + record.
         # The robot-owned 8 ms sender continues independently if this loop is late.
