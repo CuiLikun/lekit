@@ -1,0 +1,1048 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Isaac Teleop to JAKA · 遥操作录制原理</title>
+<style>
+  :root {
+    --bg: #fafbf9; --fg: #1a1e1c; --muted: #5f6d67;
+    --line: #d8dfd8; --panel: #ffffff; --deep: #173b37;
+    --green: #16805d; --green-bg: #e8f5ee; --green-light: #bfe8d6;
+    --blue: #2e6f9e; --blue-bg: #e8f1f8; --blue-light: #d0e4f4;
+    --amber: #a36b16; --amber-bg: #fef9ed; --amber-light: #fff0c9;
+    --coral: #ad4c3f; --coral-bg: #fdf0ee; --coral-light: #f8dfdb;
+    --purple: #7b4fbf; --purple-bg: #f4effb;
+    --code-bg: #1c2622; --code-fg: #d4f0e4;
+    --radius: 6px;
+    --shadow: 0 1px 4px rgba(0,0,0,.06);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: var(--fg); background: var(--bg); line-height: 1.65;
+  }
+  .shell { max-width: 1060px; margin: 0 auto; padding: 28px 28px 90px; }
+
+  /* ── nav ── */
+  nav { position: sticky; top: 0; z-index: 10; background: rgba(250,251,249,.92); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); padding: 10px 28px; display: flex; gap: 16px; flex-wrap: wrap; font-size: 13px; font-weight: 650; }
+  nav a { color: var(--muted); text-decoration: none; }
+  nav a:hover { color: var(--green); }
+
+  /* ── header ── */
+  .hero { padding: 46px 0 36px; border-bottom: 2px solid var(--green-light); margin-bottom: 44px; }
+  .hero h1 { font-size: 42px; letter-spacing: -.03em; line-height: 1.08; margin-bottom: 12px; }
+  .hero h1 span { color: var(--green); }
+  .hero p { max-width: 680px; color: var(--muted); font-size: 16px; }
+
+  /* ── section ── */
+  section { margin-bottom: 52px; }
+  h2 { font-size: 26px; letter-spacing: -.02em; margin-bottom: 6px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+  h2 .num { color: var(--green); font-size: 15px; font-weight: 850; margin-right: 6px; }
+  h3 { font-size: 19px; margin: 22px 0 8px; color: var(--deep); }
+  h4 { font-size: 15px; margin: 16px 0 6px; color: var(--deep); }
+  p, li { color: var(--fg); font-size: 14.5px; }
+  p { margin: 8px 0; }
+  .muted { color: var(--muted); }
+
+  /* ── panels ── */
+  .panel {
+    border: 1px solid var(--line); border-radius: var(--radius);
+    background: var(--panel); box-shadow: var(--shadow);
+    padding: 22px 26px; margin: 16px 0;
+  }
+  .panel-blue { border-color: #c4d8e8; background: var(--blue-bg); }
+  .panel-green { border-color: #b4d6c4; background: var(--green-bg); }
+  .panel-amber { border-color: #e8d498; background: var(--amber-bg); }
+  .panel-coral { border-color: #e8c4bf; background: var(--coral-bg); }
+  .panel-purple { border-color: #d8c8f0; background: var(--purple-bg); }
+
+  /* ── code ── */
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px; background: #eef1ec; padding: 1px 5px; border-radius: 3px;
+  }
+  pre {
+    background: var(--code-bg); color: var(--code-fg);
+    font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    padding: 16px 20px; border-radius: var(--radius); overflow-x: auto;
+    margin: 12px 0;
+  }
+  pre .kw { color: #86d5ba; }       /* keyword */
+  pre .fn { color: #d4c47a; }       /* function */
+  pre .str { color: #e4be64; }      /* string */
+  pre .cm { color: #6b8a7a; }       /* comment */
+  pre .num { color: #dca3a3; }      /* number */
+  pre .op { color: #c0a0e0; }       /* operator */
+  pre .ty { color: #a0c8e8; }       /* type */
+
+  /* ── diagram containers ── */
+  .diagram {
+    display: flex; justify-content: center; margin: 20px 0;
+    border: 1px solid var(--line); border-radius: var(--radius);
+    background: var(--panel); box-shadow: var(--shadow);
+    padding: 16px; overflow-x: auto;
+  }
+  .diagram svg { max-width: 100%; height: auto; }
+  .diagram figcaption { text-align: center; color: var(--muted); font-size: 12px; margin-top: 8px; }
+
+  /* ── grid ── */
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin: 16px 0; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; margin: 16px 0; }
+  @media (max-width: 780px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
+
+  /* ── table ── */
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; margin: 12px 0; }
+  th { text-align: left; padding: 8px 12px; border-bottom: 2px solid var(--line); color: var(--muted); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; }
+  td { padding: 8px 12px; border-bottom: 1px solid #edf0ec; vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+
+  /* ── callout ── */
+  .callout {
+    display: grid; grid-template-columns: 22px 1fr; gap: 10px; align-items: start;
+    margin: 14px 0; padding: 12px 16px; border-radius: var(--radius);
+    font-size: 13.5px;
+  }
+  .callout-info { border: 1px solid #b4cce0; background: var(--blue-bg); color: #234e6a; }
+  .callout-warn { border: 1px solid #e8c477; background: var(--amber-bg); color: #765016; }
+  .callout-tip { border: 1px solid #9cc7af; background: var(--green-bg); color: #1a5538; }
+  .callout strong { display: block; margin-bottom: 2px; }
+
+  /* ── math block ── */
+  .math-block {
+    background: #f7f9f6; border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 14px 20px; margin: 12px 0; font: 13.5px/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: var(--deep); overflow-x: auto; white-space: pre;
+  }
+
+  /* ── state machine ── */
+  .state-grid { display: flex; gap: 0; margin: 16px 0; }
+  .state-node {
+    flex: 1; text-align: center; padding: 14px 10px;
+    border: 1.5px solid var(--line);
+  }
+  .state-node:first-child { border-radius: var(--radius) 0 0 var(--radius); }
+  .state-node:last-child { border-radius: 0 var(--radius) var(--radius) 0); }
+  .state-node .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; }
+  .state-node .label { font-weight: 750; font-size: 14px; }
+  .state-node .desc { font-size: 11.5px; color: var(--muted); margin-top: 4px; }
+
+  /* ── footer ── */
+  footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; display: flex; justify-content: space-between; }
+</style>
+</head>
+<body>
+
+<nav>
+  <a href="#arch">架构总览</a>
+  <a href="#xr-pipeline">XR 输入管线</a>
+  <a href="#clutch">Clutch 接合</a>
+  <a href="#head-yaw">头显相对映射</a>
+  <a href="#control-loop">控制循环</a>
+  <a href="#state-machine">状态机</a>
+  <a href="#dataset">数据集录制</a>
+  <a href="#servo">Servo P</a>
+  <a href="#rerun">Rerun</a>
+  <a href="#trace">诊断 Trace</a>
+</nav>
+
+<div class="shell">
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<header class="hero">
+  <h1>Isaac Teleop to JAKA<br><span>遥操作录制 · 原理深度解析</span></h1>
+  <p>本文档逐层剖析从 XR 手柄到 LeRobot 数据集的完整数据流，覆盖 clutch 接合数学、头显相对坐标系映射、Cartesian Servo P 控制、控制循环状态机和异步可视化管线。</p>
+</header>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<section id="arch">
+<h2><span class="num">§1</span> 系统架构总览</h2>
+
+<div class="diagram">
+<svg viewBox="0 0 960 520" role="img" aria-label="系统架构图">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#5f6d67"/></marker>
+    <marker id="arr-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#16805d"/></marker>
+    <marker id="arr-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#2e6f9e"/></marker>
+    <marker id="arr-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#a36b16"/></marker>
+    <filter id="sh"><feDropShadow dx="0" dy="1" stdDeviation="2" flood-color="#00000018"/></filter>
+  </defs>
+
+  <!-- XR Headset -->
+  <rect x="30" y="30" width="200" height="90" rx="8" fill="#e8f1f8" stroke="#2e6f9e" stroke-width="2" filter="url(#sh)"/>
+  <text x="130" y="55" text-anchor="middle" font-weight="800" font-size="13" fill="#2e6f9e">XR 头显 + 手柄</text>
+  <text x="130" y="74" text-anchor="middle" font-size="11" fill="#4a7a9a">CloudXR · OpenXR tracking</text>
+  <text x="130" y="92" text-anchor="middle" font-size="10.5" fill="#5a8aaa">grip pose · squeeze · buttons</text>
+
+  <!-- arrows from XR -->
+  <line x1="230" y1="75" x2="295" y2="75" stroke="#2e6f9e" stroke-width="1.8" marker-end="url(#arr-b)"/>
+  <text x="262" y="68" font-size="9" fill="#2e6f9e" text-anchor="middle">WiFi</text>
+
+  <!-- Isaac Teleop Session -->
+  <rect x="300" y="20" width="210" height="110" rx="8" fill="#f4effb" stroke="#7b4fbf" stroke-width="2" filter="url(#sh)"/>
+  <text x="405" y="43" text-anchor="middle" font-weight="800" font-size="12" fill="#7b4fbf">Isaac Teleop Session</text>
+  <text x="405" y="60" text-anchor="middle" font-size="10.5" fill="#6a4a9a">XRController.get_action()</text>
+  <text x="405" y="76" text-anchor="middle" font-size="10.5" fill="#6a4a9a">ControllersSource + HeadSource</text>
+  <text x="405" y="92" text-anchor="middle" font-size="10" fill="#8a6aba">raw grip pos/quat · trigger · A/B</text>
+  <text x="405" y="108" text-anchor="middle" font-size="10" fill="#8a6aba">base_T_anchor 坐标变换</text>
+
+  <!-- arrow -->
+  <line x1="510" y1="55" x2="575" y2="55" stroke="#5f6d67" stroke-width="1.8" marker-end="url(#arr)"/>
+
+  <!-- make_xr_device -->
+  <rect x="580" y="15" width="230" height="120" rx="8" fill="#fff" stroke="#5f6d67" stroke-width="2" filter="url(#sh)"/>
+  <text x="695" y="38" text-anchor="middle" font-weight="800" font-size="12" fill="#1a1e1c">make_xr_device 计算层</text>
+  <text x="695" y="55" text-anchor="middle" font-size="10.5" fill="#5f6d67">Clutch 接合重映射</text>
+  <text x="695" y="71" text-anchor="middle" font-size="10.5" fill="#5f6d67">head-yaw → base_T_anchor</text>
+  <text x="695" y="87" text-anchor="middle" font-size="10.5" fill="#5f6d67">thumbstick RPY 调节</text>
+  <text x="695" y="103" text-anchor="middle" font-size="10" fill="#8a8a8a">position deadband · step limit</text>
+  <text x="695" y="120" text-anchor="middle" font-size="10" fill="#8a8a8a">输出: {ee.x, ee.y, ..., gripper.pos}</text>
+
+  <!-- arrow to recorder -->
+  <line x1="810" y1="75" x2="870" y2="75" stroke="#16805d" stroke-width="2" marker-end="url(#arr-g)"/>
+
+  <!-- Recorder -->
+  <rect x="580" y="160" width="350" height="105" rx="8" fill="#e8f5ee" stroke="#16805d" stroke-width="2" filter="url(#sh)"/>
+  <text x="755" y="185" text-anchor="middle" font-weight="800" font-size="14" fill="#16805d">_record_loop() 录制循环</text>
+  <text x="755" y="205" text-anchor="middle" font-size="11" fill="#3a7a5a">HoldLatch · TriggerGripperToggle</text>
+  <text x="755" y="222" text-anchor="middle" font-size="11" fill="#3a7a5a">ControllerButtons · EpisodeController</text>
+  <text x="755" y="239" text-anchor="middle" font-size="11" fill="#3a7a5a">_send_action_for_clutch_state()</text>
+  <text x="755" y="256" text-anchor="middle" font-size="10" fill="#5a9a7a">键盘: TerminalKeyListener (stdin TTY)</text>
+
+  <!-- arrows from recorder -->
+  <line x1="700" y1="265" x2="700" y2="312" stroke="#16805d" stroke-width="2" marker-end="url(#arr-g)"/>
+  <line x1="810" y1="265" x2="810" y2="312" stroke="#16805d" stroke-width="2" marker-end="url(#arr-g)"/>
+
+  <!-- Camera -->
+  <rect x="590" y="315" width="190" height="70" rx="8" fill="#fff" stroke="#a36b16" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="685" y="340" text-anchor="middle" font-weight="750" font-size="11" fill="#a36b16">RealSense 相机</text>
+  <text x="685" y="358" text-anchor="middle" font-size="10.5" fill="#8a6a3a">robot.get_observation()</text>
+  <text x="685" y="374" text-anchor="middle" font-size="10" fill="#8a6a3a">RGB · Depth · camera_timeout fallback</text>
+
+  <!-- JAKA Robot -->
+  <rect x="300" y="315" width="210" height="70" rx="8" fill="#fff" stroke="#16805d" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="405" y="338" text-anchor="middle" font-weight="750" font-size="11" fill="#16805d">JAKA Robot (JakaRobot)</text>
+  <text x="405" y="356" text-anchor="middle" font-size="10.5" fill="#3a7a5a">servo_p(Cartesian Servo Move)</text>
+  <text x="405" y="372" text-anchor="middle" font-size="10" fill="#5a9a7a">separate_feedback_connection</text>
+
+  <!-- arrow: robot.send_action -->
+  <line x1="590" y1="240" x2="510" y2="345" stroke="#16805d" stroke-width="1.8" marker-end="url(#arr-g)"/>
+
+  <!-- arrow: obs back -->
+  <line x1="510" y1="345" x2="590" y2="210" stroke="#2e6f9e" stroke-width="1.2" stroke-dasharray="5 4" marker-end="url(#arr-b)"/>
+
+  <!-- Dataset -->
+  <rect x="30" y="315" width="190" height="70" rx="8" fill="#fef9ed" stroke="#a36b16" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="125" y="340" text-anchor="middle" font-weight="750" font-size="11" fill="#a36b16">LeRobot 数据集</text>
+  <text x="125" y="358" text-anchor="middle" font-size="10.5" fill="#8a6a3a">dataset.add_frame()</text>
+  <text x="125" y="374" text-anchor="middle" font-size="10" fill="#8a6a3a">Parquet · video encoding</text>
+
+  <!-- arrow camera to dataset -->
+  <line x1="590" y1="350" x2="220" y2="350" stroke="#a36b16" stroke-width="1.8" marker-end="url(#arr-a)"/>
+  <text x="405" y="400" text-anchor="middle" font-size="10" fill="#a36b16">obs + action frame (30 Hz)</text>
+
+  <!-- RerunLogger -->
+  <rect x="30" y="420" width="320" height="60" rx="8" fill="#f0f4ee" stroke="#8a8a8a" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="190" y="445" text-anchor="middle" font-weight="750" font-size="11" fill="#5a6a5a">RerunLogger (异步线程)</text>
+  <text x="190" y="465" text-anchor="middle" font-size="10.5" fill="#7a8a7a">rerun_logger.log() → gRPC → Rerun Viewer</text>
+
+  <!-- ControlTrace -->
+  <rect x="400" y="420" width="250" height="60" rx="8" fill="#f0f4ee" stroke="#8a8a8a" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="525" y="445" text-anchor="middle" font-weight="750" font-size="11" fill="#5a6a5a">ControlTraceWriter (CSV)</text>
+  <text x="525" y="465" text-anchor="middle" font-size="10.5" fill="#7a8a7a">逐帧诊断数据 · 67 个字段</text>
+
+  <!-- arrow from recorder to aux -->
+  <line x1="700" y1="265" x2="190" y2="420" stroke="#8a8a8a" stroke-width="1.2" stroke-dasharray="4 4" marker-end="url(#arr)"/>
+  <line x1="700" y1="265" x2="525" y2="420" stroke="#8a8a8a" stroke-width="1.2" stroke-dasharray="4 4" marker-end="url(#arr)"/>
+
+  <!-- legend -->
+  <rect x="720" y="435" width="210" height="75" rx="4" fill="none" stroke="#d8dfd8" stroke-width="1"/>
+  <text x="735" y="452" font-size="9" font-weight="700" fill="#5f6d67">图例</text>
+  <line x1="735" y1="462" x2="775" y2="462" stroke="#16805d" stroke-width="1.8"/><text x="782" y="465" font-size="9" fill="#5f6d67">控制流 (action)</text>
+  <line x1="735" y1="476" x2="775" y2="476" stroke="#2e6f9e" stroke-width="1.2" stroke-dasharray="5 4"/><text x="782" y="479" font-size="9" fill="#5f6d67">反馈流 (observation)</text>
+  <line x1="735" y1="490" x2="775" y2="490" stroke="#8a8a8a" stroke-width="1.2" stroke-dasharray="4 4"/><text x="782" y="493" font-size="9" fill="#5f6d67">诊断/可视化流</text>
+</svg>
+</div>
+
+<div class="grid2">
+  <div class="panel panel-blue">
+    <h4>核心设计原则</h4>
+    <ul style="margin:0;padding-left:18px;">
+      <li><strong>无 IK：</strong>直接发送绝对 TCP 位姿目标给 JAKA SDK 的 Cartesian Servo Move (<code>servo_p</code>)，主机不执行逆运动学</li>
+      <li><strong>Clutch 接合：</strong>squeeze 按下时锁存手柄原点和实测 TCP home，后续目标 = home + (grip_current − grip_origin)</li>
+      <li><strong>头显相对映射：</strong>每次接合锁存操作者朝向，保证直觉方向映射，转头不漂移</li>
+      <li><strong>异步观测：</strong>反馈使用独立 SDK 连接，30 Hz 观测不阻塞 8 ms Servo 命令流</li>
+    </ul>
+  </div>
+  <div class="panel panel-green">
+    <h4>数据速率设计</h4>
+    <table>
+      <tr><th>通道</th><th>频率</th><th>说明</th></tr>
+      <tr><td>控制循环 (record loop)</td><td>30 Hz</td><td>obs → compute → send_action → record</td></tr>
+      <tr><td>Servo P 发送</td><td>125 Hz (8 ms)</td><td>JAKA SDK 独立线程持续发送最新目标</td></tr>
+      <tr><td>XR tracking</td><td>跟随头显</td><td>Isaac Teleop session.step() 阻塞等待最新帧</td></tr>
+      <tr><td>Rerun logging</td><td>异步不限速</td><td>独立线程，队满时丢弃旧帧</td></tr>
+      <tr><td>Control trace</td><td>30 Hz</td><td>同步 CSV 写入，每 30 帧 flush</td></tr>
+    </table>
+  </div>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<section id="xr-pipeline">
+<h2><span class="num">§2</span> XR 输入管线</h2>
+
+<h3>2.1 从手柄到 action dict</h3>
+
+<div class="diagram">
+<svg viewBox="0 0 920 280" role="img" aria-label="XR pipeline">
+  <defs>
+    <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#2e6f9e"/></marker>
+    <marker id="a2g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#16805d"/></marker>
+  </defs>
+  <!-- Step 1 -->
+  <rect x="15" y="15" width="200" height="75" rx="6" fill="#fff" stroke="#2e6f9e" stroke-width="1.5"/>
+  <text x="115" y="40" text-anchor="middle" font-weight="750" font-size="12" fill="#2e6f9e">① CloudXR + OpenXR</text>
+  <text x="115" y="58" text-anchor="middle" font-size="10.5" fill="#5a7a9a">头显通过 WiFi 将手柄和</text>
+  <text x="115" y="74" text-anchor="middle" font-size="10.5" fill="#5a7a9a">头显姿态流式传输到工作站</text>
+  <line x1="215" y1="52" x2="265" y2="52" stroke="#2e6f9e" stroke-width="1.5" marker-end="url(#a2)"/>
+
+  <!-- Step 2 -->
+  <rect x="270" y="15" width="195" height="75" rx="6" fill="#f4effb" stroke="#7b4fbf" stroke-width="1.5"/>
+  <text x="367" y="40" text-anchor="middle" font-weight="750" font-size="12" fill="#7b4fbf">② TeleopSession.step()</text>
+  <text x="367" y="58" text-anchor="middle" font-size="10.5" fill="#6a4a9a">ControllersSource 读取</text>
+  <text x="367" y="74" text-anchor="middle" font-size="10.5" fill="#6a4a9a">grip position + orientation</text>
+  <line x1="465" y1="52" x2="515" y2="52" stroke="#2e6f9e" stroke-width="1.5" marker-end="url(#a2)"/>
+
+  <!-- Step 3 -->
+  <rect x="520" y="15" width="190" height="75" rx="6" fill="#fff" stroke="#7b4fbf" stroke-width="1.5"/>
+  <text x="615" y="40" text-anchor="middle" font-weight="750" font-size="12" fill="#7b4fbf">③ base_T_anchor 变换</text>
+  <text x="615" y="58" text-anchor="middle" font-size="10.5" fill="#6a4a9a">ValueInput(4x4)</text>
+  <text x="615" y="74" text-anchor="middle" font-size="10.5" fill="#6a4a9a">OpenXR anchor → 目标基坐标</text>
+  <line x1="710" y1="52" x2="755" y2="52" stroke="#2e6f9e" stroke-width="1.5" marker-end="url(#a2)"/>
+
+  <!-- Step 4 -->
+  <rect x="760" y="15" width="145" height="75" rx="6" fill="#e8f1f8" stroke="#2e6f9e" stroke-width="1.5"/>
+  <text x="832" y="40" text-anchor="middle" font-weight="750" font-size="12" fill="#2e6f9e">④ XRController</text>
+  <text x="832" y="58" text-anchor="middle" font-size="10.5" fill="#4a7a9a">get_action()</text>
+  <text x="832" y="74" text-anchor="middle" font-size="10.5" fill="#4a7a9a">→ RobotAction dict</text>
+
+  <!-- Output -->
+  <rect x="15" y="120" width="890" height="95" rx="6" fill="#e8f5ee" stroke="#16805d" stroke-width="1.5"/>
+  <text x="460" y="145" text-anchor="middle" font-weight="750" font-size="13" fill="#16805d">XRController.get_action() 返回的 RobotAction dict</text>
+  <text x="460" y="168" text-anchor="middle" font-size="11" fill="#3a7a5a">
+    grip_pos (3) · grip_quat (4) · raw_grip_pos (3) · raw_grip_quat (4) · head_quat (4)
+  </text>
+  <text x="460" y="186" text-anchor="middle" font-size="11" fill="#3a7a5a">
+    head_is_tracking (bool) · squeeze (scalar) · trigger (scalar) · a_button · b_button
+  </text>
+  <text x="460" y="204" text-anchor="middle" font-size="11" fill="#3a7a5a">
+    thumbstick_x · thumbstick_y · thumbstick_click
+  </text>
+  <line x1="460" y1="215" x2="460" y2="255" stroke="#16805d" stroke-width="2" marker-end="url(#a2g)"/>
+
+  <!-- make_xr_device -->
+  <rect x="230" y="225" width="460" height="48" rx="6" fill="#fff" stroke="#16805d" stroke-width="2"/>
+  <text x="460" y="245" text-anchor="middle" font-weight="800" font-size="13" fill="#16805d">make_xr_device.compute(obs) → {ee.x, ee.y, ee.z, ee.roll, ee.pitch, ee.yaw, gripper.pos}</text>
+  <text x="460" y="264" text-anchor="middle" font-size="10.5" fill="#5a9a7a">Clutch 接合重映射 + head-yaw 坐标变换 + thumbstick RPY + position deadband/step-limit</text>
+</svg>
+</div>
+
+<h3>2.2 安全默认值策略</h3>
+<p>当控制器 tracking 丢失或数据无效时，<code>get_action()</code> 的所有字段保持安全默认值（零位置、单位四元数、零 squeeze），绝不让部分有效帧混入旧值。例如：squeeze=0 确保 clutch 不会意外接合。</p>
+
+<div class="panel panel-amber">
+  <h4>关键安全细节</h4>
+  <p style="font-size:13.5px;"><code>get_action()</code> 先声明所有默认值（zero pos, identity quat, squeeze=0, trigger=0），仅在 <code>grip_is_valid</code> 且所有字段通过有限性检查和四元数范数检查后才覆盖。A/B 按钮和 thumbstick 值有独立的 try/except 块——按钮解析失败不影响位姿读取。</p>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<section id="clutch">
+<h2><span class="num">§3</span> Clutch 接合重映射</h2>
+
+<p>Clutch 是系统的核心数学组件。它的目标是：<strong>接合瞬间指令位移恒为零</strong>，避免操作者手柄位置与机器人 TCP 之间的初始偏移造成跳变。</p>
+
+<h3>3.1 基本原理</h3>
+
+<div class="diagram">
+<svg viewBox="0 0 880 310" role="img" aria-label="Clutch原理">
+  <defs>
+    <marker id="carr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#16805d"/></marker>
+  </defs>
+
+  <!-- Phase 1: Disengaged -->
+  <rect x="20" y="15" width="400" height="125" rx="8" fill="#fef9ed" stroke="#a36b16" stroke-width="1.5"/>
+  <text x="220" y="40" text-anchor="middle" font-weight="800" font-size="13" fill="#a36b16">松开 squeeze — TCP 保持 (HoldLatch)</text>
+  <text x="220" y="62" text-anchor="middle" font-size="12" fill="#6a4a1a">compute() 返回 None → HoldLatch 冻结最后的目标</text>
+  <text x="220" y="82" text-anchor="middle" font-size="12" fill="#6a4a1a">Servo Move 退出 → 机械臂停止但不掉使能</text>
+  <text x="220" y="105" text-anchor="middle" font-size="11" fill="#8a6a3a">操作者可自由转身/重新站位</text>
+  <text x="220" y="125" text-anchor="middle" font-size="10.5" fill="#8a6a3a">TCP 可能因重力/外力轻微移动</text>
+
+  <text x="440" y="78" font-size="28" fill="#16805d" font-weight="900">→</text>
+
+  <!-- Phase 2: Engage edge -->
+  <rect x="465" y="15" width="400" height="125" rx="8" fill="#e8f5ee" stroke="#16805d" stroke-width="1.5"/>
+  <text x="665" y="40" text-anchor="middle" font-weight="800" font-size="13" fill="#16805d">按下 squeeze 边沿 — 锁存原点</text>
+  <text x="665" y="62" text-anchor="middle" font-size="12" fill="#3a6a4a">clutch.engage(grip_pos, grip_quat, home=measured_ee)</text>
+  <text x="665" y="82" text-anchor="middle" font-size="12" fill="#3a6a4a">origin_pos = grip_pos · origin_rot = grip_quat</text>
+  <text x="665" y="105" text-anchor="middle" font-size="12" fill="#3a6a4a">home_pos = measured_tcp_xyz · home_rot = measured_tcp_rpy</text>
+  <text x="665" y="125" text-anchor="middle" font-size="11" fill="#5a8a6a">使用实测 TCP 做 home，而不是上次命令目标</text>
+
+  <!-- Phase 3: Engaged -->
+  <rect x="20" y="170" width="845" height="120" rx="8" fill="#fff" stroke="#16805d" stroke-width="2"/>
+  <text x="442" y="195" text-anchor="middle" font-weight="800" font-size="13" fill="#16805d">持续按住 squeeze — 每帧计算位移</text>
+
+  <text x="110" y="225" text-anchor="middle" font-size="12" fill="#3a6a3a">当前位置: grip_pos<br/>原点: origin_pos</text>
+  <text x="310" y="225" text-anchor="middle" font-size="28" fill="#16805d" font-weight="900">−</text>
+  <text x="490" y="225" text-anchor="middle" font-size="12" fill="#3a6a3a">位移: delta_pos<br/>delta_rot</text>
+  <text x="660" y="225" text-anchor="middle" font-size="28" fill="#16805d" font-weight="900">+</text>
+  <text x="810" y="225" text-anchor="middle" font-size="12" fill="#3a6a3a">TCP目标: home_pos+delta_pos<br/>home_rot*delta_rot</text>
+
+  <!-- math formula -->
+  <rect x="80" y="248" width="725" height="30" rx="4" fill="#e8f5ee"/>
+  <text x="442" y="269" text-anchor="middle" font-size="13" font-weight="700" fill="#16805d">
+    p_tcp_target = p_tcp_home + (p_grip_current − p_grip_origin) &nbsp;&nbsp;·&nbsp;&nbsp; R_tcp_target = (R_grip * R_origin⁻¹) * R_home
+  </text>
+</svg>
+</div>
+
+<h3>3.2 为什么用实测 TCP 做 home？</h3>
+<div class="callout callout-warn"><div style="font-weight:900;font-size:16px;">!</div><div><strong>关键设计决策</strong><br>如果使用"上次命令目标"作为 home，机械臂在松开 squeeze 期间因重力下沉或外力接触产生的位移会在下次接合瞬间被纠正——机械臂会以全 Servo 速度回弹到旧目标。使用实测 TCP 做 home 保证了接合第一帧永远是"当前位置零偏移"。</div></div>
+
+<h3>3.3 Clutch 代码实现</h3>
+<pre><span class="kw">class</span> <span class="ty">Clutch</span>:
+    <span class="kw">def</span> <span class="fn">engage</span>(<span class="kw">self</span>, grip_pos, grip_quat, home_base_T_ee=<span class="kw">None</span>):
+        <span class="cm"># 用实测 TCP 更新 home（如果提供）</span>
+        <span class="kw">if</span> home_base_T_ee <span class="kw">is not None</span>:
+            home = np.asarray(home_base_T_ee)
+            <span class="kw">self</span>._home_pos = home[:<span class="num">3</span>, <span class="num">3</span>].copy()
+            <span class="kw">self</span>._home_rot = Rotation.from_matrix(home[:<span class="num">3</span>, :<span class="num">3</span>])
+        <span class="cm"># 锁存手柄原点</span>
+        <span class="kw">self</span>._origin_pos = np.asarray(grip_pos).copy()
+        <span class="kw">self</span>._origin_rot = Rotation.from_quat(np.asarray(grip_quat))
+
+    <span class="kw">def</span> <span class="fn">rebase</span>(<span class="kw">self</span>, grip_pos, grip_quat):
+        <span class="cm"># home + (grip_current − grip_origin)</span>
+        pos = <span class="kw">self</span>._home_pos + (grip_pos - <span class="kw">self</span>._origin_pos)
+        rot_ctrl = Rotation.from_quat(grip_quat)
+        rot = (rot_ctrl * <span class="kw">self</span>._origin_rot.inv()) * <span class="kw">self</span>._home_rot
+        <span class="kw">return</span> pos, rot.as_quat()</pre>
+
+<h3>3.4 位置安全限幅</h3>
+<p><code>make_xr_device.compute()</code> 内部实施了多层防护：</p>
+<table>
+  <tr><th>防护层</th><th>阈值</th><th>作用</th></tr>
+  <tr><td>position_deadband_m</td><td>0.0002 m (0.2 mm)</td><td>忽略控制器漂移，低于阈值冻结位置</td></tr>
+  <tr><td>MAX_EE_STEP_M</td><td>0.05 m/frame</td><td>防止 tracking 毛刺造成单帧瞬移</td></tr>
+  <tr><td>JAKA per-frame clamp</td><td>0.01 m/frame (driver 内部)</td><td>更严格的 JAKA SDK 层保护</td></tr>
+  <tr><td>MAX_THUMBSTICK_DT_S</td><td>0.1 s</td><td>限制摇杆积分时间，防止控制循环暂停后姿态跳变</td></tr>
+</table>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<section id="head-yaw">
+<h2><span class="num">§4</span> 头显相对坐标映射</h2>
+
+<h3>4.1 问题</h3>
+<p>OpenXR anchor (世界坐标系) 在一个会话中基本固定。操作者转身后身体的"前方"在 anchor 中旋转，固定的 <code>base_T_anchor</code> 只在特定朝向有效——转身后就会出现换轴、反向或两个水平轴同时移动。</p>
+
+<h3>4.2 解决方案：接合时锁存头显 yaw</h3>
+
+<div class="diagram">
+<svg viewBox="0 0 880 340" role="img" aria-label="Head yaw mapping">
+  <defs>
+    <marker id="harr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#2e6f9e"/></marker>
+  </defs>
+
+  <!-- Step 1 -->
+  <rect x="15" y="15" width="250" height="85" rx="6" fill="#e8f1f8" stroke="#2e6f9e" stroke-width="1.5"/>
+  <text x="140" y="38" text-anchor="middle" font-weight="750" font-size="12" fill="#2e6f9e">① 读头显四元数</text>
+  <text x="140" y="56" text-anchor="middle" font-size="10.5" fill="#4a7a9a">head_quat = HeadSource.output("head")</text>
+  <text x="140" y="74" text-anchor="middle" font-size="10.5" fill="#4a7a9a">表示 anchor_R_head 旋转矩阵</text>
+  <text x="140" y="92" text-anchor="middle" font-size="10" fill="#6a9aba">head_is_tracking 必须为 true</text>
+
+  <text x="280" y="58" font-size="24" fill="#2e6f9e" font-weight="900">→</text>
+
+  <!-- Step 2 -->
+  <rect x="305" y="15" width="250" height="85" rx="6" fill="#e8f1f8" stroke="#2e6f9e" stroke-width="1.5"/>
+  <text x="430" y="38" text-anchor="middle" font-weight="750" font-size="12" fill="#2e6f9e">② 提取水平 heading</text>
+  <text x="430" y="56" text-anchor="middle" font-size="10.5" fill="#4a7a9a">forward = anchor_R_head @ [0,0,-1]</text>
+  <text x="430" y="74" text-anchor="middle" font-size="10.5" fill="#4a7a9a">heading = atan2(fwd.x, -fwd.z)</text>
+  <text x="430" y="92" text-anchor="middle" font-size="10" fill="#6a9aba">水平分量归一化后计算方位角</text>
+
+  <text x="570" y="58" font-size="24" fill="#2e6f9e" font-weight="900">→</text>
+
+  <!-- Step 3 -->
+  <rect x="595" y="15" width="275" height="85" rx="6" fill="#e8f1f8" stroke="#2e6f9e" stroke-width="1.5"/>
+  <text x="732" y="38" text-anchor="middle" font-weight="750" font-size="12" fill="#2e6f9e">③ 构造 base_T_anchor</text>
+  <text x="732" y="56" text-anchor="middle" font-size="10.5" fill="#4a7a9a">4x4 矩阵: 第一行 [cos(θ), 0, sin(θ)]</text>
+  <text x="732" y="74" text-anchor="middle" font-size="10.5" fill="#4a7a9a">第二行 [sin(θ), 0, -cos(θ)]</text>
+  <text x="732" y="92" text-anchor="middle" font-size="10" fill="#6a9aba">第三行 [0, 1, 0] — 保持上方向</text>
+
+  <!-- Result -->
+  <rect x="130" y="130" width="600" height="55" rx="6" fill="#e8f5ee" stroke="#16805d" stroke-width="1.5"/>
+  <text x="430" y="155" text-anchor="middle" font-weight="750" font-size="12" fill="#16805d">效果：无论操作者面朝哪个方向</text>
+  <text x="430" y="175" text-anchor="middle" font-size="13" fill="#3a6a4a"><strong>身体右移 → JAKA +X &nbsp;·&nbsp; 身体前移 → JAKA +Y &nbsp;·&nbsp; 身体上移 → JAKA +Z</strong></text>
+
+  <!-- Timing diagram -->
+  <text x="430" y="212" text-anchor="middle" font-weight="700" font-size="13" fill="#1a1e1c">锁存时机</text>
+
+  <rect x="15" y="225" width="850" height="105" rx="6" fill="#fff" stroke="#d8dfd8" stroke-width="1"/>
+  <text x="40" y="250" font-size="11" fill="#5f6d67">squeeze</text>
+  <line x1="90" y1="246" x2="855" y2="246" stroke="#d8dfd8" stroke-width="1"/>
+  <rect x="90" y="236" width="280" height="20" rx="2" fill="#d8dfd8"/><text x="230" y="251" text-anchor="middle" font-size="9" fill="#5f6d67">松开（TCP保持，可转身）</text>
+  <rect x="375" y="236" width="525" height="20" rx="2" fill="#bfe8d6"/><text x="637" y="251" text-anchor="middle" font-size="9" fill="#16805d">按住 squeeze（固定 base_T_anchor，转头不影响 TCP）</text>
+  <line x1="375" y1="232" x2="375" y2="265" stroke="#16805d" stroke-width="2" stroke-dasharray="3 2"/>
+  <text x="375" y="280" text-anchor="middle" font-size="10" fill="#16805d" font-weight="700">↑ 接合边沿：锁存 head yaw</text>
+  <text x="95" y="300" text-anchor="middle" font-size="10" fill="#a36b16">可自由转身/重新站位</text>
+  <text x="637" y="300" text-anchor="middle" font-size="10" fill="#16805d">固定坐标映射，转身不影响方向直觉</text>
+
+  <text x="855" y="310" text-anchor="end" font-size="10" fill="#2e6f9e">head 跟踪无效 → 保持TCP不动</text>
+  <line x1="430" y1="275" x2="855" y2="310" stroke="#2e6f9e" stroke-width="1" stroke-dasharray="2 2"/>
+</svg>
+</div>
+
+<h3>4.3 为什么不在每帧跟随头显？</h3>
+<div class="callout callout-info"><div style="font-weight:900;">i</div><div><strong>关键是锁存而非持续跟踪</strong><br>如果每帧都重新计算 base_T_anchor，手保持不动时仅转头就会改变坐标变换，造成 TCP 在没有手柄输入的情况下漂移。锁存策略在接合期间冻结映射，既保证了方向直觉，又消除了转头干扰。</div></div>
+
+<h3>4.4 姿态控制：lock_pose 与 thumbstick</h3>
+<div class="grid2">
+  <div class="panel panel-purple">
+    <h4>lock_pose = true (默认)</h4>
+    <p style="font-size:13px;">接合时锁存实测 TCP roll/pitch/yaw 作为姿态基准。手柄移动<strong>只控制平移</strong>。姿态通过摇杆调节：</p>
+    <ul style="font-size:13px;padding-left:18px;">
+      <li>摇杆<strong>上下</strong> → 调节 pitch</li>
+      <li>摇杆<strong>左右</strong> → 调节 yaw</li>
+      <li><strong>按住摇杆</strong>再左右 → 调节 roll</li>
+    </ul>
+    <p style="font-size:12px;color:var(--muted);margin-top:6px;">松开 squeeze 后姿态偏移清零，下次接合从新的实测 TCP 姿态重新开始。</p>
+  </div>
+  <div class="panel panel-blue">
+    <h4>lock_pose = false</h4>
+    <p style="font-size:13px;">手柄方向<strong>直接控制</strong> TCP 姿态。使用 RPY 连续分解（参考上一帧避免 2π 跳变）。摇杆偏移叠加在手柄方向之上。</p>
+    <table style="font-size:12px;margin-top:8px;">
+      <tr><th>参数</th><th>默认值</th></tr>
+      <tr><td>thumbstick_deadband</td><td>0.15 (15% 死区)</td></tr>
+      <tr><td>thumbstick_angular_speed</td><td>0.5 rad/s</td></tr>
+    </table>
+  </div>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<section id="control-loop">
+<h2><span class="num">§5</span> 控制循环详解</h2>
+
+<h3>5.1 主循环流程图</h3>
+
+<div class="diagram">
+<svg viewBox="0 0 900 480" role="img" aria-label="Control loop flowchart">
+  <defs>
+    <marker id="larr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#1a1e1c"/></marker>
+  </defs>
+
+  <!-- Loop start -->
+  <rect x="330" y="10" width="240" height="32" rx="16" fill="#173b37"/>
+  <text x="450" y="31" text-anchor="middle" font-weight="800" font-size="12" fill="#fff">while not stop_recording:</text>
+
+  <line x1="450" y1="42" x2="450" y2="65" stroke="#1a1e1c" stroke-width="1.5" marker-end="url(#larr)"/>
+
+  <!-- Step 1: get_observation -->
+  <rect x="305" y="68" width="290" height="38" rx="6" fill="#e8f1f8" stroke="#2e6f9e" stroke-width="1.5"/>
+  <text x="450" y="92" text-anchor="middle" font-weight="700" font-size="12" fill="#2e6f9e">① robot.get_observation() → obs</text>
+  <line x1="450" y1="106" x2="450" y2="128" stroke="#1a1e1c" stroke-width="1.5" marker-end="url(#larr)"/>
+
+  <!-- Step 2: camera fallback -->
+  <rect x="275" y="130" width="350" height="38" rx="6" fill="#fef9ed" stroke="#a36b16" stroke-width="1.5"/>
+  <text x="450" y="154" text-anchor="middle" font-weight="700" font-size="12" fill="#a36b16">② _reuse_latest_camera_frames() · timeout fallback</text>
+  <line x1="450" y1="168" x2="450" y2="190" stroke="#1a1e1c" stroke-width="1.5" marker-end="url(#larr)"/>
+
+  <!-- Step 3: compute -->
+  <rect x="275" y="192" width="350" height="38" rx="6" fill="#f4effb" stroke="#7b4fbf" stroke-width="1.5"/>
+  <text x="450" y="216" text-anchor="middle" font-weight="700" font-size="12" fill="#7b4fbf">③ device.compute(obs) → raw_action</text>
+  <line x1="450" y1="230" x2="450" y2="252" stroke="#1a1e1c" stroke-width="1.5" marker-end="url(#larr)"/>
+
+  <!-- Step 4: HoldLatch + gripper -->
+  <rect x="255" y="254" width="390" height="38" rx="6" fill="#e8f5ee" stroke="#16805d" stroke-width="1.5"/>
+  <text x="450" y="278" text-anchor="middle" font-weight="700" font-size="12" fill="#16805d">④ HoldLatch.resolve(raw, obs) → GripperToggle.apply() → action</text>
+  <line x1="450" y1="292" x2="450" y2="314" stroke="#1a1e1c" stroke-width="1.5" marker-end="url(#larr)"/>
+
+  <!-- Step 5: buttons -->
+  <rect x="290" y="316" width="320" height="38" rx="6" fill="#fff" stroke="#5f6d67" stroke-width="1.5"/>
+  <text x="450" y="340" text-anchor="middle" font-weight="700" font-size="12" fill="#1a1e1c">⑤ ControllerButtons.update() + keyboard events</text>
+  <line x1="450" y1="354" x2="450" y2="376" stroke="#1a1e1c" stroke-width="1.5" marker-end="url(#larr)"/>
+
+  <!-- Step 6: EpisodeController -->
+  <rect x="280" y="378" width="340" height="38" rx="6" fill="#fff" stroke="#5f6d67" stroke-width="1.5"/>
+  <text x="450" y="402" text-anchor="middle" font-weight="700" font-size="12" fill="#1a1e1c">⑥ EpisodeController .toggle_recording / .toggle_pause</text>
+
+  <!-- Branch -->
+  <line x1="450" y1="416" x2="450" y2="435" stroke="#1a1e1c" stroke-width="1.5" marker-end="url(#larr)"/>
+  <rect x="255" y="437" width="390" height="36" rx="6" fill="#e8f5ee" stroke="#16805d" stroke-width="1.5"/>
+  <text x="450" y="460" text-anchor="middle" font-weight="700" font-size="12" fill="#16805d">⑦ _send_action_for_clutch_state() → dataset.add_frame()</text>
+
+  <!-- Loop back arrow -->
+  <line x1="255" y1="455" x2="225" y2="455" stroke="#1a1e1c" stroke-width="1" stroke-dasharray="4 3"/>
+  <line x1="225" y1="455" x2="225" y2="30" stroke="#1a1e1c" stroke-width="1" stroke-dasharray="4 3"/>
+  <line x1="225" y1="30" x2="330" y2="30" stroke="#1a1e1c" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#larr)"/>
+  <text x="200" y="250" font-size="10" fill="#5f6d67" transform="rotate(-90 200 250)">precise_sleep(33.3ms - frame_time)</text>
+</svg>
+</div>
+
+<h3>5.2 核心组件职责</h3>
+
+<div class="grid3">
+  <div class="panel">
+    <h4>HoldLatch</h4>
+    <p style="font-size:12.5px;">当 <code>compute()</code> 返回 <code>None</code>（clutch 未接合）时，在第一个空闲帧锁存当前观测的 TCP 位姿，后续帧返回锁存值。防止控制器在手柄不接合时继续向未达成的目标移动。</p>
+  </div>
+  <div class="panel">
+    <h4>TriggerGripperToggle</h4>
+    <p style="font-size:12.5px;">将模拟 trigger 值转换为每个按压边沿的离散 toggle。首次读取时从观测初始化夹爪位置。防止每个循环帧都翻转夹爪状态。</p>
+  </div>
+  <div class="panel">
+    <h4>ControllerButtons</h4>
+    <p style="font-size:12.5px;">区分短按和长按（默认 1.0 秒）。A 短按=toggle recording，A 长按=discard 重录。B 短按=toggle pause（松开时判断），B 长按=reset robot。</p>
+  </div>
+</div>
+
+<div class="grid2">
+  <div class="panel">
+    <h4>LoopRateMonitor</h4>
+    <p style="font-size:12.5px;">通过滑动窗口（默认 1 秒）测量控制循环的实际频率。窗口内至少 2 个样本后返回有效值，用于控制面板显示 LOOP Hz。</p>
+  </div>
+  <div class="panel">
+    <h4>_send_action_for_clutch_state</h4>
+    <p style="font-size:12.5px;">Clutch 接合时启用 Servo Move 并发送 action。Clutch 释放时，如果 gripper 目标有变化先发送 gripper 命令，然后退出 Servo Move。返回的 applied action 用于数据集记录。</p>
+  </div>
+</div>
+
+<h3>5.3 相机超时处理</h3>
+<div class="panel panel-amber">
+  <p style="font-size:13px;">当某个 RealSense 相机超时时，<code>JakaRobot.get_observation()</code> 抛出 <code>JakaCameraTimeoutError</code>（携带已读到的部分观测）。系统：</p>
+  <ol style="font-size:13px;padding-left:18px;margin:8px 0;">
+    <li>捕获异常，提取部分 obs</li>
+    <li><code>_reuse_latest_camera_frames()</code> 用该相机的最新有效帧填充缺失流</li>
+    <li>如果缓存也为空，调用 <code>read_latest(max_age_ms=MAX)</code> 做最后一次非阻塞尝试</li>
+    <li>帧仍可记录（arm 状态是新鲜的），控制面板显示 <code>CAM TIMEOUT N</code></li>
+  </ol>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<section id="state-machine">
+<h2><span class="num">§6</span> Episode 状态机</h2>
+
+<div class="diagram">
+<svg viewBox="0 0 900 350" role="img" aria-label="Episode state machine">
+  <defs>
+    <marker id="sarr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#5f6d67"/></marker>
+    <marker id="sarr-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#16805d"/></marker>
+    <marker id="sarr-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#a36b16"/></marker>
+    <marker id="sarr-c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#ad4c3f"/></marker>
+    <marker id="sarr-p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#7b4fbf"/></marker>
+  </defs>
+
+  <!-- READY -->
+  <rect x="40" y="140" width="160" height="70" rx="10" fill="#e8f1f8" stroke="#2e6f9e" stroke-width="2.5"/>
+  <text x="120" y="165" text-anchor="middle" font-weight="800" font-size="15" fill="#2e6f9e">READY</text>
+  <text x="120" y="185" text-anchor="middle" font-size="11" fill="#4a7a9a">等待 · 未写入数据</text>
+  <text x="120" y="200" text-anchor="middle" font-size="10" fill="#6a9aba">按 A 开始</text>
+
+  <!-- RECORDING -->
+  <rect x="370" y="30" width="170" height="70" rx="10" fill="#e8f5ee" stroke="#16805d" stroke-width="2.5"/>
+  <text x="455" y="55" text-anchor="middle" font-weight="800" font-size="15" fill="#16805d">RECORDING</text>
+  <text x="455" y="75" text-anchor="middle" font-size="11" fill="#3a7a5a">正在写入数据</text>
+  <text x="455" y="90" text-anchor="middle" font-size="10" fill="#5a9a7a">A:结束 · B:暂停</text>
+
+  <!-- PAUSE -->
+  <rect x="370" y="250" width="170" height="70" rx="10" fill="#f4effb" stroke="#7b4fbf" stroke-width="2.5"/>
+  <text x="455" y="275" text-anchor="middle" font-weight="800" font-size="15" fill="#7b4fbf">PAUSE</text>
+  <text x="455" y="295" text-anchor="middle" font-size="11" fill="#6a4a9a">回合保留 · 不写帧</text>
+  <text x="455" y="310" text-anchor="middle" font-size="10" fill="#8a6aba">B短按:恢复</text>
+
+  <!-- RESETTING -->
+  <rect x="650" y="140" width="170" height="70" rx="10" fill="#fef9ed" stroke="#a36b16" stroke-width="2.5"/>
+  <text x="735" y="165" text-anchor="middle" font-weight="800" font-size="15" fill="#a36b16">RESETTING</text>
+  <text x="735" y="185" text-anchor="middle" font-size="11" fill="#8a6a3a">Servo关闭 · 执行复位</text>
+  <text x="735" y="200" text-anchor="middle" font-size="10" fill="#8a6a3a">完成后→READY</text>
+
+  <!-- STOP (implicit) -->
+  <rect x="650" y="30" width="170" height="45" rx="10" fill="#fdf0ee" stroke="#ad4c3f" stroke-width="2" stroke-dasharray="5 3"/>
+  <text x="735" y="58" text-anchor="middle" font-weight="800" font-size="13" fill="#ad4c3f">STOP (Esc/q)</text>
+
+  <!-- Transitions from READY -->
+  <path d="M200 175 Q280 175 280 100 Q280 65 365 65" fill="none" stroke="#16805d" stroke-width="2" marker-end="url(#sarr-g)"/>
+  <text x="285" y="110" font-size="9" fill="#16805d">A短按/键盘</text>
+
+  <path d="M200 175 Q280 175 280 280 Q280 285 365 285" fill="none" stroke="#7b4fbf" stroke-width="2" marker-end="url(#sarr-p)"/>
+  <text x="300" y="295" font-size="9" fill="#7b4fbf">B短按/Space</text>
+
+  <!-- Transitions from RECORDING -->
+  <path d="M455 100 Q455 130 455 245" fill="none" stroke="#7b4fbf" stroke-width="2" marker-end="url(#sarr-p)"/>
+  <text x="425" y="180" font-size="9" fill="#7b4fbf">B短按</text>
+
+  <path d="M540 65 Q610 65 645 52" fill="none" stroke="#ad4c3f" stroke-width="2" marker-end="url(#sarr-c)"/>
+
+  <path d="M370 100 Q300 100 280 175 Q260 200 205 200" fill="none" stroke="#2e6f9e" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#sarr)"/>
+  <text x="270" y="130" font-size="9" fill="#2e6f9e">A结束/r丢弃</text>
+
+  <!-- Transitions from PAUSE -->
+  <path d="M370 285 Q270 285 270 200 Q260 175 205 175" fill="none" stroke="#2e6f9e" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#sarr)"/>
+  <text x="260" y="300" font-size="9" fill="#2e6f9e">A结束/r丢弃</text>
+
+  <path d="M540 285 Q610 285 645 285" fill="none" stroke="#a36b16" stroke-width="2" marker-end="url(#sarr-a)"/>
+  <text x="590" y="300" font-size="9" fill="#a36b16">B长按</text>
+
+  <!-- Transitions from RESETTING -->
+  <path d="M650 175 Q580 175 210 175" fill="none" stroke="#2e6f9e" stroke-width="2" marker-end="url(#sarr)"/>
+  <text x="430" y="168" font-size="9" fill="#2e6f9e">finish_reset() → READY</text>
+
+  <!-- discard / A long press from any active state -->
+  <path d="M540 65 Q610 65 645 52" fill="none" stroke="#ad4c3f" stroke-width="2" marker-end="url(#sarr-c)"/>
+  <text x="590" y="55" font-size="9" fill="#coral">A长按=重录</text>
+
+  <!-- reset from any active -->
+  <path d="M200 175 Q280 145 320 145 Q350 145 365 155" fill="none" stroke="#a36b16" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#sarr-a)"/>
+  <text x="290" y="140" font-size="9" fill="#a36b16">B长按</text>
+</svg>
+</div>
+
+<h3>6.1 EpisodeController 状态转换</h3>
+<table>
+  <tr><th>转换</th><th>触发条件</th><th>效果</th></tr>
+  <tr><td>ready → recording</td><td>A 短按 / 键盘 Right/n/a / toggle_recording event</td><td>started_at = now, 开始写帧</td></tr>
+  <tr><td>recording → pause</td><td>B 短按松开 / 键盘 Space</td><td>paused_at = now, 停止写帧</td></tr>
+  <tr><td>pause → recording</td><td>B 短按松开 / 键盘 Space</td><td>累加暂停时间到 total_paused_s</td></tr>
+  <tr><td>recording/pause → ready</td><td>A 短按 / 键盘 Right/n/a</td><td>返回 "completed"，外层保存 episode</td></tr>
+  <tr><td>recording/pause → ready</td><td>A 长按 / 键盘 Left/r</td><td>clear_episode_buffer() + discard()</td></tr>
+  <tr><td>recording/pause → resetting</td><td>B 长按 / 键盘 b</td><td>clear buffer → 关Servo → 复位 → ready</td></tr>
+  <tr><td>any → stop</td><td>Esc / q</td><td>stop_recording=True, 退出循环</td></tr>
+  <tr><td>recording → ready</td><td>episode_time_s 到期</td><td>自动结束回合</td></tr>
+</table>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<section id="dataset">
+<h2><span class="num">§7</span> 数据集录制管线</h2>
+
+<h3>7.1 帧写入流程</h3>
+<div class="diagram">
+<svg viewBox="0 0 900 220" role="img" aria-label="Dataset recording">
+  <defs>
+    <marker id="darr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#5f6d67"/></marker>
+    <marker id="darr-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#16805d"/></marker>
+  </defs>
+
+  <rect x="15" y="15" width="195" height="65" rx="6" fill="#fff" stroke="#5f6d67" stroke-width="1.5"/>
+  <text x="112" y="38" text-anchor="middle" font-weight="700" font-size="12">obs dict</text>
+  <text x="112" y="55" text-anchor="middle" font-size="10.5" fill="#5f6d67">ee.x/y/z, joint, camera, ...</text>
+  <text x="112" y="70" text-anchor="middle" font-size="10.5" fill="#5f6d67">(从 robot.get_observation)</text>
+
+  <line x1="210" y1="47" x2="260" y2="47" stroke="#5f6d67" stroke-width="1.5" marker-end="url(#darr)"/>
+
+  <rect x="265" y="8" width="210" height="78" rx="6" fill="#e8f5ee" stroke="#16805d" stroke-width="1.5"/>
+  <text x="370" y="31" text-anchor="middle" font-weight="700" font-size="12" fill="#16805d">build_dataset_frame()</text>
+  <text x="370" y="49" text-anchor="middle" font-size="10.5" fill="#3a7a5a">prefix="observation." → obs_frame</text>
+  <text x="370" y="66" text-anchor="middle" font-size="10.5" fill="#3a7a5a">prefix="action." → action_frame</text>
+  <text x="370" y="83" text-anchor="middle" font-size="10.5" fill="#3a7a5a">+ task string</text>
+
+  <line x1="475" y1="47" x2="525" y2="47" stroke="#5f6d67" stroke-width="1.5" marker-end="url(#darr)"/>
+
+  <rect x="530" y="8" width="195" height="78" rx="6" fill="#e8f5ee" stroke="#16805d" stroke-width="1.5"/>
+  <text x="627" y="31" text-anchor="middle" font-weight="700" font-size="12" fill="#16805d">dataset.add_frame()</text>
+  <text x="627" y="49" text-anchor="middle" font-size="10.5" fill="#3a7a5a">写入 episode buffer</text>
+  <text x="627" y="66" text-anchor="middle" font-size="10.5" fill="#3a7a5a">(内存中，未持久化)</text>
+  <text x="627" y="83" text-anchor="middle" font-size="10" fill="#5a9a7a">仅 camera_frame_valid=true 时</text>
+
+  <line x1="725" y1="47" x2="770" y2="47" stroke="#5f6d67" stroke-width="1.5" marker-end="url(#darr)"/>
+
+  <rect x="775" y="15" width="115" height="65" rx="6" fill="#fff" stroke="#5f6d67" stroke-width="1.5"/>
+  <text x="832" y="40" text-anchor="middle" font-weight="700" font-size="12">episode</text>
+  <text x="832" y="58" text-anchor="middle" font-weight="700" font-size="12">finished?</text>
+  <text x="832" y="73" text-anchor="middle" font-size="10.5" fill="#5f6d67">A 再次按下</text>
+
+  <line x1="832" y1="80" x2="832" y2="112" stroke="#16805d" stroke-width="2" marker-end="url(#darr-g)"/>
+
+  <rect x="695" y="115" width="275" height="60" rx="6" fill="#e8f5ee" stroke="#16805d" stroke-width="2"/>
+  <text x="832" y="138" text-anchor="middle" font-weight="700" font-size="12" fill="#16805d">dataset.save_episode()</text>
+  <text x="832" y="156" text-anchor="middle" font-size="10.5" fill="#3a7a5a">buffer → Parquet · video encoding (异步)</text>
+  <text x="832" y="172" text-anchor="middle" font-size="10" fill="#5a9a7a">禁用 progress bar 避免破坏 Live 面板</text>
+
+  <!-- Video encoding annotations -->
+  <rect x="280" y="130" width="330" height="55" rx="6" fill="#fef9ed" stroke="#a36b16" stroke-width="1.2" stroke-dasharray="4 2"/>
+  <text x="445" y="150" text-anchor="middle" font-size="10.5" fill="#a36b16">VideoEncodingManager (上下文管理器)</text>
+  <text x="445" y="168" text-anchor="middle" font-size="10" fill="#8a6a3a">控制 video encoding 生命周期 · streaming_encoding</text>
+
+  <line x1="370" y1="86" x2="370" y2="130" stroke="#a36b16" stroke-width="1" stroke-dasharray="3 2"/>
+</svg>
+</div>
+
+<h3>7.2 数据集特性</h3>
+<div class="grid2">
+  <div class="panel">
+    <h4>features 结构</h4>
+    <p style="font-size:12.5px;"><code>build_dataset_features()</code> 从 robot 推断所有必需的特征键：</p>
+    <ul style="font-size:12px;padding-left:18px;">
+      <li><code>observation.ee.x/y/z/roll/pitch/yaw</code></li>
+      <li><code>observation.joint_1.pos … joint_6.pos</code></li>
+      <li><code>observation.gripper.pos</code></li>
+      <li><code>observation.images.{camera_name}</code> (per camera)</li>
+      <li><code>action.ee.x/y/z/roll/pitch/yaw</code></li>
+      <li><code>action.gripper.pos</code></li>
+      <li><code>task</code> (string, single_task)</li>
+    </ul>
+  </div>
+  <div class="panel">
+    <h4>resume 支持</h4>
+    <p style="font-size:12.5px;"><code>--resume</code> 可接续中断的数据集：</p>
+    <ul style="font-size:12px;padding-left:18px;">
+      <li><code>LeRobotDataset.resume()</code> 加载已有 episodes</li>
+      <li><code>sanity_check_dataset_robot_compatibility()</code> 验证 robot/fps/features 一致性</li>
+      <li>后续 episodes 追加到同一 repo_id</li>
+    </ul>
+  </div>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<section id="servo">
+<h2><span class="num">§8</span> Cartesian Servo P 控制</h2>
+
+<h3>8.1 双连接架构</h3>
+<div class="diagram">
+<svg viewBox="0 0 880 230" role="img" aria-label="Servo architecture">
+  <defs>
+    <marker id="svarr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#16805d"/></marker>
+  </defs>
+
+  <!-- Main connection -->
+  <rect x="15" y="15" width="250" height="80" rx="6" fill="#e8f5ee" stroke="#16805d" stroke-width="1.5"/>
+  <text x="140" y="40" text-anchor="middle" font-weight="750" font-size="12" fill="#16805d">主连接 (命令)</text>
+  <text x="140" y="58" text-anchor="middle" font-size="10.5" fill="#3a7a5a">robot.send_action()</text>
+  <text x="140" y="76" text-anchor="middle" font-size="10.5" fill="#3a7a5a">→ servo_p() Cartesian Servo Move</text>
+  <text x="140" y="93" text-anchor="middle" font-size="10" fill="#5a9a7a">125 Hz 独立发送线程</text>
+
+  <!-- Feedback connection -->
+  <rect x="615" y="15" width="250" height="80" rx="6" fill="#e8f1f8" stroke="#2e6f9e" stroke-width="1.5"/>
+  <text x="740" y="40" text-anchor="middle" font-weight="750" font-size="12" fill="#2e6f9e">反馈连接 (观测)</text>
+  <text x="740" y="58" text-anchor="middle" font-size="10.5" fill="#4a7a9a">robot.get_observation()</text>
+  <text x="740" y="76" text-anchor="middle" font-size="10.5" fill="#4a7a9a">读取 EE pose · joints · gripper</text>
+  <text x="740" y="93" text-anchor="middle" font-size="10" fill="#6a9aba">separate_feedback_connection=true</text>
+
+  <!-- Robot -->
+  <rect x="340" y="135" width="200" height="45" rx="6" fill="#173b37"/>
+  <text x="440" y="163" text-anchor="middle" font-weight="800" font-size="14" fill="#bfe8d6">JAKA 机器人</text>
+
+  <line x1="140" y1="95" x2="140" y2="115" stroke="#16805d" stroke-width="1.5"/>
+  <line x1="140" y1="115" x2="340" y2="157" stroke="#16805d" stroke-width="2" marker-end="url(#svarr)"/>
+
+  <line x1="740" y1="95" x2="740" y2="115" stroke="#2e6f9e" stroke-width="1.5"/>
+  <line x1="740" y1="115" x2="540" y2="157" stroke="#2e6f9e" stroke-width="1.5" stroke-dasharray="5 3"/>
+
+  <!-- Servo settings -->
+  <rect x="15" y="135" width="845" height="80" rx="6" fill="#fff" stroke="#d8dfd8" stroke-width="1"/>
+  <text x="30" y="155" font-weight="700" font-size="11" fill="#5f6d67">Servo 参数 (从 teleop config 复制到 robot config)</text>
+  <text x="30" y="175" font-size="10.5" fill="#5f6d67">
+    线速度 0.20 m/s · 线加速度 0.8 m/s² · 线 jerk 3.0 m/s³ (3000 mm/s³, 在 JAKA Cartesian NLF 限制内)
+  </text>
+  <text x="30" y="195" font-size="10.5" fill="#5f6d67">
+    角速度 1.0 rad/s · 角加速度 2.0 rad/s² · 角 jerk 8.0 rad/s³
+  </text>
+  <text x="30" y="210" font-size="10.5" fill="#8a8a8a">
+    servo_filter_mode 强制设为 cartesian_nlf (Cartesian NLF = 在线 S 曲线规划器，抑制目标附近的 Servo P 抖动)
+  </text>
+</svg>
+</div>
+
+<h3>8.2 Servo Enable 生命周期</h3>
+<table>
+  <tr><th>事件</th><th>操作</th><th>原因</th></tr>
+  <tr><td>squeeze 接合边沿</td><td><code>servo_enable(True, repr="eef")</code></td><td>开始 Cartesian Servo Move 控制</td></tr>
+  <tr><td>squeeze 按住期间</td><td><code>send_action(action)</code></td><td>每帧发送最新 EEF 目标</td></tr>
+  <tr><td>squeeze 释放边沿</td><td><code>servo_enable(False)</code></td><td>退出 Servo Move，防止 NLF 继续积分未完成目标</td></tr>
+  <tr><td>RESET (B长按)</td><td>先 <code>servo_enable(False)</code>，再 <code>send_action(reset_joints, use_servo=False)</code></td><td>复位需要 blocking 关节空间运动，不能走 Servo P</td></tr>
+</table>
+
+<h3>8.3 响应速度调优</h3>
+<div class="callout callout-tip"><div style="font-weight:900;">T</div><div><strong>不要先关闭 cartesian_nlf</strong><br>该滤波器用于抑制固定目标附近的 Servo P 抖动。应通过提高线速度/加速度来解决迟滞，而不是关闭滤波器。JAKA 官方建议线性 jerk &lt; 5000 mm/s³，默认 3000 mm/s³。通过 control trace 比较 requested/applied/commanded/actual 来区分输入限幅和真实延迟。</div></div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<section id="rerun">
+<h2><span class="num">§9</span> RerunLogger 异步可视化</h2>
+
+<h3>9.1 架构</h3>
+<div class="diagram">
+<svg viewBox="0 0 880 200" role="img" aria-label="RerunLogger architecture">
+  <defs>
+    <marker id="rarr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#5f6d67"/></marker>
+  </defs>
+
+  <rect x="15" y="15" width="200" height="55" rx="6" fill="#e8f5ee" stroke="#16805d" stroke-width="1.5"/>
+  <text x="115" y="38" text-anchor="middle" font-weight="700" font-size="12" fill="#16805d">_record_loop()</text>
+  <text x="115" y="55" text-anchor="middle" font-size="10.5" fill="#3a7a5a">rerun_logger.log(data)</text>
+  <text x="115" y="70" text-anchor="middle" font-size="10" fill="#5a9a7a">(非阻塞)</text>
+
+  <line x1="215" y1="42" x2="265" y2="42" stroke="#5f6d67" stroke-width="1.5" marker-end="url(#rarr)"/>
+
+  <rect x="270" y="8" width="210" height="68" rx="6" fill="#fff" stroke="#7b4fbf" stroke-width="1.5"/>
+  <text x="375" y="30" text-anchor="middle" font-weight="700" font-size="12" fill="#7b4fbf">_LatestLogQueue</text>
+  <text x="375" y="48" text-anchor="middle" font-size="10.5" fill="#6a4a9a">put_latest() 合并旧帧</text>
+  <text x="375" y="65" text-anchor="middle" font-size="10" fill="#8a6aba">max 1 pending log frame</text>
+
+  <line x1="480" y1="42" x2="530" y2="42" stroke="#5f6d67" stroke-width="1.5" marker-end="url(#rarr)"/>
+
+  <rect x="535" y="8" width="200" height="68" rx="6" fill="#e8f1f8" stroke="#2e6f9e" stroke-width="1.5"/>
+  <text x="635" y="30" text-anchor="middle" font-weight="700" font-size="12" fill="#2e6f9e">_worker() 线程</text>
+  <text x="635" y="48" text-anchor="middle" font-size="10.5" fill="#4a7a9a">_log_sync(data)</text>
+  <text x="635" y="65" text-anchor="middle" font-size="10" fill="#6a9aba">rr.log() → gRPC stream</text>
+
+  <line x1="735" y1="42" x2="780" y2="42" stroke="#5f6d67" stroke-width="1.5" marker-end="url(#rarr)"/>
+
+  <rect x="785" y="15" width="80" height="55" rx="6" fill="#173b37"/>
+  <text x="825" y="40" text-anchor="middle" font-weight="700" font-size="11" fill="#bfe8d6">Rerun</text>
+  <text x="825" y="58" text-anchor="middle" font-weight="700" font-size="11" fill="#bfe8d6">Viewer</text>
+
+  <!-- Bottom: blueprint -->
+  <rect x="270" y="100" width="465" height="55" rx="6" fill="#fff" stroke="#d8dfd8" stroke-width="1"/>
+  <text x="502" y="120" text-anchor="middle" font-weight="700" font-size="11" fill="#5f6d67">Blueprint 自动布局</text>
+  <text x="502" y="138" text-anchor="middle" font-size="10.5" fill="#5f6d67">
+    相机 Grid (Spatial2D) + 关节 TimeSeries + 曲线 TimeSeries → Grid(2行) → Blueprint
+  </text>
+  <line x1="375" y1="76" x2="375" y2="100" stroke="#7b4fbf" stroke-width="1" stroke-dasharray="3 2"/>
+  <text x="340" y="90" font-size="9" fill="#7b4fbf">CMD_BLUEPRINT (首帧)</text>
+
+  <!-- switch_record -->
+  <rect x="270" y="170" width="465" height="22" rx="3" fill="#f4effb"/>
+  <text x="502" y="186" text-anchor="middle" font-size="10" fill="#7b4fbf">CMD_NEW_RECORDING: 新 episode → disconnect → 新 RecordingStream → reconnect</text>
+</svg>
+</div>
+
+<h3>9.2 关键设计</h3>
+<div class="grid2">
+  <div class="panel">
+    <h4>帧合并 (Coalescing)</h4>
+    <p style="font-size:13px;"><code>put_latest()</code> 将队列中所有旧 log 帧替换为最新一帧。当 Viewer 消费慢于录制循环时，自动跳帧而非阻塞录制。</p>
+  </div>
+  <div class="panel">
+    <h4>容错隔离</h4>
+    <p style="font-size:13px;">Rerun 是辅助工具。worker 线程的所有异常被静默捕获（仅 debug log），<strong>永远不会影响录制循环</strong>。失败帧仅计数到 errors 字段。</p>
+  </div>
+  <div class="panel">
+    <h4>Episode 标签绘制</h4>
+    <p style="font-size:13px;">每帧 Camera 图像在发送前用 OpenCV 绘制 Episode 号和 RECORDING/PAUSE 状态。白色文字 + 黑色描边，自适应缩放，居中显示。</p>
+  </div>
+  <div class="panel">
+    <h4>switch_record()</h4>
+    <p style="font-size:13px;">每个新 episode 创建新的 <code>RecordingStream</code>（新 recording_id），在 Rerun Viewer 中产生独立的录制时间线。Blueprint 在新 recording 中重新发送。</p>
+  </div>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<section id="trace">
+<h2><span class="num">§10</span> Control Trace 诊断</h2>
+
+<h3>10.1 CSV 结构</h3>
+<p><code>ControlTraceWriter</code> 每帧写入一行包含 <strong>67 个字段</strong>的 CSV。字段按类别组织：</p>
+
+<div class="grid3">
+  <div class="panel panel-blue">
+    <h4>时间与相位</h4>
+    <p style="font-size:12px;font-family:monospace;">time_s · phase · frame_index · action_source</p>
+  </div>
+  <div class="panel panel-purple">
+    <h4>XR 遥测</h4>
+    <p style="font-size:12px;font-family:monospace;">clutch_engaged · squeeze · trigger<br>thumbstick_x/y/click · grip_x/y/z_m<br>raw_grip_x/y/z_m · head_is_tracking<br>head_quat_x/y/z/w · control_yaw_deg</p>
+  </div>
+  <div class="panel panel-green">
+    <h4>TCP 位姿 (×4)</h4>
+    <p style="font-size:12px;font-family:monospace;"><strong>actual</strong> (观测) · <strong>requested</strong> (Clutch输出)<br><strong>applied</strong> (send_action后)<br><strong>servo_target</strong> · <strong>servo_commanded</strong></p>
+  </div>
+</div>
+
+<div class="grid2" style="margin-top:0;">
+  <div class="panel panel-amber">
+    <h4>跟踪误差</h4>
+    <p style="font-size:12px;font-family:monospace;">tracking_error = applied − actual (每轴)<br>tracking_error_norm_m · tracking_error_angle_rad<br>target_step = applied − previous_applied<br>target_step_norm_m · target_step_angle_rad</p>
+  </div>
+  <div class="panel panel-coral">
+    <h4>Servo + Rerun 健康</h4>
+    <p style="font-size:12px;font-family:monospace;">servo_active · servo_send_rate_hz<br>servo_period_p95_ms · servo_overruns<br>servo_queue_depth · servo_target_age_s<br>rerun_enqueued · rerun_dropped · rerun_errors</p>
+  </div>
+</div>
+
+<h3>10.2 如何使用 Trace 调试</h3>
+<div class="grid2">
+  <div class="panel">
+    <h4>方向问题</h4>
+    <p style="font-size:13px;">比较 <strong>raw_grip</strong> (未变换手柄位置) → <strong>control_yaw_deg</strong> (锁存 yaw) → <strong>requested</strong> (Clutch 输出)。检查 yaw 变换矩阵是否正确将手柄前向映射到 JAKA +Y。</p>
+  </div>
+  <div class="panel">
+    <h4>延迟问题</h4>
+    <p style="font-size:13px;">比较 <strong>requested → applied → servo_target → servo_commanded → actual</strong>。如果 requested→applied 一致但 actual 滞后，问题在 JAKA NLF 速度轮廓或机械响应。如果 applied≠servo_target，检查 Servo 周期和 queue depth。</p>
+  </div>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<section id="summary">
+<h2><span class="num">§11</span> 完整数据流时间线</h2>
+
+<div class="diagram">
+<svg viewBox="0 0 900 270" role="img" aria-label="End-to-end timeline">
+  <!-- Time axis -->
+  <line x1="40" y1="30" x2="880" y2="30" stroke="#d8dfd8" stroke-width="1"/>
+  <text x="40" y="22" font-size="9" fill="#5f6d67">t</text>
+
+  <!-- Frame timing blocks -->
+  <rect x="50" y="40" width="830" height="35" rx="4" fill="#e8f1f8" stroke="#2e6f9e" stroke-width="1"/>
+  <text x="465" y="55" text-anchor="middle" font-size="10" fill="#2e6f9e">get_observation() — 读取 arm state + camera (可能因相机超时阻塞)</text>
+  <text x="465" y="69" text-anchor="middle" font-size="9" fill="#4a7a9a">~5-15 ms</text>
+
+  <rect x="50" y="82" width="830" height="28" rx="4" fill="#f4effb" stroke="#7b4fbf" stroke-width="1"/>
+  <text x="465" y="101" text-anchor="middle" font-size="10" fill="#7b4fbf">device.compute(obs) → Clutch + head-yaw + thumbstick → action dict</text>
+
+  <rect x="50" y="117" width="830" height="28" rx="4" fill="#e8f5ee" stroke="#16805d" stroke-width="1"/>
+  <text x="465" y="136" text-anchor="middle" font-size="10" fill="#16805d">HoldLatch → GripperToggle → ControllerButtons → EpisodeController</text>
+
+  <rect x="50" y="152" width="600" height="28" rx="4" fill="#e8f5ee" stroke="#16805d" stroke-width="1"/>
+  <text x="350" y="171" text-anchor="middle" font-size="10" fill="#16805d">send_action() → servo_p() [独立线程 8ms 持续发送]</text>
+
+  <rect x="660" y="152" width="220" height="28" rx="4" fill="#fef9ed" stroke="#a36b16" stroke-width="1"/>
+  <text x="770" y="171" text-anchor="middle" font-size="10" fill="#a36b16">dataset.add_frame()</text>
+
+  <rect x="50" y="187" width="400" height="28" rx="4" fill="#e8f5ee" stroke="#16805d" stroke-width="1"/>
+  <text x="250" y="206" text-anchor="middle" font-size="10" fill="#16805d">control_trace.write_frame() + control panel refresh</text>
+
+  <rect x="460" y="187" width="420" height="28" rx="4" fill="#f0f4ee" stroke="#8a8a8a" stroke-width="1"/>
+  <text x="670" y="206" text-anchor="middle" font-size="10" fill="#5a6a5a">rerun_logger.log() [异步入队] + precise_sleep()</text>
+
+  <!-- Total -->
+  <rect x="50" y="225" width="830" height="32" rx="4" fill="#173b37"/>
+  <text x="465" y="247" text-anchor="middle" font-size="11" fill="#bfe8d6">总帧时间 budget: 33.3 ms (30 Hz) · 实际 ~10-25 ms · precise_sleep 填充剩余</text>
+</svg>
+</div>
+
+<h3>配置入口</h3>
+<div class="panel">
+  <p style="font-size:13px;"><code>record()</code> 函数由 draccus <code>@parser.wrap()</code> 装饰，自动从 CLI 解析 <code>RecordConfig</code>（含有 <code>robot: JakaRobotConfig</code>、<code>teleop: IsaacTeleopConfig</code>、<code>dataset: DatasetRecordConfig</code>）。</p>
+  <ul style="font-size:13px;padding-left:18px;">
+    <li><code>--teleop.type=xr_controller</code> 通过 <code>IsaacTeleopConfig._choice_registry</code> 解析为 <code>XRControllerConfig</code></li>
+    <li><code>build_device()</code> 连接 robot 后调用 <code>make_xr_device()</code>，将 teleop config 中的 Servo 参数复制到 robot config</li>
+    <li><code>record()</code> 的 finally 块保证硬件在数据集之前释放，防止视频编码时 SDK 连接仍然存活</li>
+  </ul>
+</div>
+</section>
+
+<footer>
+  <span>Isaac Teleop to JAKA · 遥操作录制原理 · v1.0</span>
+  <span>record.py · xr.py · clutch.py · control_trace.py · rerun_utils.py</span>
+</footer>
+
+</div>
+</body>
+</html>

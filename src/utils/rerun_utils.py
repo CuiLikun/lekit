@@ -3,6 +3,7 @@ import queue
 import threading
 import time
 import uuid
+from collections import deque
 
 import cv2
 import numpy as np
@@ -13,8 +14,8 @@ import torch
 class _LatestLogQueue(queue.Queue):
     """FIFO command queue that coalesces pending live-view frames."""
 
-    def put_latest(self, item: tuple, log_command: int) -> bool:
-        """Replace queued log frames while preserving ordered control commands."""
+    def put_latest(self, item: tuple, log_command: int) -> tuple[bool, int]:
+        """Replace queued log frames and report ``(accepted, dropped)``."""
 
         with self.not_full:
             pending = list(self.queue)
@@ -33,12 +34,12 @@ class _LatestLogQueue(queue.Queue):
                 self.not_full.notify_all()
 
             if self.maxsize > 0 and self._qsize() >= self.maxsize:
-                return False
+                return False, dropped
 
             self._put(item)
             self.unfinished_tasks += 1
             self.not_empty.notify()
-            return True
+            return True, dropped
 
 
 class RerunLogger:
@@ -99,6 +100,7 @@ class RerunLogger:
 
         self._queue: _LatestLogQueue = _LatestLogQueue(maxsize=max_queue_size)
         self._stopped = threading.Event()
+        self._init_status()
         self._thread = threading.Thread(target=self._worker, daemon=True, name="RerunLogger")
         self._thread.start()
 
@@ -263,7 +265,39 @@ class RerunLogger:
         # schema, so each new recording needs another enqueue here.
         self._enqueue_blueprint()
 
-        self._queue.put_latest((self._CMD_LOG, data), self._CMD_LOG)
+        accepted, coalesced = self._queue.put_latest((self._CMD_LOG, data), self._CMD_LOG)
+        with self._status_lock:
+            self._enqueued_frames += 1
+            self._dropped_frames += coalesced + (not accepted)
+
+    def get_status(self) -> dict[str, int | float | bool]:
+        """Return a lightweight snapshot of the asynchronous logging pipeline."""
+
+        now = time.monotonic()
+        with self._status_lock:
+            while self._processed_at and self._processed_at[0] < now - 1.0:
+                self._processed_at.popleft()
+            window_s = min(max(now - self._status_started_at, 1e-6), 1.0)
+            in_flight_ms = (
+                (now - self._log_started_at) * 1000.0
+                if self._log_started_at is not None
+                else 0.0
+            )
+            status = {
+                "enqueued_frames": self._enqueued_frames,
+                "processed_frames": self._processed_frames,
+                "dropped_frames": self._dropped_frames,
+                "worker_rate_hz": len(self._processed_at) / window_s,
+                "log_ms": self._last_log_ms,
+                "image_ms": self._last_image_ms,
+                "curve_ms": self._last_curve_ms,
+                "in_flight": self._log_started_at is not None,
+                "in_flight_ms": in_flight_ms,
+                "errors": self._errors,
+            }
+        status["queue_depth"] = self._queue.qsize()
+        status["worker_alive"] = self._thread.is_alive()
+        return status
 
     def switch_record(self) -> None:
         """Switch to a new recording_id (e.g., when starting a new episode).
@@ -311,6 +345,19 @@ class RerunLogger:
     # Internal
     # ------------------------------------------------------------------
 
+    def _init_status(self) -> None:
+        self._status_lock = threading.Lock()
+        self._status_started_at = time.monotonic()
+        self._enqueued_frames = 0
+        self._processed_frames = 0
+        self._dropped_frames = 0
+        self._errors = 0
+        self._last_log_ms = 0.0
+        self._last_image_ms = 0.0
+        self._last_curve_ms = 0.0
+        self._log_started_at: float | None = None
+        self._processed_at: deque[float] = deque()
+
     def _is_local(self) -> bool:
         return self._url and ("127.0.0.1" in self._url or "localhost" in self._url)
 
@@ -328,7 +375,24 @@ class RerunLogger:
                     return
                 cmd = item[0]
                 if cmd == self._CMD_LOG:
-                    self._log_sync(item[1])
+                    started_at = time.monotonic()
+                    timings = None
+                    with self._status_lock:
+                        self._log_started_at = started_at
+                    try:
+                        timings = self._log_sync(item[1])
+                    finally:
+                        finished_at = time.monotonic()
+                        with self._status_lock:
+                            self._processed_frames += 1
+                            self._last_log_ms = (finished_at - started_at) * 1000.0
+                            if timings is not None:
+                                self._last_image_ms = timings["image_ms"]
+                                self._last_curve_ms = timings["curve_ms"]
+                            self._log_started_at = None
+                            self._processed_at.append(finished_at)
+                            while self._processed_at[0] < finished_at - 1.0:
+                                self._processed_at.popleft()
                 elif cmd == self._CMD_BLUEPRINT:
                     rr.send_blueprint(item[1], recording=self._rec)
                 elif cmd == self._CMD_NEW_RECORDING:
@@ -344,6 +408,9 @@ class RerunLogger:
             except Exception:
                 # Rerun is auxiliary to control and recording. Keep worker failures
                 # out of stdout/stderr so they cannot corrupt a live Rich panel.
+                if item is not self._SENTINEL_STOP and item[0] == self._CMD_LOG:
+                    with self._status_lock:
+                        self._errors += 1
                 logging.getLogger(__name__).debug("Rerun logging failed", exc_info=True)
             finally:
                 self._queue.task_done()
@@ -470,7 +537,7 @@ class RerunLogger:
             )
         return output
 
-    def _log_sync(self, data: dict) -> None:
+    def _log_sync(self, data: dict) -> dict[str, float]:
         frame_seq = data.get("framestep")
         frame_seq = self._next_frame_seq if frame_seq is None else int(frame_seq)
 
@@ -480,6 +547,7 @@ class RerunLogger:
         task = data.get("task")
         episode_number = data.get("episode_number")
         record_state = data.get("record_state")
+        image_started_at = time.perf_counter()
         for name in self._image_keys:
             img = data.get(name)
             if img is None:
@@ -503,6 +571,8 @@ class RerunLogger:
                     ),
                     recording=self._rec,
                 )
+        image_ms = (time.perf_counter() - image_started_at) * 1000.0
+        curve_started_at = time.perf_counter()
         state = data.get("observation.state")
         for i in range(self._joint_count):
             if state is None:
@@ -516,3 +586,7 @@ class RerunLogger:
             value = data.get(key)
             if value is not None:
                 rr.log(key, rr.Scalars(float(value)), recording=self._rec)
+        return {
+            "image_ms": image_ms,
+            "curve_ms": (time.perf_counter() - curve_started_at) * 1000.0,
+        }

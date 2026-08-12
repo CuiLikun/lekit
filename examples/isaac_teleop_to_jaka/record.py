@@ -857,6 +857,8 @@ def _record_loop(
         loop_start = time.perf_counter()
         control_rate_hz = rate_monitor.update(loop_start)
 
+        observation_started_at = time.perf_counter()
+        camera_timeout = False
         try:
             obs = robot.get_observation()
         except JakaCameraTimeoutError as exc:
@@ -864,6 +866,7 @@ def _record_loop(
                 break
             obs = exc.observation
             camera_timeout_count += 1
+            camera_timeout = True
         except Exception:
             if events["stop_recording"]:
                 break
@@ -872,11 +875,13 @@ def _record_loop(
         # A timeout still produces a complete logical timestep. Reuse only the
         # missing camera streams, while preserving the freshly measured arm state.
         camera_frame_valid = _reuse_latest_camera_frames(robot, obs, latest_camera_frames)
+        observation_ms = (time.perf_counter() - observation_started_at) * 1000.0
 
         if events["stop_recording"]:
             break
 
         # XR clutch disengaged: hold the TCP pose latched on the idle edge.
+        device_compute_started_at = time.perf_counter()
         try:
             raw = device.compute(obs)
         except Exception:
@@ -888,6 +893,7 @@ def _record_loop(
             obs,
             float(device.telemetry.get("trigger", 0.0)),
         )
+        device_compute_ms = (time.perf_counter() - device_compute_started_at) * 1000.0
 
         if events["stop_recording"]:
             break
@@ -983,6 +989,7 @@ def _record_loop(
             episode.toggle_recording(loop_start)
             episode_finished = True
 
+        send_action_started_at = time.perf_counter()
         try:
             sent_action = _send_action_for_clutch_state(
                 robot,
@@ -995,6 +1002,7 @@ def _record_loop(
             if events["stop_recording"]:
                 break
             raise
+        send_action_ms = (time.perf_counter() - send_action_started_at) * 1000.0
 
         if loop_start >= next_status_refresh_at:
             robot_status = _jaka_status(robot)
@@ -1008,11 +1016,14 @@ def _record_loop(
         robot_status["record_state"] = episode.state
         robot_status["camera_timeout_count"] = camera_timeout_count
 
+        dataset_started_at = time.perf_counter()
         if episode.is_recording and camera_frame_valid:
             obs_frame = build_dataset_frame(dataset.features, obs, prefix=OBS_STR)
             action_frame = build_dataset_frame(dataset.features, sent_action, prefix=ACTION)
             dataset.add_frame({**obs_frame, **action_frame, "task": single_task})
+        dataset_ms = (time.perf_counter() - dataset_started_at) * 1000.0
 
+        rerun_enqueue_started_at = time.perf_counter()
         if rerun_logger is not None:
             rerun_action = {**action, "gripper.pos": gripper_toggle.position}
             rerun_frame = {
@@ -1038,6 +1049,7 @@ def _record_loop(
                 if getattr(camera, "use_rgb", True) and name in obs:
                     rerun_frame[f"observation.images.{name}"] = obs[name]
             rerun_logger.log(rerun_frame)
+        rerun_enqueue_ms = (time.perf_counter() - rerun_enqueue_started_at) * 1000.0
 
         # Work time of this iteration: obs read + compute + target update + record.
         # The robot-owned Servo sender continues independently if this loop is late.
@@ -1051,9 +1063,19 @@ def _record_loop(
                 observation=obs,
                 telemetry=device.telemetry,
                 servo_status=robot.get_servo_status(),
+                rerun_status=rerun_logger.get_status() if rerun_logger is not None else None,
                 frame_ms=frame_ms,
                 control_rate_hz=control_rate_hz,
                 control_target_hz=float(fps),
+                stage_timings={
+                    "observation_ms": observation_ms,
+                    "camera_timeout": camera_timeout,
+                    "camera_timeout_count": camera_timeout_count,
+                    "device_compute_ms": device_compute_ms,
+                    "send_action_ms": send_action_ms,
+                    "dataset_ms": dataset_ms,
+                    "rerun_enqueue_ms": rerun_enqueue_ms,
+                },
             )
         live.update(
             _control_panel(

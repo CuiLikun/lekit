@@ -2,6 +2,8 @@ import ast
 import csv
 import importlib
 import io
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -418,7 +420,7 @@ def test_rerun_logger_detects_pos_fields_and_logs_direct_curves(monkeypatch):
 
     class FakeQueue:
         def put_latest(self, _item, _log_command):
-            pass
+            return True, 0
 
     logger = rerun_module.RerunLogger.__new__(rerun_module.RerunLogger)
     logger._rec = object()
@@ -429,6 +431,8 @@ def test_rerun_logger_detects_pos_fields_and_logs_direct_curves(monkeypatch):
     logger._next_frame_seq = 0
     logger._blueprint_sent = True
     logger._queue = FakeQueue()
+    logger._init_status()
+    logger._thread = threading.current_thread()
     logger._enqueue_blueprint = lambda: None
 
     monkeypatch.setattr(rerun_module.rr, "set_time", lambda *_args, **_kwargs: None)
@@ -469,6 +473,8 @@ def test_rerun_logger_keeps_latest_frame_when_queue_is_full(monkeypatch):
     logger._image_keys = []
     logger._blueprint_sent = True
     logger._queue = rerun_module._LatestLogQueue(maxsize=2)
+    logger._init_status()
+    logger._thread = threading.current_thread()
     blueprint = (logger._CMD_BLUEPRINT, object())
     logger._queue.put(blueprint)
 
@@ -481,6 +487,39 @@ def test_rerun_logger_keeps_latest_frame_when_queue_is_full(monkeypatch):
     queued_steps = [item[1]["framestep"] for item in queued_items if item[0] == logger._CMD_LOG]
     assert queued_steps == [2]
     assert logger._queue.unfinished_tasks == 2
+    status = logger.get_status()
+    assert status["enqueued_frames"] == 3
+    assert status["dropped_frames"] == 2
+    assert status["queue_depth"] == 2
+
+
+def test_rerun_logger_reports_worker_throughput_and_log_duration(monkeypatch):
+    rerun_module = importlib.import_module("src.utils.rerun_utils")
+    logger = rerun_module.RerunLogger.__new__(rerun_module.RerunLogger)
+    logger._rec = object()
+    logger._queue = rerun_module._LatestLogQueue(maxsize=2)
+    logger._stopped = threading.Event()
+    logger._init_status()
+    logger._thread = threading.current_thread()
+    def fake_log_sync(_data):
+        time.sleep(0.001)
+        return {"image_ms": 0.75, "curve_ms": 0.25}
+
+    monkeypatch.setattr(logger, "_log_sync", fake_log_sync)
+    logger._queue.put((logger._CMD_LOG, {"framestep": 1}))
+    logger._queue.put(logger._SENTINEL_STOP)
+
+    logger._worker()
+
+    status = logger.get_status()
+    assert status["processed_frames"] == 1
+    assert status["worker_rate_hz"] > 0
+    assert status["log_ms"] >= 1.0
+    assert status["image_ms"] == 0.75
+    assert status["curve_ms"] == 0.25
+    assert status["in_flight"] is False
+    assert status["in_flight_ms"] == 0.0
+    assert status["errors"] == 0
 
 
 def test_rerun_logger_draws_episode_number_large_at_image_top_center():
@@ -1142,6 +1181,29 @@ def test_control_trace_records_disengaged_hold_and_servo_targets(monkeypatch, tm
                     "commanded_position": tuple(target.values()),
                     "send_rate_hz": 125.0,
                 },
+                rerun_status={
+                    "enqueued_frames": 20,
+                    "processed_frames": 18,
+                    "dropped_frames": 1,
+                    "queue_depth": 1,
+                    "worker_rate_hz": 27.5,
+                    "log_ms": 12.5,
+                    "image_ms": 9.5,
+                    "curve_ms": 3.0,
+                    "in_flight": True,
+                    "in_flight_ms": 3.5,
+                    "worker_alive": True,
+                    "errors": 0,
+                },
+                stage_timings={
+                    "observation_ms": 4.0,
+                    "camera_timeout": False,
+                    "camera_timeout_count": 2,
+                    "device_compute_ms": 1.0,
+                    "send_action_ms": 2.0,
+                    "dataset_ms": 0.5,
+                    "rerun_enqueue_ms": 0.25,
+                },
                 frame_ms=8.0,
                 control_rate_hz=29.5,
                 control_target_hz=30.0,
@@ -1175,6 +1237,22 @@ def test_control_trace_records_disengaged_hold_and_servo_targets(monkeypatch, tm
     assert float(rows[1]["thumbstick_x"]) == pytest.approx(-0.25)
     assert float(rows[1]["thumbstick_y"]) == pytest.approx(0.75)
     assert rows[1]["thumbstick_click"] == "1.0"
+    assert rows[1]["rerun_enqueued_frames"] == "20"
+    assert rows[1]["rerun_processed_frames"] == "18"
+    assert rows[1]["rerun_dropped_frames"] == "1"
+    assert float(rows[1]["rerun_worker_rate_hz"]) == pytest.approx(27.5)
+    assert float(rows[1]["rerun_log_ms"]) == pytest.approx(12.5)
+    assert float(rows[1]["rerun_image_ms"]) == pytest.approx(9.5)
+    assert float(rows[1]["rerun_curve_ms"]) == pytest.approx(3.0)
+    assert float(rows[1]["observation_ms"]) == pytest.approx(4.0)
+    assert rows[1]["camera_timeout"] == "False"
+    assert rows[1]["camera_timeout_count"] == "2"
+    assert float(rows[1]["device_compute_ms"]) == pytest.approx(1.0)
+    assert float(rows[1]["send_action_ms"]) == pytest.approx(2.0)
+    assert float(rows[1]["dataset_ms"]) == pytest.approx(0.5)
+    assert float(rows[1]["rerun_enqueue_ms"]) == pytest.approx(0.25)
+    assert rows[1]["rerun_in_flight"] == "True"
+    assert rows[1]["rerun_worker_alive"] == "True"
 
 
 def test_build_device_isolates_feedback_and_defers_servo_start(monkeypatch):
