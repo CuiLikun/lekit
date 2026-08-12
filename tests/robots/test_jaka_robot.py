@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import multiprocessing
+import os
 import threading
 import time
 
@@ -654,5 +656,160 @@ def test_servo_sdk_failure_stops_sender_and_records_error(monkeypatch):
         assert ("servo_move_enable", False) in rc.calls
         with pytest.raises(RuntimeError, match=r"Last worker error: JAKA servo_j failed \(-3\)"):
             arm.send_action({"joint_1.pos": 0.1})
+    finally:
+        arm.disconnect()
+
+
+def test_servo_process_worker_waits_for_engage_and_sends_latest_eef_target(monkeypatch):
+    rc = FakeRC()
+    monkeypatch.setattr(driver, "create_rc", lambda _ip: rc)
+    ctx = multiprocessing.get_context("spawn")
+    target = ctx.Array("d", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6], lock=True)
+    stop = ctx.Event()
+    active = ctx.Event()
+    process_ready = ctx.Event()
+    frame_ready = ctx.Event()
+    inactive = ctx.Event()
+    error_event = ctx.Event()
+    error_bytes = ctx.Array("b", [0] * driver.SERVO_PROCESS_ERROR_BYTES, lock=True)
+    frames_sent = ctx.Value("L", 0)
+    overruns = ctx.Value("L", 0)
+    queue_depth = ctx.Value("i", -1)
+    periods = ctx.Array("d", [0.0] * 16, lock=True)
+    period_index = ctx.Value("L", 0)
+    target_updated_at = ctx.Value("d", time.monotonic())
+    consecutive_overruns = ctx.Value("L", 0)
+    controller_state = ctx.Array("b", [0, 0], lock=False)
+    parent_rpc, child_rpc = ctx.Pipe(duplex=True)
+    config = driver.JakaRobot(
+        driver.JakaRobotConfig(
+            ip="10.0.0.2",
+            auto_enable_servo=False,
+            servo_filter_mode="cartesian_nlf",
+        )
+    )._servo_process_config()
+    worker = threading.Thread(
+        target=driver._servo_process_main,
+        args=(
+            "10.0.0.2",
+            False,
+            os.getppid(),
+            target,
+            stop,
+            active,
+            process_ready,
+            frame_ready,
+            inactive,
+            error_event,
+            error_bytes,
+            frames_sent,
+            overruns,
+            queue_depth,
+            periods,
+            period_index,
+            target_updated_at,
+            consecutive_overruns,
+            controller_state,
+            child_rpc,
+            config,
+        ),
+    )
+    worker.start()
+    try:
+        assert process_ready.wait(timeout=0.5)
+        assert not servo_calls(rc, "servo_p")
+
+        active.set()
+        assert frame_ready.wait(timeout=0.5)
+        with error_bytes.get_lock():
+            error_message = bytes((int(value) & 0xFF) for value in error_bytes).split(b"\0", 1)[0]
+        assert not error_event.is_set(), error_message.decode(errors="replace")
+        first_pose = servo_calls(rc, "servo_p")[0][1]
+        assert first_pose == pytest.approx((100.0, 200.0, 300.0, 0.4, 0.5, 0.6))
+        assert frames_sent.value >= 1
+        assert queue_depth.value == 3
+
+        active.clear()
+        assert inactive.wait(timeout=0.5)
+        assert rc.servo_enabled is False
+        assert not error_event.is_set()
+    finally:
+        stop.set()
+        active.clear()
+        worker.join(timeout=0.5)
+        parent_rpc.close()
+        child_rpc.close()
+    assert not worker.is_alive()
+    assert rc.calls[-1] == ("logout",)
+
+
+def test_servo_process_is_the_only_sdk_owner(monkeypatch):
+    """A second JAKA login invalidates the first controller session on A5."""
+
+    ctx = multiprocessing.get_context("fork")
+    login_generation = ctx.Value("i", 0)
+    login_count = ctx.Value("i", 0)
+
+    class SingleSessionRC(FakeRC):
+        def __init__(self):
+            super().__init__()
+            self.generation = 0
+
+        def login(self, **kwargs):
+            with login_generation.get_lock():
+                login_generation.value += 1
+                self.generation = login_generation.value
+            with login_count.get_lock():
+                login_count.value += 1
+            return (0,)
+
+        def _session_result(self, result):
+            if self.generation != login_generation.value:
+                return (-3,)
+            return result
+
+        def get_actual_joint_position(self):
+            return self._session_result(super().get_actual_joint_position())
+
+        def get_actual_tcp_position(self):
+            return self._session_result(super().get_actual_tcp_position())
+
+    monkeypatch.setattr(driver, "create_rc", lambda _ip: SingleSessionRC())
+    monkeypatch.setattr(driver.multiprocessing, "get_context", lambda _method: ctx)
+    arm = driver.JakaRobot(
+        driver.JakaRobotConfig(
+            ip="10.0.0.2",
+            auto_enable_servo=False,
+            servo_process=True,
+            servo_filter_mode="cartesian_nlf",
+        )
+    )
+
+    arm.connect()
+    try:
+        assert login_count.value == 1
+        assert arm.rc is None
+        assert arm.get_eef_pose() == pytest.approx((0.1, 0.2, 0.3, 0.1, 0.2, 0.3))
+        observation = arm.get_observation()
+        assert observation["joint_6.pos"] == pytest.approx(0.5)
+        assert observation["ee.z"] == pytest.approx(0.3)
+
+        arm.servo_enable(True, representation="eef")
+        applied = arm.send_action(
+            {
+                "ee.x": 0.105,
+                "ee.y": 0.2,
+                "ee.z": 0.3,
+                "ee.roll": 0.1,
+                "ee.pitch": 0.2,
+                "ee.yaw": 0.3,
+                "gripper.pos": 0.75,
+            }
+        )
+        assert applied["ee.x"] == pytest.approx(0.105)
+        assert applied["gripper.pos"] == pytest.approx(0.75)
+        arm.servo_enable(False, representation="eef")
+        arm.send_action({f"joint_{index}.pos": 0.0 for index in range(1, 7)}, use_servo=False)
+        assert arm.is_in_servo() is False
     finally:
         arm.disconnect()

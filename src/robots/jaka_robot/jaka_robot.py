@@ -2,8 +2,8 @@
 
 The public interface is deliberately small: construct :class:`JakaRobot`,
 call the standard LeRobot lifecycle methods, and use joint or Cartesian
-actions.  Vendor-specific operations remain available through ``robot.rc``
-after connection instead of being mirrored as a second, partial SDK.
+actions. In process-isolated Servo mode the worker exclusively owns the vendor
+SDK; normal mode still exposes the connected handle through ``robot.rc``.
 
 JAKA uses millimetres and radians. This adapter exposes metres and radians at
 its LeRobot interface, converting only at the SDK seam.
@@ -15,12 +15,14 @@ import ctypes
 import importlib
 import logging
 import math
+import multiprocessing
+import os
 import sys
 import threading
 import time
 from collections import deque
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
@@ -51,6 +53,7 @@ SERVO_CYCLE_S = 0.008
 SERVO_SPIN_THRESHOLD_S = 0.0005
 DEFAULT_SERVO_STEP_NUM = 1
 SERVO_QUEUE_MAX = 100
+SERVO_PROCESS_ERROR_BYTES = 512
 
 _ERROR_MESSAGES = {
     -3: "communication failure or controller is unavailable",
@@ -204,6 +207,294 @@ def _euler_to_quaternion(rpy: np.ndarray) -> np.ndarray:
     return quaternion / np.linalg.norm(quaternion)
 
 
+def _configure_servo_filter_on_rc(rc: Any, config: dict[str, Any]) -> None:
+    """Apply the controller-side Servo filter on an arbitrary SDK handle."""
+
+    mode = config["servo_filter_mode"]
+    if mode == "none":
+        return
+    if mode == "joint_lpf":
+        result = rc.servo_move_use_joint_LPF(config["servo_filter_joint_lpf_cutoff_hz"])
+    elif mode == "joint_nlf":
+        result = rc.servo_move_use_joint_NLF(
+            config["servo_joint_max_velocity_rad_s"],
+            config["servo_joint_max_acceleration_rad_s2"],
+            config["servo_filter_joint_max_jerk_rad_s3"],
+        )
+    elif mode == "cartesian_nlf":
+        result = rc.servo_move_use_carte_NLF(
+            config["servo_eef_max_velocity_m_s"] * 1000.0,
+            config["servo_eef_max_acceleration_m_s2"] * 1000.0,
+            config["servo_filter_eef_max_jerk_m_s3"] * 1000.0,
+            math.degrees(config["servo_eef_max_angular_velocity_rad_s"]),
+            math.degrees(config["servo_eef_max_angular_acceleration_rad_s2"]),
+            math.degrees(config["servo_filter_eef_max_angular_jerk_rad_s3"]),
+        )
+    else:
+        raise ValueError(f"Unsupported Servo filter mode: {mode}")
+    _payload(f"servo filter {mode}", result)
+
+
+def _write_servo_process_error(error_bytes: Any, error: BaseException) -> None:
+    message = f"{type(error).__name__}: {error}".encode("utf-8", errors="replace")
+    message = message[: SERVO_PROCESS_ERROR_BYTES - 1]
+    with error_bytes.get_lock():
+        error_bytes[:] = b"\x00" * SERVO_PROCESS_ERROR_BYTES
+        error_bytes[: len(message)] = message
+
+
+def _servo_process_rpc(rc: Any, operation: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    """Execute one whitelisted SDK operation in the sole-owner process."""
+
+    if operation == "get_arm_observation":
+        joints = _payload("get_actual_joint_position", rc.get_actual_joint_position())
+        tcp = _payload("get_actual_tcp_position", rc.get_actual_tcp_position())
+        return joints, tcp
+    methods = {
+        "get_actual_joint_position": "get_actual_joint_position",
+        "get_actual_tcp_position": "get_actual_tcp_position",
+        "get_robot_status_simple": "get_robot_status_simple",
+        "is_in_servomove": "is_in_servomove",
+        "joint_move": "joint_move",
+        "linear_move": "linear_move",
+        "power_on": "power_on",
+        "power_off": "power_off",
+        "enable_robot": "enable_robot",
+        "disable_robot": "disable_robot",
+        "motion_abort": "motion_abort",
+        "clear_error": "clear_error",
+        "drag_mode_enable": "drag_mode_enable",
+        "get_analog_input": "get_analog_input",
+        "set_analog_output": "set_analog_output",
+    }
+    method_name = methods.get(operation)
+    if method_name is None:
+        raise ValueError(f"Unsupported JAKA process operation: {operation}")
+    method = getattr(rc, method_name, None)
+    if method is None:
+        if operation == "get_robot_status_simple":
+            return None
+        raise RuntimeError(f"Installed JAKA binding does not expose {method_name}().")
+    return _payload(operation, method(*args, **kwargs))
+
+
+def _send_servo_process_rpc_response(connection: Any, request_id: int, result: Any = None) -> None:
+    connection.send((request_id, True, result))
+
+
+def _send_servo_process_rpc_error(connection: Any, request_id: int, exc: BaseException) -> None:
+    if isinstance(exc, JakaError):
+        detail = ("jaka", exc.operation, exc.code, exc.payload)
+    else:
+        detail = ("runtime", type(exc).__name__, str(exc))
+    connection.send((request_id, False, detail))
+
+
+def _service_servo_process_rpc(rc: Any, connection: Any, controller_state: Any) -> None:
+    """Drain pending parent requests between Servo deadlines."""
+
+    while connection.poll():
+        request_id, operation, args, kwargs = connection.recv()
+        try:
+            result = _servo_process_rpc(rc, operation, args, kwargs)
+        except BaseException as exc:
+            _send_servo_process_rpc_error(connection, request_id, exc)
+        else:
+            if operation == "power_on":
+                controller_state[0] = 1
+            elif operation == "power_off":
+                controller_state[0] = 0
+            elif operation == "enable_robot":
+                controller_state[1] = 1
+            elif operation == "disable_robot":
+                controller_state[1] = 0
+            _send_servo_process_rpc_response(connection, request_id, result)
+
+
+def _servo_process_main(
+    ip: str,
+    use_grpc: bool,
+    parent_pid: int,
+    target: Any,
+    stop: Any,
+    active: Any,
+    process_ready: Any,
+    frame_ready: Any,
+    inactive: Any,
+    error_event: Any,
+    error_bytes: Any,
+    frames_sent: Any,
+    overruns: Any,
+    queue_depth: Any,
+    periods: Any,
+    period_index: Any,
+    target_updated_at: Any,
+    consecutive_overruns: Any,
+    controller_state: Any,
+    rpc_connection: Any,
+    config: dict[str, Any],
+) -> None:
+    """Own the JAKA SDK and run blocking Servo calls outside the recorder process."""
+
+    rc = None
+    controller_servo_enabled = False
+    period_s = float(config["servo_step_num"]) * SERVO_CYCLE_S
+    try:
+        rc = create_rc(ip)
+        login = getattr(rc, "login", None) or getattr(rc, "log_in", None)
+        if login is None:
+            raise RuntimeError("Installed JAKA binding does not expose login() or log_in().")
+        try:
+            result = login(use_grpc=int(use_grpc))
+        except TypeError:
+            result = login()
+        _payload("servo process login", result)
+        rc.set_vibsuppress_mode(1)
+        rc.vibsuppress_on(12)
+        status_getter = getattr(rc, "get_robot_status_simple", None)
+        if status_getter is not None:
+            status = _payload("get_robot_status_simple", status_getter())
+            powered_on = bool(status[-2])
+            enabled = bool(status[-1])
+        else:
+            powered_on = False
+            enabled = False
+        if config["auto_power_on"] and not powered_on:
+            _payload("power_on", rc.power_on())
+            config["powered_by_driver"] = True
+        if config["auto_enable"] and not enabled:
+            _payload("enable_robot", rc.enable_robot())
+            config["enabled_by_driver"] = True
+        controller_state[0] = int(powered_on or config["powered_by_driver"])
+        controller_state[1] = int(enabled or config["enabled_by_driver"])
+        _payload("set_tool_id", rc.set_tool_id(int(config["tool_id"])))
+        _payload("set_user_frame_id", rc.set_user_frame_id(int(config["user_frame_id"])))
+        _payload("set_collision_level", rc.set_collision_level(int(config["collision_level"])))
+        _payload("set_motion_planner", rc.set_motion_planner(PLANNER_S))
+        _configure_servo_filter_on_rc(rc, config)
+        inactive.set()
+        process_ready.set()
+
+        while not stop.is_set():
+            if os.getppid() != parent_pid:
+                raise RuntimeError("Servo process parent exited")
+            if not active.wait(timeout=0.002):
+                _service_servo_process_rpc(rc, rpc_connection, controller_state)
+                continue
+            inactive.clear()
+            try:
+                try:
+                    result = rc.servo_move_enable(True, True)
+                except TypeError:
+                    result = rc.servo_move_enable(True)
+                _payload("servo_move_enable", result)
+                controller_servo_enabled = True
+                deadline = time.monotonic()
+                last_frame_at: float | None = None
+                while active.is_set() and not stop.is_set():
+                    if os.getppid() != parent_pid:
+                        raise RuntimeError("Servo process parent exited")
+                    if not _wait_for_servo_deadline(deadline, stop=stop):
+                        break
+                    if not active.is_set():
+                        break
+                    frame_at = time.monotonic()
+                    if last_frame_at is not None:
+                        measured_period = frame_at - last_frame_at
+                        with period_index.get_lock():
+                            slot = period_index.value % len(periods)
+                            periods[slot] = measured_period
+                            period_index.value += 1
+                        if measured_period > period_s * 1.5:
+                            with overruns.get_lock():
+                                overruns.value += 1
+                            consecutive_overruns.value += 1
+                        else:
+                            consecutive_overruns.value = 0
+                        if consecutive_overruns.value >= config["servo_max_consecutive_overruns"]:
+                            raise RuntimeError(
+                                "Servo watchdog detected "
+                                f"{consecutive_overruns.value} consecutive timing overruns"
+                            )
+                    last_frame_at = frame_at
+
+                    timeout_s = config["servo_target_timeout_s"]
+                    if timeout_s is not None and frame_at - target_updated_at.value > timeout_s:
+                        raise RuntimeError(
+                            "Servo watchdog target timeout after "
+                            f"{frame_at - target_updated_at.value:.3f}s"
+                        )
+                    parent_timeout_s = config["servo_process_parent_timeout_s"]
+                    if frame_at - target_updated_at.value > parent_timeout_s:
+                        raise RuntimeError(
+                            "Servo process parent heartbeat timeout after "
+                            f"{frame_at - target_updated_at.value:.3f}s"
+                        )
+
+                    with target.get_lock():
+                        frame = tuple(float(value) for value in target[:])
+                    frame = (*tuple(value * 1000.0 for value in frame[:3]), *frame[3:])
+                    result = rc.servo_p(frame, ABS, int(config["servo_step_num"]))
+                    values = _payload("servo_p", result)
+                    if values:
+                        try:
+                            queue_depth.value = int(values[0])
+                        except (TypeError, ValueError):
+                            queue_depth.value = -1
+                    with frames_sent.get_lock():
+                        frames_sent.value += 1
+                    frame_ready.set()
+                    _service_servo_process_rpc(rc, rpc_connection, controller_state)
+
+                    deadline += period_s
+                    if frame_at >= deadline:
+                        missed = int((frame_at - deadline) // period_s) + 1
+                        deadline += missed * period_s
+            finally:
+                if controller_servo_enabled:
+                    try:
+                        try:
+                            result = rc.servo_move_enable(False, True)
+                        except TypeError:
+                            result = rc.servo_move_enable(False)
+                        _payload("servo_move_disable", result)
+                    finally:
+                        controller_servo_enabled = False
+                inactive.set()
+    except BaseException as exc:
+        _write_servo_process_error(error_bytes, exc)
+        error_event.set()
+        process_ready.set()
+        frame_ready.set()
+        inactive.set()
+    finally:
+        if rc is not None:
+            if controller_servo_enabled:
+                try:
+                    try:
+                        result = rc.servo_move_enable(False, True)
+                    except TypeError:
+                        result = rc.servo_move_enable(False)
+                    _payload("servo_move_disable", result)
+                except Exception:
+                    logger.debug("Servo process failed to disable Servo Move", exc_info=True)
+            try:
+                if config.get("enabled_by_driver") and config["disable_on_disconnect"]:
+                    _payload("disable_robot", rc.disable_robot())
+                if config.get("powered_by_driver") and config["power_off_on_disconnect"]:
+                    _payload("power_off", rc.power_off())
+            except Exception:
+                logger.debug("Servo process failed to restore controller state", exc_info=True)
+            try:
+                logout = getattr(rc, "logout", None) or getattr(rc, "log_out", None)
+                if logout is not None:
+                    logout()
+            except Exception:
+                logger.debug("Servo process failed to logout", exc_info=True)
+        with suppress(Exception):
+            rpc_connection.close()
+
+
 def _quaternion_to_euler(quaternion: np.ndarray, *, reference_rpy: np.ndarray | None = None) -> np.ndarray:
     """Convert normalized wxyz quaternion to continuous XYZ roll/pitch/yaw radians."""
 
@@ -261,9 +552,14 @@ class JakaRobotConfig(RobotConfig):
     disable_on_disconnect: bool = False
     power_off_on_disconnect: bool = False
     use_grpc: bool = False
-    # Open a second SDK handle for feedback/auxiliary IO so state reads cannot
-    # interrupt the 8 ms Servo P command stream. Recorder workloads enable this.
+    # Optionally open a second SDK handle for feedback/auxiliary IO so state
+    # reads cannot interrupt an in-process Servo command stream.
     separate_feedback_connection: bool = False
+    # Run blocking vendor Servo calls in a child process so the native binding
+    # cannot starve camera/Rerun Python threads while holding the GIL.
+    servo_process: bool = False
+    servo_process_startup_timeout_s: float = 10.0
+    servo_process_parent_timeout_s: float = 0.5
     tool_id: int = 0
     user_frame_id: int = 0
     collision_level: int = 3
@@ -361,6 +657,8 @@ class JakaRobotConfig(RobotConfig):
                 self.servo_filter_eef_max_angular_jerk_rad_s3,
             ),
             ("servo_shutdown_timeout_s", self.servo_shutdown_timeout_s),
+            ("servo_process_startup_timeout_s", self.servo_process_startup_timeout_s),
+            ("servo_process_parent_timeout_s", self.servo_process_parent_timeout_s),
         ):
             if not np.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be positive and finite.")
@@ -441,9 +739,9 @@ class JakaRobot(Robot):
     ``send_action`` is ready after ``connect`` by default. Each action selects
     `servo_j` when it contains joint fields or `servo_p` when it contains
     Cartesian fields, with target limiting applied inside this adapter. For
-    one-off controller-planned moves use ``move_j`` or ``move_l``. Advanced SDK
-    calls are intentionally not mirrored: access the connected vendor handle
-    through ``rc`` when needed.
+    one-off controller-planned moves use ``move_j`` or ``move_l``. In normal
+    mode advanced calls may use ``rc``; process mode intentionally keeps
+    ``rc`` unset because its worker is the only SDK owner.
     """
 
     config_class: ClassVar[type] = JakaRobotConfig
@@ -469,7 +767,7 @@ class JakaRobot(Robot):
         self._feedback_sdk_lock = threading.RLock()
         self._observation_lock = threading.RLock()
         self._last_arm_observation: dict[str, float] | None = None
-        self._last_arm_observation_at: float | None = None
+        self._last_observation_at: float | None = None
         self._servo_state_lock = threading.RLock()
         self._servo_stop = threading.Event()
         self._servo_thread: threading.Thread | None = None
@@ -492,6 +790,26 @@ class JakaRobot(Robot):
         self._servo_queue_depth: int | None = None
         self._servo_last_error: str | None = None
         self._servo_watchdog: str | None = None
+        self._servo_process: multiprocessing.Process | None = None
+        self._servo_process_stop: Any | None = None
+        self._servo_process_active: Any | None = None
+        self._servo_process_started: Any | None = None
+        self._servo_process_ready: Any | None = None
+        self._servo_process_inactive: Any | None = None
+        self._servo_process_error_event: Any | None = None
+        self._servo_process_error_bytes: Any | None = None
+        self._servo_process_target: Any | None = None
+        self._servo_process_frames_sent: Any | None = None
+        self._servo_process_overruns: Any | None = None
+        self._servo_process_queue_depth: Any | None = None
+        self._servo_process_periods: Any | None = None
+        self._servo_process_period_index: Any | None = None
+        self._servo_process_target_updated_at: Any | None = None
+        self._servo_process_consecutive_overruns: Any | None = None
+        self._servo_process_controller_state: Any | None = None
+        self._servo_process_rpc_connection: Any | None = None
+        self._servo_process_rpc_lock = threading.Lock()
+        self._servo_process_rpc_request_id = 0
         self._last_gripper_position = config.gripper_fallback_position
         self._powered_by_driver = False
         self._enabled_by_driver = False
@@ -517,7 +835,15 @@ class JakaRobot(Robot):
 
     @property
     def is_connected(self) -> bool:
-        return self.rc is not None and all(camera.is_connected for camera in self.cameras.values())
+        if self.config.servo_process:
+            controller_connected = (
+                self._servo_process is not None
+                and self._servo_process.is_alive()
+                and self._servo_process_error() is None
+            )
+        else:
+            controller_connected = self.rc is not None
+        return controller_connected and all(camera.is_connected for camera in self.cameras.values())
 
     @property
     def is_calibrated(self) -> bool:
@@ -538,6 +864,18 @@ class JakaRobot(Robot):
         """Log in, apply configured controller settings, and attach cameras."""
 
         del calibrate
+        if self.config.servo_process:
+            try:
+                self._start_servo_process()
+                for camera in self.cameras.values():
+                    camera.connect()
+                if self.config.auto_enable_servo:
+                    self.servo_enable(True, representation="eef")
+            except BaseException:
+                self.disconnect()
+                raise
+            logger.info("JAKA controller %s connected through SDK owner process.", self.config.ip)
+            return
         rc = create_rc(self.config.ip)
         self._login(rc)
         self.rc = rc
@@ -565,7 +903,7 @@ class JakaRobot(Robot):
             for camera in self.cameras.values():
                 camera.connect()
             if self.config.auto_enable_servo:
-                self.servo_enable(True)
+                self.servo_enable(True, representation="joints")
         except BaseException:
             self.disconnect()
             raise
@@ -613,6 +951,15 @@ class JakaRobot(Robot):
     def disconnect(self) -> None:
         """Safely leave Servo Move, release owned state, and log out."""
 
+        if self.config.servo_process:
+            try:
+                if self._servo_active:
+                    self._set_servo(False, suppress_errors=True)
+                self._shutdown_servo_process(suppress_errors=True)
+            finally:
+                self._disconnect_cameras()
+                self._clear_disconnected_state()
+            return
         rc = self.rc
         if rc is None:
             return
@@ -620,6 +967,8 @@ class JakaRobot(Robot):
         try:
             if self._servo_active:
                 self._set_servo(False, suppress_errors=True)
+            if self._servo_process is not None:
+                self._shutdown_servo_process(suppress_errors=True)
             if self._enabled_by_driver and self.config.disable_on_disconnect:
                 self._call("disable_robot", rc.disable_robot())
             if self._powered_by_driver and self.config.power_off_on_disconnect:
@@ -636,20 +985,26 @@ class JakaRobot(Robot):
         except JakaError as exc:
             logger.warning("JAKA disconnect cleanup failed: %s", exc)
         finally:
-            for camera in self.cameras.values():
-                try:
-                    camera.disconnect()
-                except Exception as exc:  # nosec B110 - teardown is best effort
-                    logger.warning("JAKA camera cleanup failed: %s", exc)
-            self.rc = None
-            self._feedback_rc = None
-            self._servo_active = False
-            with self._observation_lock:
-                self._last_arm_observation = None
-                self._last_observation_at = None
-            self._last_eef_target = None
-            self._powered_by_driver = False
-            self._enabled_by_driver = False
+            self._disconnect_cameras()
+            self._clear_disconnected_state()
+
+    def _disconnect_cameras(self) -> None:
+        for camera in self.cameras.values():
+            try:
+                camera.disconnect()
+            except Exception as exc:  # nosec B110 - teardown is best effort
+                logger.warning("JAKA camera cleanup failed: %s", exc)
+
+    def _clear_disconnected_state(self) -> None:
+        self.rc = None
+        self._feedback_rc = None
+        self._servo_active = False
+        with self._observation_lock:
+            self._last_arm_observation = None
+            self._last_observation_at = None
+        self._last_eef_target = None
+        self._powered_by_driver = False
+        self._enabled_by_driver = False
 
     def _login(self, rc: Any) -> None:
         login = getattr(rc, "login", None) or getattr(rc, "log_in", None)
@@ -666,6 +1021,12 @@ class JakaRobot(Robot):
         return _payload(operation, result)
 
     def _read_joint_vector(self) -> np.ndarray:
+        if self.config.servo_process:
+            values = self._servo_rpc("get_actual_joint_position")
+            try:
+                return _vector(values, name="actual joint position")
+            except ValueError as exc:
+                raise JakaError("get_actual_joint_position", -1, tuple(values)) from exc
         rc, lock = self._feedback_handle()
         with lock:
             values = self._call("get_actual_joint_position", rc.get_actual_joint_position())
@@ -675,6 +1036,12 @@ class JakaRobot(Robot):
             raise JakaError("get_actual_joint_position", -1, values) from exc
 
     def _read_tcp_vector_mm(self) -> np.ndarray:
+        if self.config.servo_process:
+            values = self._servo_rpc("get_actual_tcp_position")
+            try:
+                return _vector(values, name="actual TCP position")
+            except ValueError as exc:
+                raise JakaError("get_actual_tcp_position", -1, tuple(values)) from exc
         rc, lock = self._feedback_handle()
         with lock:
             values = self._call("get_actual_tcp_position", rc.get_actual_tcp_position())
@@ -715,8 +1082,18 @@ class JakaRobot(Robot):
     def get_observation(self) -> RobotObservation:
         """Read actual joint/TCP state, optional gripper feedback, and cameras."""
 
-        joints = self.get_joint_positions()
-        eef = self.get_eef_pose()
+        if self.config.servo_process:
+            joint_values, tcp_values = self._servo_rpc("get_arm_observation")
+            joint_vector = _vector(joint_values, name="actual joint position")
+            eef = _vector(tcp_values, name="actual TCP position")
+            eef[:3] /= 1000.0
+            joints = {
+                f"{motor}.pos": float(joint_vector[index])
+                for index, motor in enumerate(self.motors)
+            }
+        else:
+            joints = self.get_joint_positions()
+            eef = self.get_eef_pose()
         observation: dict[str, Any] = dict(joints)
         observation.update(zip(self._EEF_KEYS, map(float, eef), strict=True))
         observation.update(self.get_gripper_position())
@@ -958,6 +1335,15 @@ class JakaRobot(Robot):
         """Execute one controller-planned absolute joint move in radians."""
 
         target = _vector(joints, name="joints")
+        if self.config.servo_process:
+            self._servo_rpc(
+                "joint_move",
+                tuple(map(float, target)),
+                ABS,
+                bool(is_block),
+                self.config.joint_speed if speed is None else speed,
+            )
+            return
         assert self.rc is not None
         with self._sdk_lock:
             self._call(
@@ -976,6 +1362,15 @@ class JakaRobot(Robot):
 
         target = _vector(pose, name="pose").copy()
         target[:3] *= 1000.0  # convert to mm for JAKA SDK
+        if self.config.servo_process:
+            self._servo_rpc(
+                "linear_move",
+                tuple(map(float, target)),
+                ABS,
+                bool(is_block),
+                self.config.linear_speed_mm_s if speed_mm_s is None else speed_mm_s,
+            )
+            return
         assert self.rc is not None
         with self._sdk_lock:
             self._call(
@@ -1007,27 +1402,36 @@ class JakaRobot(Robot):
     def power_on(self) -> None:
         """Power the controller on and record that this adapter owns that state."""
 
-        assert self.rc is not None
-        with self._sdk_lock:
-            self._call("power_on", self.rc.power_on())
+        if self.config.servo_process:
+            self._servo_rpc("power_on")
+        else:
+            assert self.rc is not None
+            with self._sdk_lock:
+                self._call("power_on", self.rc.power_on())
         self._powered_by_driver = True
 
     @check_if_not_connected
     def power_off(self) -> None:
         """Explicitly power the controller off after all motion has stopped."""
 
-        assert self.rc is not None
-        with self._sdk_lock:
-            self._call("power_off", self.rc.power_off())
+        if self.config.servo_process:
+            self._servo_rpc("power_off")
+        else:
+            assert self.rc is not None
+            with self._sdk_lock:
+                self._call("power_off", self.rc.power_off())
         self._powered_by_driver = False
 
     @check_if_not_connected
     def enable_robot(self) -> None:
         """Enable robot servos and record that this adapter owns that state."""
 
-        assert self.rc is not None
-        with self._sdk_lock:
-            self._call("enable_robot", self.rc.enable_robot())
+        if self.config.servo_process:
+            self._servo_rpc("enable_robot")
+        else:
+            assert self.rc is not None
+            with self._sdk_lock:
+                self._call("enable_robot", self.rc.enable_robot())
         self._enabled_by_driver = True
 
     @check_if_not_connected
@@ -1036,14 +1440,27 @@ class JakaRobot(Robot):
 
         if self._servo_active:
             self._set_servo(False)
-        assert self.rc is not None
-        with self._sdk_lock:
-            self._call("disable_robot", self.rc.disable_robot())
+        if self.config.servo_process:
+            self._servo_rpc("disable_robot")
+        else:
+            assert self.rc is not None
+            with self._sdk_lock:
+                self._call("disable_robot", self.rc.disable_robot())
         self._enabled_by_driver = False
 
     def get_controller_state(self) -> dict[str, bool]:
         """Return controller-reported power and enable state."""
 
+        if self.config.servo_process:
+            if self._servo_process_controller_state is None:
+                return {
+                    "powered_on": self._powered_by_driver,
+                    "enabled": self._enabled_by_driver,
+                }
+            return {
+                "powered_on": bool(self._servo_process_controller_state[0]),
+                "enabled": bool(self._servo_process_controller_state[1]),
+            }
         rc, lock = self._feedback_handle()
         getter = getattr(rc, "get_robot_status_simple", None)
         if getter is None:
@@ -1061,25 +1478,34 @@ class JakaRobot(Robot):
     def motion_abort(self) -> None:
         """Stop the controller's active planned motion."""
 
-        assert self.rc is not None
-        with self._sdk_lock:
-            self._call("motion_abort", self.rc.motion_abort())
+        if self.config.servo_process:
+            self._servo_rpc("motion_abort")
+        else:
+            assert self.rc is not None
+            with self._sdk_lock:
+                self._call("motion_abort", self.rc.motion_abort())
 
     @check_if_not_connected
     def clear_error(self) -> None:
         """Clear a recoverable controller fault after its physical cause is resolved."""
 
-        assert self.rc is not None
-        with self._sdk_lock:
-            self._call("clear_error", self.rc.clear_error())
+        if self.config.servo_process:
+            self._servo_rpc("clear_error")
+        else:
+            assert self.rc is not None
+            with self._sdk_lock:
+                self._call("clear_error", self.rc.clear_error())
 
     @check_if_not_connected
     def set_drag_mode(self, enabled: bool) -> None:
         """Enable or disable JAKA drag mode."""
 
-        assert self.rc is not None
-        with self._sdk_lock:
-            self._call("drag_mode_enable", self.rc.drag_mode_enable(bool(enabled)))
+        if self.config.servo_process:
+            self._servo_rpc("drag_mode_enable", bool(enabled))
+        else:
+            assert self.rc is not None
+            with self._sdk_lock:
+                self._call("drag_mode_enable", self.rc.drag_mode_enable(bool(enabled)))
 
     def servo_frame_period_s(self, step_num: int | None = None) -> float:
         """Return the nominal period of one Servo Move frame."""
@@ -1110,6 +1536,9 @@ class JakaRobot(Robot):
         representation: Literal["joints", "eef"] = "joints",
         suppress_errors: bool = False,
     ) -> None:
+        if self.config.servo_process:
+            self._set_servo_process(enabled, representation=representation, suppress_errors=suppress_errors)
+            return
         assert self.rc is not None
         if enabled:
             if self._servo_active:
@@ -1205,6 +1634,267 @@ class JakaRobot(Robot):
                 self._servo_queue_warned = False
                 self._last_eef_target = None
 
+    def _servo_process_config(self) -> dict[str, Any]:
+        return {
+            name: getattr(self.config, name)
+            for name in (
+                "auto_power_on",
+                "auto_enable",
+                "disable_on_disconnect",
+                "power_off_on_disconnect",
+                "tool_id",
+                "user_frame_id",
+                "collision_level",
+                "servo_step_num",
+                "servo_target_timeout_s",
+                "servo_max_consecutive_overruns",
+                "servo_process_parent_timeout_s",
+                "servo_filter_mode",
+                "servo_filter_joint_lpf_cutoff_hz",
+                "servo_joint_max_velocity_rad_s",
+                "servo_joint_max_acceleration_rad_s2",
+                "servo_filter_joint_max_jerk_rad_s3",
+                "servo_eef_max_velocity_m_s",
+                "servo_eef_max_acceleration_m_s2",
+                "servo_filter_eef_max_jerk_m_s3",
+                "servo_eef_max_angular_velocity_rad_s",
+                "servo_eef_max_angular_acceleration_rad_s2",
+                "servo_filter_eef_max_angular_jerk_rad_s3",
+            )
+        } | {"powered_by_driver": False, "enabled_by_driver": False}
+
+    def _servo_process_error(self) -> str | None:
+        if self._servo_process_error_bytes is None:
+            return None
+        with self._servo_process_error_bytes.get_lock():
+            raw = bytes((int(value) & 0xFF) for value in self._servo_process_error_bytes)
+        message = raw.split(b"\0", 1)[0].decode("utf-8", errors="replace")
+        return message or None
+
+    def _servo_rpc(self, operation: str, *args: Any, **kwargs: Any) -> Any:
+        """Call the sole-owner SDK process without exposing its native handle."""
+
+        process = self._servo_process
+        connection = self._servo_process_rpc_connection
+        if process is None or connection is None or not process.is_alive():
+            error = self._servo_process_error()
+            raise RuntimeError(error or "JAKA SDK owner process is not running")
+        with self._servo_process_rpc_lock:
+            self._servo_process_rpc_request_id += 1
+            request_id = self._servo_process_rpc_request_id
+            try:
+                connection.send((request_id, operation, args, kwargs))
+                timeout = self.config.servo_process_startup_timeout_s
+                if not connection.poll(timeout):
+                    raise TimeoutError(f"JAKA process {operation} timed out after {timeout:.1f}s")
+                response_id, ok, payload = connection.recv()
+            except (BrokenPipeError, EOFError, OSError) as exc:
+                error = self._servo_process_error()
+                raise RuntimeError(error or f"JAKA process {operation} communication failed") from exc
+            if response_id != request_id:
+                raise RuntimeError(
+                    f"JAKA process response mismatch: expected {request_id}, received {response_id}"
+                )
+            if ok:
+                return payload
+            if payload[0] == "jaka":
+                _, failed_operation, code, error_payload = payload
+                raise JakaError(failed_operation, code, tuple(error_payload))
+            _, error_type, message = payload
+            raise RuntimeError(f"JAKA process {operation} failed: {error_type}: {message}")
+
+    def _start_servo_process(self) -> None:
+        """Start the isolated SDK process; Servo Move remains inactive initially."""
+
+        ctx = multiprocessing.get_context("spawn")
+        target = ctx.Array("d", [0.0] * 6, lock=True)
+        stop = ctx.Event()
+        active = ctx.Event()
+        process_ready = ctx.Event()
+        frame_ready = ctx.Event()
+        inactive = ctx.Event()
+        error_event = ctx.Event()
+        error_bytes = ctx.Array("b", [0] * SERVO_PROCESS_ERROR_BYTES, lock=True)
+        frames_sent = ctx.Value("L", 0)
+        overruns = ctx.Value("L", 0)
+        queue_depth = ctx.Value("i", -1)
+        periods = ctx.Array("d", [0.0] * 512, lock=True)
+        period_index = ctx.Value("L", 0)
+        target_updated_at = ctx.Value("d", time.monotonic())
+        consecutive_overruns = ctx.Value("L", 0)
+        controller_state = ctx.Array("b", [0, 0], lock=False)
+        parent_rpc, child_rpc = ctx.Pipe(duplex=True)
+        process = ctx.Process(
+            target=_servo_process_main,
+            args=(
+                self.config.ip,
+                self.config.use_grpc,
+                os.getpid(),
+                target,
+                stop,
+                active,
+                process_ready,
+                frame_ready,
+                inactive,
+                error_event,
+                error_bytes,
+                frames_sent,
+                overruns,
+                queue_depth,
+                periods,
+                period_index,
+                target_updated_at,
+                consecutive_overruns,
+                controller_state,
+                child_rpc,
+                self._servo_process_config(),
+            ),
+            name=f"jaka-servo-process-{self.config.ip}",
+            daemon=True,
+        )
+        self._servo_process = process
+        self._servo_process_stop = stop
+        self._servo_process_active = active
+        self._servo_process_started = process_ready
+        self._servo_process_ready = frame_ready
+        self._servo_process_inactive = inactive
+        self._servo_process_error_event = error_event
+        self._servo_process_error_bytes = error_bytes
+        self._servo_process_target = target
+        self._servo_process_frames_sent = frames_sent
+        self._servo_process_overruns = overruns
+        self._servo_process_queue_depth = queue_depth
+        self._servo_process_periods = periods
+        self._servo_process_period_index = period_index
+        self._servo_process_target_updated_at = target_updated_at
+        self._servo_process_consecutive_overruns = consecutive_overruns
+        self._servo_process_controller_state = controller_state
+        self._servo_process_rpc_connection = parent_rpc
+        process.start()
+        child_rpc.close()
+        if not process_ready.wait(timeout=self.config.servo_process_startup_timeout_s):
+            self._shutdown_servo_process(suppress_errors=True)
+            raise RuntimeError("JAKA Servo process did not finish startup")
+        if error_event.is_set():
+            error = self._servo_process_error() or "JAKA Servo process failed during startup"
+            self._shutdown_servo_process(suppress_errors=True)
+            raise RuntimeError(error)
+
+    def _shutdown_servo_process(self, *, suppress_errors: bool = False) -> None:
+        process = self._servo_process
+        stop = self._servo_process_stop
+        if process is None:
+            return
+        if stop is not None:
+            stop.set()
+        process.join(timeout=self.config.servo_shutdown_timeout_s)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=self.config.servo_shutdown_timeout_s)
+            if not suppress_errors:
+                raise RuntimeError("JAKA Servo process did not stop cleanly")
+        if self._servo_process_rpc_connection is not None:
+            self._servo_process_rpc_connection.close()
+        self._servo_process = None
+        self._servo_process_stop = None
+        self._servo_process_active = None
+        self._servo_process_started = None
+        self._servo_process_ready = None
+        self._servo_process_inactive = None
+        self._servo_process_error_event = None
+        self._servo_process_error_bytes = None
+        self._servo_process_target = None
+        self._servo_process_frames_sent = None
+        self._servo_process_overruns = None
+        self._servo_process_queue_depth = None
+        self._servo_process_periods = None
+        self._servo_process_period_index = None
+        self._servo_process_target_updated_at = None
+        self._servo_process_consecutive_overruns = None
+        self._servo_process_controller_state = None
+        self._servo_process_rpc_connection = None
+
+    def _set_servo_process(
+        self,
+        enabled: bool,
+        *,
+        representation: Literal["joints", "eef"] = "joints",
+        suppress_errors: bool = False,
+    ) -> None:
+        if enabled and (representation != "eef" or self.config.servo_filter_mode != "cartesian_nlf"):
+            raise ValueError("servo_process requires EEF control with cartesian_nlf")
+        if self._servo_process is None:
+            self._start_servo_process()
+        if enabled:
+            assert self._servo_process is not None
+            process_error = self._servo_process_error()
+            if not self._servo_process.is_alive() or process_error:
+                self._servo_active = False
+                raise RuntimeError(process_error or "JAKA Servo process is not running")
+            if self._servo_active:
+                return
+            initial_position = self.get_eef_pose()
+            assert self._servo_process_target is not None
+            with self._servo_process_target.get_lock():
+                self._servo_process_target[:] = initial_position
+            assert self._servo_process_frames_sent is not None
+            assert self._servo_process_overruns is not None
+            assert self._servo_process_queue_depth is not None
+            assert self._servo_process_periods is not None
+            assert self._servo_process_period_index is not None
+            assert self._servo_process_target_updated_at is not None
+            assert self._servo_process_consecutive_overruns is not None
+            self._servo_process_frames_sent.value = 0
+            self._servo_process_overruns.value = 0
+            self._servo_process_queue_depth.value = -1
+            with self._servo_process_periods.get_lock():
+                self._servo_process_periods[:] = [0.0] * len(self._servo_process_periods)
+            self._servo_process_period_index.value = 0
+            self._servo_process_target_updated_at.value = time.monotonic()
+            self._servo_process_consecutive_overruns.value = 0
+            assert self._servo_process_active is not None and self._servo_process_ready is not None
+            self._servo_process_ready.clear()
+            self._servo_process_active.set()
+            with self._servo_state_lock:
+                self._servo_active = True
+                self._servo_representation = representation
+                self._servo_target = initial_position.copy()
+                self._servo_commanded_position = initial_position.copy()
+                self._servo_target_updated_at = time.monotonic()
+                self._servo_period_samples.clear()
+                self._servo_frames_sent = 0
+                self._servo_overruns = 0
+                self._servo_queue_depth = None
+            if not self._servo_process_ready.wait(timeout=self.config.servo_shutdown_timeout_s):
+                self._set_servo_process(False, representation=representation, suppress_errors=True)
+                raise RuntimeError("JAKA Servo process did not send an initial frame")
+            if self._servo_process_error_event is not None and self._servo_process_error_event.is_set():
+                error = self._servo_process_error() or "JAKA Servo process failed to start Servo Move"
+                self._servo_active = False
+                raise RuntimeError(error)
+            return
+        if not self._servo_active:
+            return
+        assert self._servo_process_active is not None and self._servo_process_inactive is not None
+        self._servo_process_active.clear()
+        stopped = self._servo_process_inactive.wait(timeout=self.config.servo_shutdown_timeout_s)
+        if not stopped:
+            message = "JAKA Servo process did not confirm Servo Move shutdown"
+            self._servo_last_error = message
+            if not suppress_errors:
+                raise RuntimeError(message)
+        if self._servo_process_error_event is not None and self._servo_process_error_event.is_set():
+            message = self._servo_process_error() or "JAKA Servo process failed"
+            self._servo_last_error = message
+            if not suppress_errors:
+                raise RuntimeError(message)
+        with self._servo_state_lock:
+            self._servo_active = False
+            self._servo_representation = None
+            self._servo_target = None
+            self._servo_commanded_position = None
+            self._last_eef_target = None
+
     def _set_controller_servo(self, enabled: bool) -> None:
         assert self.rc is not None
         with self._sdk_lock:
@@ -1226,9 +1916,18 @@ class JakaRobot(Robot):
         target = _vector(target, name="Servo target").copy()
         current = _vector(current, name="current Servo position").copy()
         with self._servo_state_lock:
-            if not self._servo_active or self._servo_thread is None or not self._servo_thread.is_alive():
+            worker_alive = (
+                self._servo_process is not None and self._servo_process.is_alive()
+                if self.config.servo_process
+                else self._servo_thread is not None and self._servo_thread.is_alive()
+            )
+            if not self._servo_active or not worker_alive:
+                if self.config.servo_process:
+                    self._servo_last_error = self._servo_process_error() or self._servo_last_error
                 detail = f" Last worker error: {self._servo_last_error}" if self._servo_last_error else ""
                 raise RuntimeError(f"Servo Move sender is not running.{detail}")
+            if self.config.servo_process and self._servo_representation != representation:
+                raise RuntimeError("Servo process representation cannot change while active.")
             if self._servo_representation != representation:
                 self._servo_representation = representation
                 self._servo_commanded_position = current
@@ -1237,6 +1936,13 @@ class JakaRobot(Robot):
                 self._servo_angular_speed = 0.0
             self._servo_target = target
             self._servo_target_updated_at = time.monotonic()
+            if self.config.servo_process:
+                assert self._servo_process_target is not None
+                with self._servo_process_target.get_lock():
+                    self._servo_process_target[:] = target
+                assert self._servo_process_target_updated_at is not None
+                self._servo_process_target_updated_at.value = self._servo_target_updated_at
+                self._servo_commanded_position = target.copy()
 
     def _servo_worker(self) -> None:
         step_num = self.config.servo_step_num
@@ -1401,7 +2107,46 @@ class JakaRobot(Robot):
         """Return a JSON-safe snapshot of sender timing and safety state."""
 
         with self._servo_state_lock:
-            samples = np.asarray(self._servo_period_samples, dtype=float)
+            if self.config.servo_process and self._servo_process_periods is not None:
+                with self._servo_process_periods.get_lock():
+                    process_samples = np.asarray(self._servo_process_periods[:], dtype=float)
+                samples = process_samples[process_samples > 0.0]
+                frames_sent = (
+                    int(self._servo_process_frames_sent.value)
+                    if self._servo_process_frames_sent is not None
+                    else 0
+                )
+                overruns = (
+                    int(self._servo_process_overruns.value)
+                    if self._servo_process_overruns is not None
+                    else 0
+                )
+                consecutive_overruns = (
+                    int(self._servo_process_consecutive_overruns.value)
+                    if self._servo_process_consecutive_overruns is not None
+                    else 0
+                )
+                queue_value = (
+                    int(self._servo_process_queue_depth.value)
+                    if self._servo_process_queue_depth is not None
+                    else -1
+                )
+                queue_depth = queue_value if queue_value >= 0 else None
+                worker_alive = self._servo_process is not None and self._servo_process.is_alive()
+                process_error = self._servo_process_error()
+                if process_error:
+                    self._servo_last_error = process_error
+                    if "watchdog" in process_error.lower() or "heartbeat" in process_error.lower():
+                        self._servo_watchdog = process_error
+                if self._servo_active and not worker_alive:
+                    self._servo_active = False
+            else:
+                samples = np.asarray(self._servo_period_samples, dtype=float)
+                frames_sent = self._servo_frames_sent
+                overruns = self._servo_overruns
+                consecutive_overruns = self._servo_consecutive_overruns
+                queue_depth = self._servo_queue_depth
+                worker_alive = self._servo_thread is not None and self._servo_thread.is_alive()
             target = tuple(map(float, self._servo_target)) if self._servo_target is not None else None
             commanded_position = (
                 tuple(map(float, self._servo_commanded_position))
@@ -1417,7 +2162,8 @@ class JakaRobot(Robot):
             )
             return {
                 "active": self._servo_active,
-                "worker_alive": self._servo_thread is not None and self._servo_thread.is_alive(),
+                "worker_alive": worker_alive,
+                "worker_mode": "process" if self.config.servo_process else "thread",
                 "representation": self._servo_representation,
                 "filter_mode": self.config.servo_filter_mode,
                 "target": target,
@@ -1426,10 +2172,10 @@ class JakaRobot(Robot):
                 "send_rate_hz": 1.0 / mean_period if mean_period > 0 else 0.0,
                 "period_p95_ms": float(np.percentile(samples, 95) * 1000.0) if samples.size else 0.0,
                 "period_max_ms": float(samples.max() * 1000.0) if samples.size else 0.0,
-                "frames_sent": self._servo_frames_sent,
-                "overruns": self._servo_overruns,
-                "consecutive_overruns": self._servo_consecutive_overruns,
-                "queue_depth": self._servo_queue_depth,
+                "frames_sent": frames_sent,
+                "overruns": overruns,
+                "consecutive_overruns": consecutive_overruns,
+                "queue_depth": queue_depth,
                 "watchdog": self._servo_watchdog,
                 "last_error": self._servo_last_error,
             }
@@ -1452,6 +2198,8 @@ class JakaRobot(Robot):
     def is_in_servo(self) -> bool:
         """Return the controller-reported Servo Move state."""
 
+        if self.config.servo_process:
+            return self._servo_active
         rc, lock = self._feedback_handle()
         with lock:
             values = self._call("is_in_servomove", rc.is_in_servomove())
@@ -1537,14 +2285,22 @@ class JakaRobot(Robot):
 
         if not self.config.gripper_analog_input_enabled:
             return {"gripper.pos": self._last_gripper_position}
-        rc, lock = self._feedback_handle()
-        with lock:
-            values = self._call(
+        if self.config.servo_process:
+            values = self._servo_rpc(
                 "get_analog_input",
-                rc.get_analog_input(
-                    self.config.gripper_analog_input_iotype, self.config.gripper_analog_input_index
-                ),
+                self.config.gripper_analog_input_iotype,
+                self.config.gripper_analog_input_index,
             )
+        else:
+            rc, lock = self._feedback_handle()
+            with lock:
+                values = self._call(
+                    "get_analog_input",
+                    rc.get_analog_input(
+                        self.config.gripper_analog_input_iotype,
+                        self.config.gripper_analog_input_index,
+                    ),
+                )
         raw = float(values[0])
         position = (raw - self.config.gripper_analog_input_min) / (
             self.config.gripper_analog_input_max - self.config.gripper_analog_input_min
@@ -1573,16 +2329,24 @@ class JakaRobot(Robot):
         raw = self.config.gripper_analog_output_min + normalized * (
             self.config.gripper_analog_output_max - self.config.gripper_analog_output_min
         )
-        rc, lock = self._feedback_handle()
-        with lock:
-            self._call(
+        if self.config.servo_process:
+            self._servo_rpc(
                 "set_analog_output",
-                rc.set_analog_output(
-                    iotype=self.config.gripper_analog_output_iotype,
-                    index=self.config.gripper_analog_output_index,
-                    value=raw,
-                ),
+                iotype=self.config.gripper_analog_output_iotype,
+                index=self.config.gripper_analog_output_index,
+                value=raw,
             )
+        else:
+            rc, lock = self._feedback_handle()
+            with lock:
+                self._call(
+                    "set_analog_output",
+                    rc.set_analog_output(
+                        iotype=self.config.gripper_analog_output_iotype,
+                        index=self.config.gripper_analog_output_index,
+                        value=raw,
+                    ),
+                )
         self._last_gripper_position = applied_position
         return applied_position
 

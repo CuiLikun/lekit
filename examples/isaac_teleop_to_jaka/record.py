@@ -501,10 +501,11 @@ def build_device(cfg: "RecordConfig") -> tuple[JakaRobot, Device]:
         cfg.teleop.cloudxr_env_file = CLOUDXR_ENV_FILE
 
     # The recorder owns Servo Move startup: wait until XR is ready and the
-    # clutch home has been measured. Feedback uses a separate SDK handle so
-    # 30 Hz observations cannot interrupt the controller's 8 ms command stream.
+    # clutch home has been measured. The isolated process exclusively owns the
+    # JAKA SDK; feedback, gripper IO, and reset moves use its RPC channel.
     cfg.robot.auto_enable_servo = False
-    cfg.robot.separate_feedback_connection = True
+    cfg.robot.separate_feedback_connection = False
+    cfg.robot.servo_process = True
     # The recorder uses the XR teleoperator's responsive Cartesian profile. JAKA's
     # controller-side Cartesian NLF remains enabled below for jitter suppression.
     for robot_name, teleop_name in (

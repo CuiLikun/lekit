@@ -1277,6 +1277,7 @@ def test_build_device_isolates_feedback_and_defers_servo_start(monkeypatch):
     def make_robot(config):
         observed_config["auto_enable_servo"] = config.auto_enable_servo
         observed_config["separate_feedback_connection"] = config.separate_feedback_connection
+        observed_config["servo_process"] = config.servo_process
         observed_config["servo_filter_mode"] = config.servo_filter_mode
         return FakeRobot(config)
 
@@ -1297,6 +1298,7 @@ def test_build_device_isolates_feedback_and_defers_servo_start(monkeypatch):
         robot=SimpleNamespace(
             auto_enable_servo=True,
             separate_feedback_connection=False,
+            servo_process=False,
             servo_filter_mode="none",
             user_frame_id=0,
         ),
@@ -1308,7 +1310,8 @@ def test_build_device_isolates_feedback_and_defers_servo_start(monkeypatch):
     assert robot.connected
     assert observed_config == {
         "auto_enable_servo": False,
-        "separate_feedback_connection": True,
+        "separate_feedback_connection": False,
+        "servo_process": True,
         "servo_filter_mode": "cartesian_nlf",
     }
     assert startup_calls == [True]
