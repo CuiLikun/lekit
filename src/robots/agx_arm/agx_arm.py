@@ -41,8 +41,6 @@ See https://github.com/agilexrobotics/pyAgxArm for the upstream SDK.
 
 from __future__ import annotations
 
-import logging
-from platform import system
 import time
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -54,38 +52,12 @@ from lerobot.cameras import CameraConfig, make_cameras_from_configs
 from lerobot.robots.config import RobotConfig
 from lerobot.robots.robot import Robot
 from lerobot.robots.utils import ensure_safe_goal_position
-from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
-logger = logging.getLogger(__name__)
-
-
-# ── Lazy pyAgxArm import ────────────────────────────────────────────────────
-#
-# ``pyAgxArm`` requires a running CAN stack (Linux socketcan / Windows
-# ``agx_cando`` / macOS ``slcan``) and pulls in the ``can`` package. The
-# factory + driver imports happen lazily so the module can be imported in
-# environments where ``pyAgxArm`` is unavailable (CI, mock_robot tests,
-# ``lerobot.robots.utils`` factory probing).
-
-
-def _require_pyagxarm():
-    """Import pyAgxArm lazily and cache the module-level symbols we use."""
-    global _AGX
-    if _AGX is None:
-        try:
-            import pyAgxArm as pyagxarm  # type: ignore[import-not-found]  # noqa: N813
-        except ImportError as e:
-            raise ImportError(
-                "pyAgxArm is required to use AgxArm. Install it with "
-                "`pip install pyAgxArm` (or the upstream repo "
-                "`agilexrobotics/pyAgxArm`)."
-            ) from e
-        _AGX = pyagxarm
-    return _AGX
-
-
-_AGX = None
+try:
+    import pyAgxArm as pyagxarm  # type: ignore[import-not-found]  # noqa: N813
+except ImportError as e:
+    raise ImportError("pyAgxArm is not installed") from e
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -262,26 +234,13 @@ class AgxArm(Robot):
 
     config_class: ClassVar[type] = AgxArmConfig
     name: ClassVar[str] = "agx_arm"
-
-    # Piper variants have six joints; Nero has seven. The instance value is
-    # selected from the model so its schema matches the SDK command length.
-    N_JOINTS: ClassVar[int] = 6
-    motors: ClassVar[list[str]] = [f"joint_{i + 1}" for i in range(N_JOINTS)] + ["gripper"]
-    _JOINT_COUNTS: ClassVar[dict[str, int]] = {"nero": 7, **dict.fromkeys(_PIPER_MODELS, 6)}
-
-    # ── Construction ──
+    motors: list[str] = []
 
     def __init__(self, config: AgxArmConfig):
         super().__init__(config)
         self.config: AgxArmConfig = config
-        self.N_JOINTS = self._JOINT_COUNTS[config.arm_model]
-        self.arm_motors = [f"joint_{index + 1}" for index in range(self.N_JOINTS)]
-        self.motors = [*self.arm_motors, "gripper"]
         self.arm: Any | None = None
-        self.effector: Any | None = None
         self.cameras: dict[str, Any] = make_cameras_from_configs(config.cameras) if config.cameras else {}
-
-    # ── Feature schemas ──
 
     @cached_property
     def observation_features(self) -> dict[str, Any]:
@@ -290,7 +249,7 @@ class AgxArm(Robot):
         The measured joints, gripper, flange pose, and configured camera frames
         are always emitted, independent of the active command representation.
         """
-        features: dict[str, Any] = {f"{motor}.pos": float for motor in self.arm_motors}
+        features: dict[str, Any] = {f"{motor}.pos": float for motor in self.motors}
         features["gripper.pos"] = float
         features.update({f"ee.{axis}": float for axis in ("x", "y", "z", "roll", "pitch", "yaw")})
         for cam_key, cam in self.cameras.items():
@@ -308,21 +267,13 @@ class AgxArm(Robot):
         ``ee.{x,y,z,roll,pitch,yaw}`` fields, plus ``gripper.pos``. The active
         ``control_mode`` selects which arm representation is sent to the SDK.
         """
-        features: dict[str, Any] = {f"{motor}.pos": float for motor in self.arm_motors}
-        features.update({f"ee.{axis}": float for axis in ("x", "y", "z", "roll", "pitch", "yaw")})
+        features: dict[str, Any] = {f"{motor}.pos": float for motor in self.motors}
         features["gripper.pos"] = float
+        features.update({f"ee.{axis}": float for axis in ("x", "y", "z", "roll", "pitch", "yaw")})
         return features
-
-    # ── Connection state ──
 
     @property
     def is_connected(self) -> bool:
-        # Match the lerobot convention (see SOFollower / OpenArmFollower):
-        # the connected check covers the arm bus + cameras only. The
-        # effector's ``is_ok()`` is a runtime health signal (CAN traffic
-        # flowing, no driver fault) that can flap independently of the
-        # bus state, so it is exposed separately rather than gating
-        # ``get_observation`` / ``send_action``.
         return (
             self.arm is not None
             and self.arm.is_connected()
@@ -339,56 +290,49 @@ class AgxArm(Robot):
         """No-op: the AgileX controller self-calibrates; nothing to do here."""
         return
 
-    # ── Lifecycle ──
-
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
         """Open the CAN bus, configure the arm, and connect cameras."""
-        del calibrate
-
-        sdk = _require_pyagxarm()
-        sdk_config = sdk.create_agx_arm_config(
+        sdk_config = pyagxarm.create_agx_arm_config(
             robot=self.config.arm_model,
-            firmeware_version=self.config.firmware_version,
+            firmware_version=self.config.firmware_version,
             interface=self.config.interface,
             channel=self.config.channel,
             bitrate=self.config.bitrate,
         )
-        arm = sdk.AgxArmFactory.create_arm(sdk_config)
-        self.arm = arm
+        self.arm = pyagxarm.AgxArmFactory.create_arm(sdk_config)
 
         try:
-            arm.connect()
-            if self.config.auto_clear_joint_error and arm.clear_joint_error() is False:
-                logger.warning("AgxArm: controller did not acknowledge clear_joint_error().")
+            self.arm.connect()
+            if self.config.auto_clear_joint_error and self.arm.clear_joint_error() is False:
+                print("AgxArm: controller did not acknowledge clear_joint_error().")
             if self.config.auto_enable:
-                self._enable_arm(arm)
+                self.arm.enable()
             if self.config.auto_set_follower_mode:
-                arm.set_follower_mode()
+                self.arm.set_follower_mode()
 
-            self.effector = arm.init_effector(arm.OPTIONS.EFFECTOR.AGX_GRIPPER)
+            self.effector = self.arm.init_effector(self.arm.OPTIONS.EFFECTOR.AGX_GRIPPER)
             for camera in self.cameras.values():
                 camera.connect()
             self.configure()
         except Exception:
+            print("AgxArm: failed to connect; cleaning up.")
             self.disconnect()
             raise
-        logger.info(
-            "AgxArm[%s %s fw=%s on %s/%s] connected.",
-            self.config.arm_model,
-            self.id,
-            self.config.firmware_version,
-            self.config.interface,
-            self.config.channel,
-        )
 
-    @staticmethod
-    def _enable_arm(arm: Any) -> None:
-        deadline = time.monotonic() + 2.0
-        while not arm.enable():
-            if time.monotonic() >= deadline:
-                raise RuntimeError("AgxArm: timed out waiting for all joints to enable.")
-            time.sleep(0.01)
+        self.motors = [f"joint_{i + 1}" for i in range(self.arm.joint_nums)]
+
+        print(f"AgxArm[{self.arm.joint_nums}DOF] connected.")
+        print(f"firmware={self.arm.get_firmware()}")
+        print(f"status={self.arm.is_ok()}")
+        print(f"fps={self.arm.get_fps()}")
+        print(f"arm_status={self.arm.get_arm_status()}")
+        print(f"arm_model={self.config.arm_model}")
+        print(f"id={self.id}")
+        print(f"firmware_version={self.config.firmware_version}")
+        print(f"interface={self.config.interface}")
+        print(f"channel={self.config.channel}")
+        print(f"joint_enable_status_list={self.arm.get_joints_enable_status_list()}")
 
     def configure(self) -> None:
         """Enable the SDK's model-specific software joint limits."""
@@ -404,29 +348,36 @@ class AgxArm(Robot):
                     if arm.is_connected():
                         arm.disable()
                 except Exception as e:
-                    logger.warning("AgxArm: could not disable joints during disconnect: %s", e)
+                    print("AgxArm: could not disable joints during disconnect: %s", e)
             try:
                 arm.disconnect()
             except Exception as e:
-                logger.warning("AgxArm: error during disconnect: %s", e)
+                print("AgxArm: error during disconnect: %s", e)
         for camera in self.cameras.values():
             try:
                 camera.disconnect()
             except Exception:
-                logger.debug("AgxArm: camera disconnect failed, ignoring.")
+                print("AgxArm: camera disconnect failed, ignoring.")
         self.arm = None
         self.effector = None
-        logger.info("AgxArm[%s] disconnected.", self.id)
-
-    # ── Observation / Action ──
+        print("AgxArm[%s] disconnected.", self.id)
 
     @check_if_not_connected
-    def get_observation(self) -> RobotObservation:
+    def get_observation(self) -> dict[str, Any]:
         """Read arm state and configured camera frames."""
         obs: dict[str, Any] = {}
-        obs.update(self.get_joint_angles())
-        obs.update(self.get_gripper_position())
-        obs.update(self.get_ee_pose())
+        obs.update(
+            {f"{motor}.pos": angle for motor, angle in zip(self.motors, self.get_joint_angles(), strict=True)}
+        )
+        obs.update({"gripper.pos": self.get_gripper_status()})
+        obs.update(
+            {
+                f"ee.{axis}": value
+                for axis, value in zip(
+                    ["x", "y", "z", "roll", "pitch", "yaw"], self.get_flange_pose(), strict=True
+                )
+            }
+        )
 
         for camera_name, camera in self.cameras.items():
             if getattr(camera, "use_rgb", True):
@@ -436,84 +387,53 @@ class AgxArm(Robot):
         return obs
 
     @check_if_not_connected
-    def get_joint_angles(self) -> dict[str, float]:
+    def get_joint_angles(self) -> list[float]:
         """Read the configured model's measured joint angles in radians."""
         sample = self.arm.get_joint_angles()
-        if sample is None:
-            return dict.fromkeys((f"{motor}.pos" for motor in self.arm_motors), 0.0)
-
+        assert sample is not None
         angles = np.asarray(sample.msg, dtype=float)
-        if angles.shape != (self.N_JOINTS,) or not np.all(np.isfinite(angles)):
-            raise RuntimeError(f"AgxArm: invalid joint feedback {sample.msg!r}.")
-        return {f"{motor}.pos": float(angles[index]) for index, motor in enumerate(self.arm_motors)}
+        assert angles.shape == (self.arm.joint_nums,) and np.all(np.isfinite(angles))
+        return [float(angle) for angle in angles]
 
     @check_if_not_connected
-    def get_gripper_position(self) -> dict[str, float]:
+    def get_gripper_status(self) -> float:
         """Read normalized gripper position in [0, 1] as ``gripper.pos`` field."""
         status = None if self.effector is None else self.effector.get_gripper_status()
-        if status is None:
-            return {"gripper.pos": 0.0}
-        if status.msg.mode != "width":
-            raise RuntimeError("AgxArm: AgxGripper must be in width mode to report gripper.pos.")
-
+        assert status is not None
+        assert status.msg.mode == "width"
         value = float(status.msg.value)
-        if not np.isfinite(value):
-            raise RuntimeError(f"AgxArm: invalid gripper feedback {value!r}.")
-        return {"gripper.pos": float(np.clip(value / self.config.gripper_max_range, 0.0, 1.0))}
+        assert np.isfinite(value)
+        return value
 
     @check_if_not_connected
     def get_flange_pose(self) -> list[float]:
         sample = self.arm.get_flange_pose()
-        if sample is None:
-            raise RuntimeError("AgxArm: no flange-pose feedback has been received.")
-
+        assert sample is not None, "AgxArm: get_flange_pose() returned None."
         pose = np.asarray(sample.msg, dtype=float)
-        if pose.shape != (6,) or not np.all(np.isfinite(pose)):
-            raise RuntimeError(f"AgxArm: invalid flange-pose feedback {sample.msg!r}.")
+        assert pose.shape == (6,) and np.all(np.isfinite(pose))
         return [float(value) for value in pose]
 
     @check_if_not_connected
-    def get_ee_pose(self) -> dict[str, float]:
-        """Read the current flange pose as Cartesian action fields."""
-        return dict(
-            zip(
-                ("ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw"),
-                self.get_flange_pose(),
-                strict=True,
-            )
-        )
-
-    @check_if_not_connected
-    def send_action(self, action: RobotAction) -> RobotAction:
+    def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         """Dispatch the configured joint-space or Cartesian control command."""
         if self.config.control_mode == "ee_pose":
             applied = self._send_ee_pose_action(action)
             applied.update(self.get_joint_angles())
         else:
             applied = self._send_joint_action(action)
-            applied.update(self.get_ee_pose())
+            applied.update(self.get_flange_pose())
         return {key: float(applied[key]) for key in self.action_features}
 
-    @staticmethod
-    def _as_finite_float(value: Any, key: str) -> float:
-        try:
-            result = float(value)
-        except (TypeError, ValueError) as e:
-            raise TypeError(f"AgxArm.send_action: action[{key!r}]={value!r} is not numeric") from e
-        if not np.isfinite(result):
-            raise ValueError(f"AgxArm.send_action: action[{key!r}] must be finite")
-        return result
-
-    def _apply_gripper_action(self, action: RobotAction) -> float:
+    def _apply_gripper_action(self, action: dict[str, Any]) -> float:
         if "gripper.pos" not in action:
-            return self.get_gripper_position()["gripper.pos"]
+            return self.get_gripper_status()
 
         position = float(np.clip(self._as_finite_float(action["gripper.pos"], "gripper.pos"), 0.0, 1.0))
         if self.config.control_gripper and self.effector is not None:
             self.move_gripper_m(position * self.config.gripper_max_range)
         return position
 
-    def _send_ee_pose_action(self, action: RobotAction) -> RobotAction:
+    def _send_ee_pose_action(self, action: dict[str, Any]) -> dict[str, Any]:
         """Rate-limit a flange target before passing it to SDK Cartesian control."""
         keys = ("ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw")
         current = np.asarray(self.get_flange_pose(), dtype=float)
@@ -532,12 +452,12 @@ class AgxArm(Robot):
         applied["gripper.pos"] = self._apply_gripper_action(action)
         return applied
 
-    def _send_joint_action(self, action: RobotAction) -> RobotAction:
+    def _send_joint_action(self, action: dict[str, Any]) -> dict[str, Any]:
         """Clamp ``joint_N.pos`` to ``max_relative_target`` and call ``move_j``."""
         present_dict = self.get_joint_angles()
-        present = [present_dict[f"{motor}.pos"] for motor in self.arm_motors]
+        present = [present_dict[f"{motor}.pos"] for motor in self.motors]
         goals: dict[str, float] = {}
-        for motor in self.arm_motors:
+        for motor in self.motors:
             key = f"{motor}.pos"
             if key in action:
                 goals[key] = self._as_finite_float(action[key], key)
@@ -553,9 +473,7 @@ class AgxArm(Robot):
             safe = {}
 
         if goals:
-            command = [
-                safe.get(f"{motor}.pos", present[index]) for index, motor in enumerate(self.arm_motors)
-            ]
+            command = [safe.get(f"{motor}.pos", present[index]) for index, motor in enumerate(self.motors)]
             self.move_j(command)
 
         applied = {**present_dict, **safe}
@@ -599,7 +517,53 @@ __all__ = [
 
 
 if __name__ == "__main__":
-    from rich import print
+    from platform import system
+
+    from rich import box
+    from rich.console import Group
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.table import Table
+
+    def format_vector(values: dict[str, Any]) -> str:
+        """Render scalar robot values while omitting camera-frame arrays."""
+        items = [
+            f"{key}={float(value):.4f}"
+            for key, value in values.items()
+            if isinstance(value, (int, float, np.integer, np.floating))
+        ]
+        return "[" + ", ".join(items) + "]"
+
+    def make_live_panel(
+        *,
+        step: int,
+        target_fps: float,
+        actual_fps: float | None,
+        observation: dict[str, Any],
+        action: dict[str, Any],
+        applied_action: dict[str, Any],
+        arm_ok: bool,
+    ) -> Panel:
+        summary = Table.grid(padding=(0, 2))
+        summary.add_column(style="bold cyan")
+        summary.add_column()
+        summary.add_row("Step", str(step))
+        summary.add_row("Loop FPS", "--" if actual_fps is None else f"{actual_fps:.2f}")
+        summary.add_row("Target FPS", f"{target_fps:.2f}")
+        summary.add_row("Arm OK", "[green]yes[/green]" if arm_ok else "[red]no[/red]")
+
+        vectors = Table(box=box.SIMPLE_HEAVY, expand=True)
+        vectors.add_column("Signal", style="bold cyan", no_wrap=True)
+        vectors.add_column("Values", overflow="fold")
+        vectors.add_row("State", format_vector(observation))
+        vectors.add_row("Command", format_vector(action))
+        vectors.add_row("Applied", format_vector(applied_action))
+
+        return Panel(
+            Group(summary, vectors),
+            title="AGX Arm Live Monitor",
+            border_style="cyan",
+        )
 
     platform_system = system()
     if platform_system == "Windows":
@@ -616,8 +580,6 @@ if __name__ == "__main__":
             "pyAgxArm currently documents Linux `socketcan`, Windows `agx_cando`, and macOS `slcan`."
         )
 
-    logging.basicConfig(level=logging.INFO)
-
     cfg = AgxArmConfig(
         id="agx_demo",
         arm_model="piper_x",
@@ -626,26 +588,39 @@ if __name__ == "__main__":
         channel=channel,
     )
     robot = AgxArm(cfg)
-    print(robot)
-    fps = 10.0
+    fps = 1
     with robot:
         step = 0
-        while True:
-            time.sleep(1.0 / fps)
-            obs = robot.get_observation()
-            pos = robot.get_flange_pose()
-            new_pos = [p + 0.001 for p in pos]
-            with np.printoptions(precision=4, suppress=True):
-                print(obs)
-            # robot.send_action(
-            #     {
-            #         "ee.x": new_pos[0],
-            #         "ee.y": new_pos[1],
-            #         "ee.z": new_pos[2],
-            #         "ee.roll": new_pos[3],
-            #         "ee.pitch": new_pos[4],
-            #         "ee.yaw": new_pos[5],
-            #         "gripper.pos": 0.5,
-            #     }
-            # )
-            step += 1
+        previous_frame_time = time.perf_counter()
+        with Live(refresh_per_second=4, transient=False) as live:
+            while True:
+                frame_start = time.perf_counter()
+                frame_interval = frame_start - previous_frame_time
+                previous_frame_time = frame_start
+
+                obs = robot.get_observation()
+                pos = robot.get_flange_pose()
+                new_pos = [p + 0.001 for p in pos]
+                action: dict[str, Any] = {
+                    "ee.x": new_pos[0],
+                    "ee.y": new_pos[1],
+                    "ee.z": new_pos[2],
+                    "ee.roll": new_pos[3],
+                    "ee.pitch": new_pos[4],
+                    "ee.yaw": new_pos[5],
+                    "gripper.pos": 0.5,
+                }
+                applied_action = robot.send_action(action)
+                live.update(
+                    make_live_panel(
+                        step=step,
+                        target_fps=fps,
+                        actual_fps=1.0 / frame_interval if step else None,
+                        observation=obs,
+                        action=action,
+                        applied_action=applied_action,
+                        arm_ok=robot.arm.is_ok(),
+                    )
+                )
+                step += 1
+                time.sleep(max(0.0, 1.0 / fps - (time.perf_counter() - frame_start)))
