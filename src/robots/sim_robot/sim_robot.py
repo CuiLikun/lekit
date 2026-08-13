@@ -290,7 +290,11 @@ class SimRobot(Robot):
                 self.renderers[key] = self.mj.Renderer(self.mj_model, height=cam.height, width=cam.width)
 
         logger.info(
-            "%s connected (nq=%d, nv=%d, nu=%d).", self.name, self.mj_model.nq, self.mj_model.nv, self.mj_model.nu
+            "%s connected (nq=%d, nv=%d, nu=%d).",
+            self.name,
+            self.mj_model.nq,
+            self.mj_model.nv,
+            self.mj_model.nu,
         )
 
     def configure(self) -> None:
