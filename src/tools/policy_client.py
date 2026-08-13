@@ -91,9 +91,12 @@ class PolicyClient:
         self._socket = self.context.socket(zmq.REQ)
         self._socket.connect(f"tcp://{self.config.host}:{self.config.port}")
 
-        # Get policy name and config from server
-        self.policy_name = self.request_policy_name()
-        self.policy_config = self.request_policy_config()
+        # Get policy metadata from the server.
+        self.policy_meta = self.request_policy_meta()
+        self.policy_name = self.policy_meta.get("name", "N/A")
+        self.policy_config = {
+            key: value for key, value in self.policy_meta.items() if key not in {"name", "ckpt"}
+        }
         self.policy_repo_id = self.policy_config.get("repo_id", "N/A")
         self.input_features = self.policy_config.get("input_features", {})
         self.output_features = self.policy_config.get("output_features", {})
@@ -181,11 +184,8 @@ class PolicyClient:
             print(f"[bright_yellow]Connected to server after {elapsed}s.[/bright_yellow]")
         return message.get(response_key, default)
 
-    def request_policy_name(self):
-        return self._request({"__request_policy_name__": True}, "policy_name")
-
-    def request_policy_config(self):
-        return self._request({"__request_policy_config__": True}, "policy_config")
+    def request_policy_meta(self):
+        return self._request({"__request_policy_meta__": True}, "policy_meta")
 
     def update_observation(self, observation: dict) -> None:
         """Update the current observation from external code and enqueue it for the action request thread."""
@@ -385,6 +385,7 @@ class PolicyClient:
                     end="\r",
                     flush=True,
                 )
+                return None
             time.sleep(0.001)
 
         # Increment timestep after getting action

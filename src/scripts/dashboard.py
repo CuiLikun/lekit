@@ -25,8 +25,7 @@ from rich.text import Text
 try:
     from src.tools.ros_robot import RosRobot, RosRobotConfig
 except ImportError:
-    from src.tools.mock_robot import MockRobot as RosRobot
-    from src.tools.mock_robot import MockRobotConfig as RosRobotConfig
+    from src.tools.mock_robot import MockRobot as RosRobot, MockRobotConfig as RosRobotConfig
 
 from src.tools.proxy import Proxy
 from src.utils.keyboard_utils import KeyboardListener
