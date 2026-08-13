@@ -42,6 +42,7 @@ See https://github.com/agilexrobotics/pyAgxArm for the upstream SDK.
 from __future__ import annotations
 
 import logging
+from platform import system
 import time
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -600,14 +601,29 @@ __all__ = [
 if __name__ == "__main__":
     from rich import print
 
+    platform_system = system()
+    if platform_system == "Windows":
+        interface = "agx_cando"
+        channel = "0"
+    elif platform_system == "Linux":
+        interface = "socketcan"
+        channel = "can0"
+    elif platform_system == "Darwin":
+        interface = "slcan"
+        channel = "/dev/ttyACM0"
+    else:
+        raise RuntimeError(
+            "pyAgxArm currently documents Linux `socketcan`, Windows `agx_cando`, and macOS `slcan`."
+        )
+
     logging.basicConfig(level=logging.INFO)
 
     cfg = AgxArmConfig(
         id="agx_demo",
         arm_model="piper_x",
         firmware_version="v188",
-        interface="socketcan",
-        channel="can0",
+        interface=interface,
+        channel=channel,
     )
     robot = AgxArm(cfg)
     print(robot)
