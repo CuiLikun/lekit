@@ -50,7 +50,7 @@ class AgxArmConfig(RobotConfig):
     # Engage the firmware's leader/follower linkage mode (follower side).
     # Demo.py calls ``robot.set_follower_mode()`` before driving commands;
     # we keep the same default.
-    auto_set_follower_mode: bool = True
+    auto_set_follower_mode: bool = False
     # cameras
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
 
@@ -122,11 +122,16 @@ class AgxArm(Robot):
 
             if self.config.auto_clear_joint_error and self.arm.clear_joint_error() is False:
                 print("AgxArm: controller did not acknowledge clear_joint_error().")
+
             if self.config.auto_enable:
                 self.arm.enable()
+                self.arm.set_speed_percent(100)
+
             if self.config.auto_set_follower_mode:
                 self.arm.set_follower_mode()
+
             self.eef = self.arm.init_effector(self.arm.OPTIONS.EFFECTOR.AGX_GRIPPER)
+
             for camera in self.cameras.values():
                 camera.connect()
             self.configure()
@@ -202,7 +207,7 @@ class AgxArm(Robot):
                 print("AgxArm: camera disconnect failed, ignoring.")
         self.arm = None
         self.eef = None
-        print("AgxArm[%s] disconnected.", self.id)
+        print(f"AgxArm[{self.arm.joint_nums}DOF] disconnected.")
 
     @check_if_not_connected
     def get_observation(self) -> dict[str, Any]:
@@ -333,17 +338,16 @@ if __name__ == "__main__":
                 frame_interval = frame_start - previous_frame_time
                 previous_frame_time = frame_start
 
-                states = robot.get_joint_angles()
                 pos = robot.get_flange_pose()
-                new_pos = [p + 0.001 for p in pos]
+                gripper_pos = robot.get_gripper_status()
                 action: dict[str, Any] = {
-                    "ee.x": new_pos[0],
-                    "ee.y": new_pos[1],
-                    "ee.z": new_pos[2],
-                    "ee.roll": new_pos[3],
-                    "ee.pitch": new_pos[4],
-                    "ee.yaw": new_pos[5],
-                    "gripper.pos": 0,
+                    "ee.x": pos[0],
+                    "ee.y": pos[1],
+                    "ee.z": pos[2] + 0.005,
+                    "ee.roll": pos[3],
+                    "ee.pitch": pos[4],
+                    "ee.yaw": pos[5],
+                    "gripper.pos": 0.005,
                 }
                 applied_action = robot.send_action(action)
                 status = robot.check_status()
@@ -352,7 +356,7 @@ if __name__ == "__main__":
                         step=step,
                         target_fps=fps,
                         actual_fps=1.0 / frame_interval if step else None,
-                        states=states,
+                        states=pos + [gripper_pos],
                         action=list(action.values()),
                         status=status,
                     )
