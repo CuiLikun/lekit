@@ -44,6 +44,9 @@ class AgxArmConfig(RobotConfig):
     # Whether ``connect()`` also powers-on and enables the servos so the
     # first ``send_action`` is immediately ready.
     auto_enable: bool = True
+    # SDK point-to-point command speed in percent. Keep the driver default
+    # conservative; applications can opt into a faster value explicitly.
+    speed_percent: int = 10
     # Best-effort clear of any joint-error state on connect (matches
     # demo.py: ``robot.clear_joint_error()``).
     auto_clear_joint_error: bool = True
@@ -109,7 +112,8 @@ class AgxArm(Robot):
         """Open the CAN bus, configure the arm, and connect cameras."""
         sdk_config = pyagxarm.create_agx_arm_config(
             robot=self.config.model,
-            firmware_version=self.config.firmware,
+            # The pyAgxArm public API retains this misspelling.
+            firmeware_version=self.config.firmware,
             interface=self.config.interface,
             channel=self.config.channel,
             bitrate=self.config.bitrate,
@@ -124,8 +128,14 @@ class AgxArm(Robot):
                 print("AgxArm: controller did not acknowledge clear_joint_error().")
 
             if self.config.auto_enable:
-                self.arm.enable()
-                self.arm.set_speed_percent(100)
+                deadline = time.monotonic() + 5.0
+                while not self.arm.enable():
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("AgxArm: timed out waiting for all joints to enable.")
+                    time.sleep(0.05)
+                if not 1 <= self.config.speed_percent <= 100:
+                    raise ValueError("AgxArmConfig.speed_percent must be between 1 and 100.")
+                self.arm.set_speed_percent(self.config.speed_percent)
 
             if self.config.auto_set_follower_mode:
                 self.arm.set_follower_mode()
@@ -182,6 +192,8 @@ class AgxArm(Robot):
             "joint_enable_status": joint_enable_status,
             "all_joints_enabled": bool(joint_enable_status) and all(joint_enable_status),
             "arm_status": arm_status_message,
+            "controller_status": None if arm_status_message is None else arm_status_message.arm_status,
+            "motion_status": None if arm_status_message is None else arm_status_message.motion_status,
             "arm_status_hz": None if arm_status is None else arm_status.hz,
             "arm_status_timestamp": None if arm_status is None else arm_status.timestamp,
             "gripper_ok": gripper_ok,
@@ -195,9 +207,11 @@ class AgxArm(Robot):
 
     def disconnect(self) -> None:
         """Best-effort teardown of torque, CAN resources, and cameras."""
-        if self.arm is not None:
+        arm = self.arm
+        joint_nums = None if arm is None else arm.joint_nums
+        if arm is not None:
             try:
-                self.arm.disconnect()
+                arm.disconnect()
             except Exception as e:
                 print("AgxArm: error during disconnect: %s", e)
         for camera in self.cameras.values():
@@ -207,7 +221,7 @@ class AgxArm(Robot):
                 print("AgxArm: camera disconnect failed, ignoring.")
         self.arm = None
         self.eef = None
-        print(f"AgxArm[{self.arm.joint_nums}DOF] disconnected.")
+        print(f"AgxArm[{joint_nums if joint_nums is not None else '?'}DOF] disconnected.")
 
     @check_if_not_connected
     def get_observation(self) -> dict[str, Any]:
@@ -264,11 +278,19 @@ class AgxArm(Robot):
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         """Dispatch the configured joint-space or Cartesian control command."""
         if "ee.x" in action:
-            target = list(action.values())
-            self.arm.move_p(target[:6])
-            self.eef.move_gripper_m(target[6])
-        else:
-            pass
+            pose_keys = ("ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw")
+            pose = [float(action[key]) for key in pose_keys]
+            if not np.all(np.isfinite(pose)):
+                raise ValueError("AgxArm.send_action: Cartesian pose must contain only finite values.")
+            self.arm.move_p(pose)
+
+        if "gripper.pos" in action:
+            gripper_position = float(action["gripper.pos"])
+            if not np.isfinite(gripper_position):
+                raise ValueError("AgxArm.send_action: gripper.pos must be finite.")
+            if self.eef is None:
+                raise RuntimeError("AgxArm.send_action: gripper effector is not initialized.")
+            self.eef.move_gripper_m(gripper_position)
         return action
 
 
@@ -295,6 +317,8 @@ if __name__ == "__main__":
         states: list[float],
         action: list[float],
         status: dict[str, Any],
+        z_offset: float,
+        command_count: int,
     ) -> Panel:
         summary = Table.grid(padding=(0, 2))
         summary.add_column(style="bold cyan")
@@ -311,6 +335,10 @@ if __name__ == "__main__":
         )
         summary.add_row("Joint States", str(status["joint_enable_status"]))
         summary.add_row("Gripper OK", "[green]yes[/green]" if status["gripper_ok"] else "[red]no[/red]")
+        summary.add_row("Controller", str(status["controller_status"]))
+        summary.add_row("Motion", str(status["motion_status"]))
+        summary.add_row("Z Test Offset", f"{z_offset * 1000:+.1f} mm")
+        summary.add_row("Commands Sent", str(command_count))
         if status["comm_error"]:
             summary.add_row("Comm Error", f"[red]{status['comm_error_detail']}[/red]")
 
@@ -328,9 +356,14 @@ if __name__ == "__main__":
 
     config = AgxArmConfig(id="agx_demo")
     robot = AgxArm(config)
-    fps = 1
+    fps = 30
+    test_amplitude_m = 0.1
+    test_period_s = 8.0
     with robot:
         step = 0
+        command_count = 0
+        test_started_at = time.monotonic()
+        center_pose: list[float] | None = None
         previous_frame_time = time.perf_counter()
         with Live(refresh_per_second=4, transient=False) as live:
             while True:
@@ -340,17 +373,33 @@ if __name__ == "__main__":
 
                 pos = robot.get_flange_pose()
                 gripper_pos = robot.get_gripper_status()
+                if center_pose is None:
+                    center_pose = [*pos]
+
+                phase = 2.0 * np.pi * (time.monotonic() - test_started_at) / test_period_s
+                z_offset = test_amplitude_m * float(np.sin(phase))
+                target_pose = [*center_pose]
+                target_pose[2] += z_offset
                 action: dict[str, Any] = {
-                    "ee.x": pos[0],
-                    "ee.y": pos[1],
-                    "ee.z": pos[2] + 0.005,
-                    "ee.roll": pos[3],
-                    "ee.pitch": pos[4],
-                    "ee.yaw": pos[5],
-                    "gripper.pos": 0.005,
+                    "ee.x": target_pose[0],
+                    "ee.y": target_pose[1],
+                    "ee.z": target_pose[2],
+                    "ee.roll": target_pose[3],
+                    "ee.pitch": target_pose[4],
+                    "ee.yaw": target_pose[5],
                 }
-                applied_action = robot.send_action(action)
                 status = robot.check_status()
+                controller_ready = (
+                    status["connected"]
+                    and status["is_ok"]
+                    and not status["comm_error"]
+                    and status["all_joints_enabled"]
+                    and "NORMAL" in str(status["controller_status"])
+                    and "REACH_TARGET_POS_FAILED" not in str(status["motion_status"])
+                )
+                if controller_ready:
+                    robot.send_action(action)
+                    command_count += 1
                 live.update(
                     make_live_panel(
                         step=step,
@@ -359,6 +408,8 @@ if __name__ == "__main__":
                         states=pos + [gripper_pos],
                         action=list(action.values()),
                         status=status,
+                        z_offset=z_offset,
+                        command_count=command_count,
                     )
                 )
                 step += 1
