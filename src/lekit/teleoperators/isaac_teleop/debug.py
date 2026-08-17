@@ -1,7 +1,7 @@
 """Live debug dashboard for :class:`IsaacTeleop`.
 
-Run with ``python -m src.teleoperators.isaac_teleop.debug`` (or directly
-``python src/teleoperators/isaac_teleop/debug.py``) to see an in-place
+Run with ``python -m lekit.teleoperators.isaac_teleop.debug`` (or directly
+``python src/lekit/teleoperators/isaac_teleop/debug.py``) to see an in-place
 ``rich`` panel showing the controller pose, the instantaneous movement
 direction, orientation, and the analog/button inputs. No scrollback spam;
 panel updates in place.

@@ -27,10 +27,10 @@ from lerobot.datasets import LeRobotDataset
 from lerobot.utils.constants import ACTION
 from lerobot.utils.feature_utils import hw_to_dataset_features
 
-# Make ``from hardwares import …`` resolve when this file is launched as a
+# Make ``from lekit.robots.sim_robot import …`` resolve when this file is launched as a
 # script with PYTHONPATH=src.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-from hardwares import SimCameraConfig, SimMotorSpec, SimRobot, SimRobotConfig  # noqa: E402
+from lekit.robots.sim_robot import SimCameraConfig, SimMotorSpec, SimRobot, SimRobotConfig  # noqa: E402
 
 logger = logging.getLogger("examples.sim_robot.record")
 

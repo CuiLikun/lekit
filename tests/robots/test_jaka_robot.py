@@ -9,7 +9,7 @@ import time
 import numpy as np
 import pytest
 
-from robots.jaka_robot import jaka_robot as driver
+from lekit.robots.jaka_robot import jaka_robot as driver
 
 
 class FakeRC:

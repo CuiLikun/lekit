@@ -8,8 +8,8 @@ without requiring any hardware, MuJoCo, or ROS. It is intended for:
   ``Robot`` contract.
 * Smoke-testing pipelines end-to-end before a physical arm is online.
 * Demos and tutorials that want to show the data flow without the
-  robotics-specific dependencies of :class:`hardwares.sim_robot.SimRobot`
-  (mujoco) or :class:`hardwares.jaka_robot.JakaRobot` (vendor .so).
+  robotics-specific dependencies of :class:`lekit.robots.sim_robot.SimRobot`
+  (mujoco) or :class:`lekit.robots.jaka_robot.JakaRobot` (vendor .so).
 
 The mock keeps a small in-memory state for joint positions. ``send_action``
 applies the standard ``max_relative_target`` safety clamp (per-joint scalar
@@ -22,7 +22,7 @@ real camera pipeline.
 
 Example:
 
-    >>> from hardwares.mock_robot import MockRobot, MockRobotConfig, MockMotor, MockCamera
+    >>> from lekit.robots.mock_robot import MockRobot, MockRobotConfig, MockMotor, MockCamera
     >>> cfg = MockRobotConfig(
     ...     motors={
     ...         "shoulder_pan": MockMotor(id=0, name="shoulder_pan"),
@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 class MockMotor:
     """Lightweight motor descriptor.
 
-    Mirrors the role :class:`hardwares.sim_robot.SimMotor` plays for
+    Mirrors the role :class:`lekit.robots.sim_robot.SimMotor` plays for
     :class:`SimRobot`: enough information to address a joint by name
     (``"{name}.pos"``) in observation / action dicts and to look it up by
     stable integer id.

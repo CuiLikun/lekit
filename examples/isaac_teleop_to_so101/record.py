@@ -70,7 +70,7 @@ from dataclasses import asdict, dataclass
 from pprint import pformat
 
 from rich import print
-from src.hardwares.agx_arm import AgxArmConfig  # noqa: F401  (registers agx_arm)
+from lekit.robots.agx_arm import AgxArmConfig  # noqa: F401  (registers agx_arm)
 
 from lerobot.cameras import CameraConfig  # noqa: F401
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401

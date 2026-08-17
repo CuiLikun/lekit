@@ -4,7 +4,7 @@ import math
 import numpy as np
 import pytest
 
-from robots.jaka_robot import jaka_robot as jaka_driver
+from lekit.robots.jaka_robot import jaka_robot as jaka_driver
 
 
 def _xr_module():

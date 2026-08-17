@@ -6,8 +6,8 @@ import sys
 import pytest
 from fastapi.testclient import TestClient
 
-from robots.jaka_robot.jaka_robot import JakaRobotConfig
-from robots.jaka_robot.web_debug import (
+from lekit.robots.jaka_robot.jaka_robot import JakaRobotConfig
+from lekit.robots.jaka_robot.web_debug import (
     JakaWebDebugger,
     _handle_message,
     _StateBroadcaster,

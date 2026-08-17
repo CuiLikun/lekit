@@ -17,7 +17,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Make ``from hardwares import …`` resolve when this script is launched with
+# Make ``from lekit.robots.sim_robot import …`` resolve when this script is launched with
 # PYTHONPATH=src. Also keep HF datasets cache off the user's read-only $HOME
 # (the sandbox here has ``~/.cache/huggingface`` mounted read-only).
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
@@ -31,7 +31,7 @@ import numpy as np  # noqa: E402
 from lerobot.datasets import LeRobotDataset  # noqa: E402
 from lerobot.utils.constants import ACTION  # noqa: E402
 
-from hardwares import (  # noqa: E402
+from lekit.robots.sim_robot import (  # noqa: E402
     SimCameraConfig,
     SimMotorSpec,
     SimRobot,

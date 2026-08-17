@@ -41,7 +41,7 @@ from lerobot.cameras import make_cameras_from_configs
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401  (registers "opencv")
 from lerobot.cameras.realsense import RealSenseCameraConfig
 from lerobot.configs import parser
-from robots.jaka_robot import JakaRobotConfig
+from lekit.robots.jaka_robot import JakaRobotConfig
 
 DEFAULT_CAMERA_SERIAL = "342522070741"
 STALE_FALLBACK_MAX_AGE_MS = 2_147_483_647

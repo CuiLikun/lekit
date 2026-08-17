@@ -49,7 +49,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Make ``from hardwares import …`` resolve when launched with PYTHONPATH=src.
+# Make ``from lekit.robots.sim_robot import …`` resolve when launched with PYTHONPATH=src.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 _TMP_HOME = Path(tempfile.gettempdir()) / "sim_robot_hf"
 _TMP_HOME.mkdir(parents=True, exist_ok=True)
@@ -57,7 +57,7 @@ os.environ.setdefault("HF_HOME", str(_TMP_HOME))
 os.environ.setdefault("HF_DATASETS_CACHE", str(_TMP_HOME / "datasets"))
 
 
-from hardwares import (  # noqa: E402
+from lekit.robots.sim_robot import (  # noqa: E402
     SimCameraConfig,
     SimMotorSpec,
     SimRobot,

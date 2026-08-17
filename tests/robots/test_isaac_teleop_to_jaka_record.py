@@ -12,8 +12,8 @@ import pytest
 from rich.console import Console
 
 from lerobot.datasets import LeRobotDatasetMetadata
-from robots.jaka_robot.dataset_features import build_dataset_features
-from robots.jaka_robot.jaka_robot import JakaRobot, JakaRobotConfig
+from lekit.robots.jaka_robot.dataset_features import build_dataset_features
+from lekit.robots.jaka_robot.jaka_robot import JakaRobot, JakaRobotConfig
 
 
 def test_trigger_gripper_toggle_changes_state_only_on_press_edges(monkeypatch):
@@ -415,7 +415,7 @@ def test_record_loop_discards_attempt_and_records_same_episode_again(monkeypatch
 
 def test_rerun_logger_detects_pos_fields_and_logs_direct_curves(monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
-    rerun_module = importlib.import_module("src.utils.rerun_utils")
+    rerun_module = importlib.import_module("lekit.utils.rerun_utils")
     logged: list[tuple[str, float]] = []
 
     class FakeQueue:
@@ -465,7 +465,7 @@ def test_rerun_logger_detects_pos_fields_and_logs_direct_curves(monkeypatch):
 
 def test_rerun_logger_keeps_latest_frame_when_queue_is_full(monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
-    rerun_module = importlib.import_module("src.utils.rerun_utils")
+    rerun_module = importlib.import_module("lekit.utils.rerun_utils")
     logger = rerun_module.RerunLogger.__new__(rerun_module.RerunLogger)
     logger._joint_count = 0
     logger._curve_keys = []
@@ -494,7 +494,7 @@ def test_rerun_logger_keeps_latest_frame_when_queue_is_full(monkeypatch):
 
 
 def test_rerun_logger_reports_worker_throughput_and_log_duration(monkeypatch):
-    rerun_module = importlib.import_module("src.utils.rerun_utils")
+    rerun_module = importlib.import_module("lekit.utils.rerun_utils")
     logger = rerun_module.RerunLogger.__new__(rerun_module.RerunLogger)
     logger._rec = object()
     logger._queue = rerun_module._LatestLogQueue(maxsize=2)
@@ -523,7 +523,7 @@ def test_rerun_logger_reports_worker_throughput_and_log_duration(monkeypatch):
 
 
 def test_rerun_logger_draws_episode_number_large_at_image_top_center():
-    rerun_module = importlib.import_module("src.utils.rerun_utils")
+    rerun_module = importlib.import_module("lekit.utils.rerun_utils")
     logger = rerun_module.RerunLogger.__new__(rerun_module.RerunLogger)
     image = np.zeros((100, 300, 3), dtype=np.uint8)
 
@@ -538,7 +538,7 @@ def test_rerun_logger_draws_episode_number_large_at_image_top_center():
 
 
 def test_rerun_logger_draws_recording_state_below_episode_number():
-    rerun_module = importlib.import_module("src.utils.rerun_utils")
+    rerun_module = importlib.import_module("lekit.utils.rerun_utils")
     logger = rerun_module.RerunLogger.__new__(rerun_module.RerunLogger)
     image = np.zeros((200, 400, 3), dtype=np.uint8)
 

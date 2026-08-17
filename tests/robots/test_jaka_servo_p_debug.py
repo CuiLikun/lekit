@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from robots.jaka_robot.servo_p_debug import (
+from lekit.robots.jaka_robot.servo_p_debug import (
     DiagnosticSettings,
     _set_cartesian_nlf,
     build_targets,

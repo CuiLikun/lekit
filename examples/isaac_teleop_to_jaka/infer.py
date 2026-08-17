@@ -44,10 +44,10 @@ from lerobot.utils.constants import OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging
-from robots.jaka_robot import JakaCameraTimeoutError, JakaRobot, JakaRobotConfig
-from robots.jaka_robot.dataset_features import build_dataset_features
-from src.tools.proxy import Proxy, ProxyConfig as BaseProxyConfig
-from src.utils.rerun_utils import RerunLogger
+from lekit.robots.jaka_robot import JakaCameraTimeoutError, JakaRobot, JakaRobotConfig
+from lekit.robots.jaka_robot.dataset_features import build_dataset_features
+from lekit.tools.proxy import Proxy, ProxyConfig as BaseProxyConfig
+from lekit.utils.rerun_utils import RerunLogger
 
 
 @dataclass

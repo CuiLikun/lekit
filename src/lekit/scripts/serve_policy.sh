@@ -32,7 +32,7 @@ rename_map='{"observation.images.right": "observation.images.right_camera"}'
 rename_map='{}'
 
 
-python src/tools/policy_server.py \
+python src/lekit/tools/policy_server.py \
     --host=0.0.0.0 \
     --port="$port" \
     --policy_type="$policy_type" \

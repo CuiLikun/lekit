@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 # ── Lazy mujoco import ──────────────────────────────────────────────────────
 # mujoco is only required when SimRobot is *used* (not when the module is
-# merely imported). This keeps ``from hardwares.sim_robot import …`` working
+# merely imported). This keeps ``from lekit.robots.sim_robot import …`` working
 # in environments where mujoco is not installed.
 
 _MUJOCO = None

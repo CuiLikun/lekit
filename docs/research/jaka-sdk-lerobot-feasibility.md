@@ -44,5 +44,5 @@ planner-backed `joint_move` for every frame.
 ## Sources
 
 - JAKA, [Python SDK 1.7.2](https://www.jaka.com/docs/guide/1.7.2/SDK/Python.html), accessed 2026-08-05. This documents environment requirements, units, lifecycle methods, feedback APIs, motion commands, Servo Move timing, queue limit, and error codes.
-- Local JAKA SDK package: `src/robots/jaka_robot/jkrc.so`, `libjakaAPI.so`, and `jkrc.pyi`, inspected 2026-08-05. Runtime symbol inspection confirmed `login`, `logout`, Servo Move, joint/TCP feedback, status, and IO calls.
+- Local JAKA SDK package: `src/lekit/robots/jaka_robot/jkrc.so`, `libjakaAPI.so`, and `jkrc.pyi`, inspected 2026-08-05. Runtime symbol inspection confirmed `login`, `logout`, Servo Move, joint/TCP feedback, status, and IO calls.
 - Local LeRobot 0.6.0 installation: `lerobot.robots.robot.Robot`, inspected 2026-08-05. This defines the required standard robot contract.

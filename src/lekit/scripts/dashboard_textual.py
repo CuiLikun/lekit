@@ -33,13 +33,13 @@ from textual.screen import ModalScreen
 from textual.widgets import Static
 
 try:
-    from src.tools.ros_robot import RosRobot, RosRobotConfig
+    from lekit.tools.ros_robot import RosRobot, RosRobotConfig
 except ImportError:
-    from src.tools.mock_robot import MockRobot as RosRobot
-    from src.tools.mock_robot import MockRobotConfig as RosRobotConfig
+    from lekit.tools.mock_robot import MockRobot as RosRobot
+    from lekit.tools.mock_robot import MockRobotConfig as RosRobotConfig
 
-from src.tools.proxy import Proxy
-from src.utils.rerun_utils import RerunLogger
+from lekit.tools.proxy import Proxy
+from lekit.utils.rerun_utils import RerunLogger
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(os.path.dirname(DIR))

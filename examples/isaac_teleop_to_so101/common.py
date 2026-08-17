@@ -60,7 +60,7 @@ from lerobot.robots.so_follower.robot_kinematic_processor import (
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.constants import HF_LEROBOT_CALIBRATION, HF_LEROBOT_HOME, TELEOPERATORS
 from lerobot.utils.robot_utils import precise_sleep
-from src.robots.agx_arm import AgxArmConfig  # noqa: F401  (registers agx_arm)
+from lekit.robots.agx_arm import AgxArmConfig  # noqa: F401  (registers agx_arm)
 
 from .isaac_teleop import (
     Clutch,
@@ -356,7 +356,7 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
     # Cartesian-native backends receive the clutch-rebased TCP target directly.
     # AgxArm needs its configured action schema switched; JAKA dispatches each
     # action from its fields and exposes a fixed joint + EEF schema.
-    from src.robots.agx_arm import AgxArm
+    from lekit.robots.agx_arm import AgxArm
 
     is_jaka = robot.name == "jaka_robot"
     use_ee_pose = isinstance(robot, AgxArm) or is_jaka

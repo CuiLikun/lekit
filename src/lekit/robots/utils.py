@@ -4,20 +4,20 @@ from lerobot.robots import Robot, RobotConfig
 def make_robot_from_config(config: RobotConfig) -> Robot:
     match config.type:
         case "mock_robot":
-            from src.hardwares.mock_robot import MockRobot
+            from lekit.robots.mock_robot import MockRobot
 
             return MockRobot(config)
         case "sim_robot":
-            from src.hardwares.sim_robot import SimRobot
+            from lekit.robots.sim_robot import SimRobot
 
             return SimRobot(config)
 
         case "jaka_robot":
-            from src.hardwares.jaka_robot import JakaRobot
+            from lekit.robots.jaka_robot import JakaRobot
 
             return JakaRobot(config)
         case "agx_arm":
-            from src.hardwares.agx_arm import AgxArm
+            from lekit.robots.agx_arm import AgxArm
 
             return AgxArm(config)
 

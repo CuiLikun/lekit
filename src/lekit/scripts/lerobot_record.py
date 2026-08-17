@@ -164,8 +164,8 @@ from lerobot.utils.visualization_utils import (
     log_visualization_data,
     shutdown_visualization,
 )
-from src.hardwares import mock_robot  # noqa: F401
-from src.hardwares.utils import make_robot_from_config
+from lekit.robots import mock_robot  # noqa: F401
+from lekit.robots.utils import make_robot_from_config
 
 
 @dataclass

@@ -46,7 +46,7 @@ from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.types import RobotAction
 from lerobot.utils.import_utils import is_package_available
 from lerobot.utils.rotation import Rotation
-from robots.jaka_robot.pose_math import matrix_to_rpy
+from lekit.robots.jaka_robot.pose_math import matrix_to_rpy
 
 from .clutch import Clutch
 

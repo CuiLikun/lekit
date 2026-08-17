@@ -83,9 +83,9 @@ from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging
-from robots.jaka_robot import JakaCameraTimeoutError, JakaRobot, JakaRobotConfig
-from robots.jaka_robot.dataset_features import build_dataset_features
-from src.utils.rerun_utils import RerunLogger
+from lekit.robots.jaka_robot import JakaCameraTimeoutError, JakaRobot, JakaRobotConfig
+from lekit.robots.jaka_robot.dataset_features import build_dataset_features
+from lekit.utils.rerun_utils import RerunLogger
 
 from .control_trace import ControlTraceWriter
 from .xr import CLOUDXR_ENV_FILE, IsaacTeleopConfig, make_xr_device

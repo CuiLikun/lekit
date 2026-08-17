@@ -1,7 +1,7 @@
 # SimRobot examples
 
 A self-contained MuJoCo-backed robot arm that plugs into the LeRobot pipeline
-through [`SimRobot`](/home/sorel/workspace/lekit/src/hardwares/sim_robot.py).
+through [`SimRobot`](/home/sorel/workspace/lekit/src/lekit/robots/sim_robot/sim_robot.py).
 No physical hardware or external assets are required — the model, scripted
 trajectory and dataset layout all live in this folder.
 
@@ -65,7 +65,7 @@ the supported headless path (`rerun --serve-web`).
 ### Wiring it into your own loop
 
 ```python
-from hardwares import SimRobot, SimRobotConfig, SimRobotVisualizer
+from lekit.robots.sim_robot import SimRobot, SimRobotConfig, SimRobotVisualizer
 
 cfg = SimRobotConfig(
     xml_path="my_scene.xml",

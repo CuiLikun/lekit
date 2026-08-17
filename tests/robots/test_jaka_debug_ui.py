@@ -4,8 +4,8 @@ import sys
 import pytest
 from textual.widgets import Button, Select
 
-from robots.jaka_robot.debug_ui import JakaDebugApp, parse_args
-from robots.jaka_robot.jaka_robot import JakaRobotConfig
+from lekit.robots.jaka_robot.debug_ui import JakaDebugApp, parse_args
+from lekit.robots.jaka_robot.jaka_robot import JakaRobotConfig
 
 
 class ConnectedRC:

@@ -23,13 +23,13 @@ from rich.table import Table
 from rich.text import Text
 
 try:
-    from src.tools.ros_robot import RosRobot, RosRobotConfig
+    from lekit.tools.ros_robot import RosRobot, RosRobotConfig
 except ImportError:
-    from src.tools.mock_robot import MockRobot as RosRobot, MockRobotConfig as RosRobotConfig
+    from lekit.tools.mock_robot import MockRobot as RosRobot, MockRobotConfig as RosRobotConfig
 
-from src.tools.proxy import Proxy
-from src.utils.keyboard_utils import KeyboardListener
-from src.utils.rerun_utils import RerunLogger
+from lekit.tools.proxy import Proxy
+from lekit.utils.keyboard_utils import KeyboardListener
+from lekit.utils.rerun_utils import RerunLogger
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(os.path.dirname(DIR))
