@@ -94,6 +94,9 @@ import time
 from dataclasses import asdict, dataclass
 from pprint import pformat
 
+from lekit.cameras.stream import StreamCameraConfig  # noqa: F401
+from lekit.robots import mock_robot  # noqa: F401
+from lekit.robots.utils import make_robot_from_config
 from lerobot.cameras import CameraConfig  # noqa: F401
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.reachy2_camera import Reachy2CameraConfig  # noqa: F401
@@ -164,8 +167,6 @@ from lerobot.utils.visualization_utils import (
     log_visualization_data,
     shutdown_visualization,
 )
-from lekit.robots import mock_robot  # noqa: F401
-from lekit.robots.utils import make_robot_from_config
 
 
 @dataclass

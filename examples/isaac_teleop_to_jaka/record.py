@@ -26,7 +26,10 @@ uv run python -m examples.isaac_teleop_to_jaka.record \
     --robot.type=jaka_robot \
     --robot.ip=192.168.1.31 \
     --robot.id=jaka_arm \
-    --robot.cameras="{ hand: {type: intelrealsense, serial_number_or_name: '342522070741', width: 640, height: 480, fps: 30}}" \
+    --robot.cameras="{
+        base_camera: {type: stream, endpoint: 'tcp://0.0.0.0:5555', camera_name: base_camera, width: 640, height: 480, fps: 30},
+        hand_camera: {type: stream, endpoint: 'tcp://0.0.0.0:5555', camera_name: hand_camera, width: 640, height: 480, fps: 30}
+    }" \
     --teleop.type=xr_controller \
     --teleop.lock_pose=true \
     --teleop.use_head_yaw=true \
@@ -67,6 +70,10 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from lekit.cameras.stream import StreamCameraConfig  # noqa: F401  (registers "stream")
+from lekit.robots.jaka_robot import JakaCameraTimeoutError, JakaRobot, JakaRobotConfig
+from lekit.robots.jaka_robot.dataset_features import build_dataset_features
+from lekit.utils.rerun_utils import RerunLogger
 from lerobot.cameras import CameraConfig  # noqa: F401
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401  (registers "opencv")
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401  (registers "intelrealsense")
@@ -83,9 +90,6 @@ from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging
-from lekit.robots.jaka_robot import JakaCameraTimeoutError, JakaRobot, JakaRobotConfig
-from lekit.robots.jaka_robot.dataset_features import build_dataset_features
-from lekit.utils.rerun_utils import RerunLogger
 
 from .control_trace import ControlTraceWriter
 from .xr import CLOUDXR_ENV_FILE, IsaacTeleopConfig, make_xr_device

@@ -8,6 +8,7 @@ from typing import Any
 import torch
 from policy_client import PolicyClient, PolicyClientConfig
 
+from lekit.cameras.stream import StreamCameraConfig  # noqa: F401
 from lerobot.cameras import (  # noqa: F401
     CameraConfig,  # noqa: F401
 )

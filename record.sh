@@ -1,16 +1,18 @@
 #!/bin/bash
 # record.sh
-# --robot.cameras="{ hand: {type: intelrealsense, serial_number_or_name: '342522070741', width: 640, height: 480, fps: 30}}" \
+# --robot.cameras="{ base_camera: {type: stream, endpoint: 'tcp://0.0.0.0:5555', camera_name: base_camera, width: 640, height: 480, fps: 30}, hand_camera: {type: stream, endpoint: 'tcp://0.0.0.0:5555', camera_name: hand_camera, width: 640, height: 480, fps: 30}}" \
+
 reset_joints="[-0.956, 1.903, 1.427, 1.368, -1.590, -0.290]"
 
-hand_camera="hand: {type: intelrealsense, serial_number_or_name: '342522070741', width: 640, height: 480, fps: 30}"
-side_camera="side: {type: intelrealsense, serial_number_or_name: '347522072196', width: 640, height: 480, fps: 30}"
+endpoint="tcp://0.0.0.0:5555"
+base_camera="base_camera: {type: stream, endpoint: '$endpoint', camera_name: base_camera, width: 640, height: 480, fps: 30}"
+hand_camera="hand_camera: {type: stream, endpoint: '$endpoint', camera_name: hand_camera, width: 640, height: 480, fps: 30}"
 
 uv run python -m examples.isaac_teleop_to_jaka.record \
     --robot.type=jaka_robot \
     --robot.id=jaka_arm \
     --robot.ip=192.168.1.31 \
-    --robot.cameras="{$hand_camera, $side_camera}" \
+    --robot.cameras="{$base_camera, $hand_camera}" \
     --robot.reset_joints="$reset_joints" \
     --teleop.type=xr_controller \
     --teleop.lock_pose=True \
