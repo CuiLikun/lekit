@@ -1,9 +1,14 @@
-"""Standard Isaac Teleop teleoperator package.
+"""Standalone Isaac Teleop input module for Quest/OpenXR controllers."""
 
-Public API is the ``IsaacTeleop`` / ``IsaacTeleopConfig`` pair; the live
-debug dashboard lives in :mod:`.debug`.
-"""
+from .config import IsaacTeleopConfig
+from .relative_pose import RelativePose, RelativePoseClutch
+from .xr_controller import CONTROLLER_SIDES, IsaacTeleop, IsaacXRController
 
-from .isaac_teleop import IsaacTeleop, IsaacTeleopConfig
-
-__all__ = ["IsaacTeleop", "IsaacTeleopConfig"]
+__all__ = [
+    "IsaacTeleop",
+    "IsaacTeleopConfig",
+    "IsaacXRController",
+    "CONTROLLER_SIDES",
+    "RelativePose",
+    "RelativePoseClutch",
+]

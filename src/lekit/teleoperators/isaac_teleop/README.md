@@ -1,19 +1,87 @@
-暂时不需要home,移除home所有相关逻辑;
+# Isaac XR Teleoperator
 
-重构 get_action，我想要 get_action 逻辑如下:
+`lekit.teleoperators.isaac_teleop` is a standalone input module for a pair of
+OpenXR controllers, including Quest 3 over CloudXR. It does not know about a
+robot, robot base frame, TCP pose, inverse kinematics, Cartesian servo, or a
+gripper implementation.
 
-pos 逻辑为按下squeeze后的相对位移: x 为左右(左-右+);y为前后(前+后-);z为高低(高+低-)
+## Interface
 
-ori 逻辑为按下squeeze后的相对姿态偏移
+`IsaacXRController.get_action()` returns device data in a stable operator
+coordinate system:
 
-例如: squeeze 没按过: pos = (0,0,0) 输出0相对位移
+```python
+{
+    "left.translation": np.ndarray,  # metres: (+right, +forward, +up)
+    "left.rotation": np.ndarray,  # relative grip xyzw quaternion
+    "left.aim_translation": np.ndarray,
+    "left.aim_rotation": np.ndarray,  # relative aim xyzw quaternion
+    "left.squeeze": float,
+    "left.trigger": float,
+    "left.thumbstick": np.ndarray,  # x, y
+    "left.thumbstick_click": float,
+    "left.primary_button": float,
+    "left.secondary_button": float,
+    "left.menu_button": float,
+    "left.is_tracking": bool,
+    "left.is_aim_tracking": bool,
+    "left.is_engaged": bool,
+    # The same fields are always present with the "right." prefix.
+    "right.translation": np.ndarray,
+    # ...
+}
+```
 
-    按下 squeeze:          pos = (0,0,0)  记录相对位移的初始位置
+There is no hand-selection setting. One `get_action()` call advances the XR
+session once and returns both controller snapshots from that frame. The flat,
+side-prefixed keys match `action_features` and can be recorded directly by
+LeRobot.
 
-    手柄往前推 10cm:       pos = (0,0.1,0)  相对初始位置的移动 (跟手)
+Each controller has an independent squeeze clutch owned by the teleoperator:
 
-    手柄往左移动 20cm:       pos = (-0.2,0,0)
+1. Before squeeze, `translation` is zero and `rotation` is identity.
+2. On the squeeze engage edge, the current controller pose becomes the origin;
+   the action remains neutral for that frame.
+3. While held, `translation` and `rotation` are cumulative transforms from the
+   engage pose, not per-frame increments.
+4. On release or tracking loss, the action immediately becomes neutral. No
+   robot pose is cached or restored.
 
-    手柄往上抬 5cm:        pos = (0,0,0.05)
+With `use_head_yaw=true` (default), both controller frames are aligned to the
+headset's horizontal heading only at squeeze engagement. The operator can turn
+or re-position while released, while a head turn during a held gesture cannot
+move a stationary controller.
 
-    松开 squeeze:          pos = (0,0,0)   (冻结)
+The grip and aim poses have independent relative origins but share the same
+controller squeeze engagement. Losing tracking resets only the affected hand.
+Button and analog input decoding is independent of pose validity, so a
+temporarily invalid grip pose does not erase otherwise valid button samples.
+
+## Installation
+
+```bash
+uv sync --extra teleop
+python -m isaacteleop.cloudxr --accept-eula
+```
+
+To inspect the input stream without a robot:
+
+```bash
+uv run python -m lekit.teleoperators.isaac_teleop.debug
+```
+
+`connect()` waits while OpenXR reports that no headset is available (`-35`).
+Set `connect_timeout_s` in `IsaacTeleopConfig` to bound this wait; the default
+is to wait until the operator connects or interrupts the process.
+
+The module intentionally has no generic recording command: its action keys
+are device data and do not match any robot's action schema by themselves.
+
+## Target robot adapters
+
+An adapter owns all target-specific behavior. It consumes the relative action,
+maps the operator frame into its target frame, establishes its target state
+from its own feedback, and emits that robot's action schema. For JAKA this
+means the adapter owns the operator-to-base transform, `ee.*` action
+construction, and the JAKA Servo P lifecycle. None of these belong to this
+module.

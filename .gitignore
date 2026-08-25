@@ -21,3 +21,4 @@ tmp/
 skills-lock.json
 .marscode/
 artifacts/
+.cloudxr/
