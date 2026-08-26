@@ -17,6 +17,7 @@ from urllib.parse import quote, urlparse
 import numpy as np
 
 from .config import IsaacTeleopConfig
+from .protocol import neutral_action
 from .xr_controller import CONTROLLER_SIDES, IsaacXRController
 
 _CLIENT_URL = "https://nvidia.github.io/IsaacTeleop/client"
@@ -24,30 +25,7 @@ _DEFAULT_RATE_HZ = 60.0
 _TRACE_LENGTH = 256
 
 
-def _neutral_action() -> dict[str, Any]:
-    """Return a visible startup frame before XR tracking is available."""
-
-    action: dict[str, Any] = {}
-    for side in CONTROLLER_SIDES:
-        action.update(
-            {
-                f"{side}.translation": np.zeros(3, dtype=np.float32),
-                f"{side}.rotation": np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
-                f"{side}.aim_translation": np.zeros(3, dtype=np.float32),
-                f"{side}.aim_rotation": np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
-                f"{side}.thumbstick": np.zeros(2, dtype=np.float32),
-                f"{side}.is_engaged": False,
-                f"{side}.is_tracking": False,
-                f"{side}.is_aim_tracking": False,
-                f"{side}.squeeze": 0.0,
-                f"{side}.trigger": 0.0,
-                f"{side}.thumbstick_click": 0.0,
-                f"{side}.primary_button": 0.0,
-                f"{side}.secondary_button": 0.0,
-                f"{side}.menu_button": 0.0,
-            }
-        )
-    return action
+_neutral_action = neutral_action
 
 
 def _status_lines(action: dict[str, Any], published_samples: int) -> list[str]:

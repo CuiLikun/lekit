@@ -9,10 +9,10 @@ import numpy as np
 from lerobot.types import RobotAction
 
 from .config import IsaacTeleopConfig
+from .protocol import CONTROLLER_SIDES, action_features
 from .relative_pose import RelativePoseClutch, default_operator_frame, operator_frame_from_head_quaternion
 from .session import IsaacTeleopSession, _isaacteleop_available
 
-CONTROLLER_SIDES = ("left", "right")
 _POSE_NAMES = ("grip", "aim")
 
 if TYPE_CHECKING or _isaacteleop_available:
@@ -55,39 +55,7 @@ class IsaacXRController(IsaacTeleopSession):
 
     @property
     def action_features(self) -> dict:
-        hand_features = {
-            "translation": {
-                "dtype": "float32",
-                "shape": (3,),
-                "names": {"x_right": 0, "y_forward": 1, "z_up": 2},
-            },
-            "rotation": {"dtype": "float32", "shape": (4,), "names": {"qx": 0, "qy": 1, "qz": 2, "qw": 3}},
-            "aim_translation": {
-                "dtype": "float32",
-                "shape": (3,),
-                "names": {"x_right": 0, "y_forward": 1, "z_up": 2},
-            },
-            "aim_rotation": {
-                "dtype": "float32",
-                "shape": (4,),
-                "names": {"qx": 0, "qy": 1, "qz": 2, "qw": 3},
-            },
-            "squeeze": {"dtype": "float32", "shape": ()},
-            "trigger": {"dtype": "float32", "shape": ()},
-            "thumbstick": {"dtype": "float32", "shape": (2,), "names": {"x": 0, "y": 1}},
-            "thumbstick_click": {"dtype": "float32", "shape": ()},
-            "primary_button": {"dtype": "float32", "shape": ()},
-            "secondary_button": {"dtype": "float32", "shape": ()},
-            "menu_button": {"dtype": "float32", "shape": ()},
-            "is_tracking": {"dtype": "bool", "shape": ()},
-            "is_aim_tracking": {"dtype": "bool", "shape": ()},
-            "is_engaged": {"dtype": "bool", "shape": ()},
-        }
-        return {
-            f"{side}.{field}": feature
-            for side in CONTROLLER_SIDES
-            for field, feature in hand_features.items()
-        }
+        return action_features()
 
     @property
     def feedback_features(self) -> dict:

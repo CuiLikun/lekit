@@ -8,9 +8,11 @@ from rich.console import Console
 
 from lekit.robots.piper import demo
 
+CURRENT_TIME_S = 1_700_000_000.0
+
 
 def message(value, *, hz: float = 100.0):
-    return SimpleNamespace(msg=value, hz=hz, timestamp=1.0)
+    return SimpleNamespace(msg=value, hz=hz, timestamp=CURRENT_TIME_S)
 
 
 def healthy_foc_status(*, enabled: bool = False):
@@ -133,13 +135,15 @@ class FakeArm:
 class FakeGripper:
     def __init__(self, width: float = 0.04) -> None:
         self.width = width
+        self.ok = True
+        self.mode = "width"
         self.homed = True
         self.fps_readings = [100.0]
         self.missing_foc_status = False
         self.missing_foc_field = False
 
     def is_ok(self) -> bool:
-        return True
+        return self.ok
 
     def get_fps(self) -> float:
         return FakeArm._next(self.fps_readings)
@@ -151,7 +155,7 @@ class FakeGripper:
             del foc_status.sensor_status
         if self.missing_foc_status:
             foc_status = None
-        return message(SimpleNamespace(value=self.width, force=1.0, mode="width", foc_status=foc_status))
+        return message(SimpleNamespace(value=self.width, force=1.0, mode=self.mode, foc_status=foc_status))
 
 
 class FakeRobot:
@@ -421,6 +425,43 @@ def test_full_self_test_cancelled_by_operator_never_enables_or_moves():
     assert "用户取消" in output.getvalue()
 
 
+@pytest.mark.parametrize(
+    "invalid_state",
+    ["unhealthy", "zero_fps", "wrong_mode", "non_finite_width", "out_of_range_width"],
+)
+def test_gripper_state_regression_after_confirmation_blocks_enable_and_motion(invalid_state: str):
+    create_robot, robots, console, output = make_harness()
+
+    def invalidate_gripper_after_static_checks() -> bool:
+        gripper = robots[0].gripper
+        assert gripper is not None
+        gripper.homed = False
+        if invalid_state == "unhealthy":
+            gripper.ok = False
+        elif invalid_state == "zero_fps":
+            gripper.fps_readings = [0.0]
+        elif invalid_state == "wrong_mode":
+            gripper.mode = "angle"
+        elif invalid_state == "non_finite_width":
+            gripper.width = float("nan")
+        else:
+            gripper.width = 0.08
+        return True
+
+    exit_code = demo.main(
+        ["--full"],
+        robot_factory=create_robot,
+        console=console,
+        confirm_motion=invalidate_gripper_after_static_checks,
+    )
+
+    robot = robots[0]
+    assert exit_code == 1
+    assert robot.arm.enabled is False
+    assert robot.actions == []
+    assert "确认后安全复核" in output.getvalue()
+
+
 def test_keyboard_interrupt_at_confirmation_is_reported_without_motion():
     create_robot, robots, console, output = make_harness()
 
@@ -665,7 +706,7 @@ def test_gripper_motion_failure_verifies_and_reports_restore(monkeypatch):
     assert "已恢复夹爪初始宽度" in output.getvalue()
 
 
-def test_unhomed_gripper_is_warned_and_skipped_during_full_self_test():
+def test_false_gripper_homing_status_warns_but_does_not_skip_safe_motion_test():
     create_robot, robots, console, output = make_harness()
 
     def create_unhomed_robot(config):
@@ -683,10 +724,13 @@ def test_unhomed_gripper_is_warned_and_skipped_during_full_self_test():
 
     robot = robots[0]
     assert exit_code == 0
-    assert len(robot.actions) == 12
-    assert all("gripper.pos" not in action for action in robot.actions)
-    assert "未归零" in output.getvalue()
-    assert "SKIP" in output.getvalue()
+    assert len(robot.actions) == 14
+    assert robot.actions[-2:] == [
+        {"gripper.pos": pytest.approx(0.045)},
+        {"gripper.pos": pytest.approx(0.04)},
+    ]
+    assert "零位状态位未置位" in output.getvalue()
+    assert "夹爪往返" in output.getvalue()
 
 
 def test_missing_gripper_motion_baseline_is_reported_as_gripper_failure():

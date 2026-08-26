@@ -85,7 +85,7 @@ class PiperSelfTest:
         self.console = console
         self.results: list[CheckResult] = []
         self.initial_observation: dict[str, float] = {}
-        self.gripper_homed = False
+        self.gripper_zeroing_status = False
         self.joint_motion_active = False
         self.gripper_motion_active = False
 
@@ -443,32 +443,17 @@ class PiperSelfTest:
                 if ready or time.monotonic() >= deadline:
                     break
                 time.sleep(0.05)
-            if not is_ok or not math.isfinite(fps) or fps <= 0 or message is None:
-                raise RuntimeError(f"夹爪通信异常: is_ok={is_ok}, fps={fps:.1f} Hz")
-            width = float(message.value)
-            force = float(message.force)
-            if message.mode != "width" or not math.isfinite(width) or not math.isfinite(force):
-                raise RuntimeError("夹爪反馈格式错误")
-            if not self.robot.config.gripper_min_width_m <= width <= self.robot.config.gripper_max_width_m:
-                raise RuntimeError(f"夹爪宽度 {width:.6f} m 超出配置范围")
-            faults = self._active_faults(
-                message.foc_status,
-                GRIPPER_FAULT_FIELDS,
-                required_fields=GRIPPER_STATUS_FIELDS,
+            width, force, self.gripper_zeroing_status = self._validate_gripper_feedback(
+                is_ok=is_ok,
+                fps=fps,
+                message=message,
             )
-            if faults:
-                self.add(
-                    "夹爪",
-                    "AGX 夹爪",
-                    CheckStatus.FAIL,
-                    "活动故障位: " + ", ".join(faults),
-                    started_at=started_at,
-                    blocks_motion=True,
-                )
-                return
-            self.gripper_homed = bool(getattr(message.foc_status, "homing_status", False))
-            status = CheckStatus.PASS if self.gripper_homed else CheckStatus.WARN
-            homing = "已归零" if self.gripper_homed else "未归零，动态夹爪检查将跳过"
+            status = CheckStatus.PASS if self.gripper_zeroing_status else CheckStatus.WARN
+            homing = (
+                "零位状态位已置位"
+                if self.gripper_zeroing_status
+                else "零位状态位未置位；将依据宽度与故障反馈执行动态检查"
+            )
             self.add(
                 "夹爪",
                 "AGX 夹爪",
@@ -485,6 +470,31 @@ class PiperSelfTest:
                 started_at=started_at,
                 blocks_motion=True,
             )
+
+    def _validate_gripper_feedback(
+        self,
+        *,
+        is_ok: bool,
+        fps: float,
+        message: Any,
+    ) -> tuple[float, float, bool]:
+        if not is_ok or not math.isfinite(fps) or fps <= 0 or message is None:
+            raise RuntimeError(f"夹爪通信异常: is_ok={is_ok}, fps={fps:.1f} Hz")
+        width = float(message.value)
+        force = float(message.force)
+        if message.mode != "width" or not math.isfinite(width) or not math.isfinite(force):
+            raise RuntimeError("夹爪反馈格式错误")
+        if not self.robot.config.gripper_min_width_m <= width <= self.robot.config.gripper_max_width_m:
+            raise RuntimeError(f"夹爪宽度 {width:.6f} m 超出配置范围")
+        faults = self._active_faults(
+            message.foc_status,
+            GRIPPER_FAULT_FIELDS,
+            required_fields=GRIPPER_STATUS_FIELDS,
+        )
+        if faults:
+            raise RuntimeError("夹爪活动故障位: " + ", ".join(faults))
+        zeroing_status = bool(getattr(message.foc_status, "homing_status", False))
+        return width, force, zeroing_status
 
     @staticmethod
     def _active_faults(
@@ -568,18 +578,14 @@ class PiperSelfTest:
                 if faults:
                     raise RuntimeError(f"关节 {joint_index} 活动故障位: {', '.join(faults)}")
             if self.robot.gripper is not None:
-                gripper_feedback = self.robot.gripper.get_gripper_status()
+                gripper = self.robot.gripper
+                gripper_feedback = gripper.get_gripper_status()
                 gripper_message = getattr(gripper_feedback, "msg", None)
-                if gripper_message is None:
-                    raise RuntimeError("夹爪反馈缺失")
-                gripper_faults = self._active_faults(
-                    gripper_message.foc_status,
-                    GRIPPER_FAULT_FIELDS,
-                    required_fields=GRIPPER_STATUS_FIELDS,
+                _, _, self.gripper_zeroing_status = self._validate_gripper_feedback(
+                    is_ok=bool(gripper.is_ok()),
+                    fps=float(gripper.get_fps()),
+                    message=gripper_message,
                 )
-                if gripper_faults:
-                    raise RuntimeError("夹爪活动故障位: " + ", ".join(gripper_faults))
-                self.gripper_homed = bool(gripper_message.foc_status.homing_status)
             self.initial_observation = {
                 key: float(value)
                 for key, value in observation.items()
@@ -713,9 +719,6 @@ class PiperSelfTest:
     def _check_gripper_motion(self) -> None:
         if self.robot.gripper is None:
             self.add("动态运动检查", "夹爪往返", CheckStatus.SKIP, "未配置夹爪")
-            return
-        if not self.gripper_homed:
-            self.add("动态运动检查", "夹爪往返", CheckStatus.SKIP, "夹爪未归零，禁止动作")
             return
         started_at = time.monotonic()
         start = self.initial_observation.get("gripper.pos")
