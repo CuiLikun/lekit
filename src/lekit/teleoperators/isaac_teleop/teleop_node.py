@@ -12,14 +12,18 @@ import uuid
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 import uvicorn
 
+from lekit.control.controller import ControllerNode, ControllerNodeConfig
+from lekit.control.runtime import Runtime
+
 from .config import IsaacTeleopConfig
 from .node_state import TeleopNodeState, create_monitor_app
-from .protocol import TeleopFrame
+from .protocol import ACTION_SCHEMA, ACTION_SCHEMA_VERSION, TeleopFrame, encode_action_frame
 from .transport import ZmqTeleopPublisher
 from .xr_controller import IsaacXRController
 
@@ -67,6 +71,40 @@ class TeleopNodeConfig:
             raise ValueError("monitor_port must be between 1 and 65535")
 
 
+@dataclass(kw_only=True)
+class IsaacControllerNodeConfig:
+    """Configuration for running Isaac Teleop as a Hub-managed Controller."""
+
+    node_id_path: Path
+    teleop: TeleopNodeConfig = field(default_factory=TeleopNodeConfig)
+    display_name: str = "Isaac Quest 3 Teleop"
+    action_endpoint: str = "tcp://0.0.0.0:5557"
+    hub_seed: str | None = None
+
+    def __post_init__(self) -> None:
+        self.node_id_path = Path(self.node_id_path)
+        if not isinstance(self.teleop, TeleopNodeConfig):
+            raise TypeError("teleop must be a TeleopNodeConfig")
+
+
+def make_isaac_controller_node(config: IsaacControllerNodeConfig, runtime: Runtime) -> ControllerNode:
+    """Build the generic Controller lifecycle for one Isaac Teleop process."""
+
+    if not isinstance(config, IsaacControllerNodeConfig):
+        raise TypeError("config must be an IsaacControllerNodeConfig")
+    return ControllerNode(
+        ControllerNodeConfig(
+            node_id_path=config.node_id_path,
+            display_name=config.display_name,
+            action_endpoint=config.action_endpoint,
+            hub_seed=config.hub_seed,
+            action_schemas=(f"{ACTION_SCHEMA}.v{ACTION_SCHEMA_VERSION}",),
+            control_modes=("teleop",),
+        ),
+        runtime=runtime,
+    )
+
+
 class MonitorServer:
     """Own a Uvicorn server running alongside the synchronous XR loop."""
 
@@ -105,6 +143,7 @@ class TeleopNode:
         self,
         config: TeleopNodeConfig,
         *,
+        control_node: ControllerNode | None = None,
         controller_factory: Callable[[IsaacTeleopConfig], Any] = IsaacXRController,
         publisher_factory: Callable[[str], Any] = ZmqTeleopPublisher,
         monitor_factory: Callable[[TeleopNodeState, str, int], Any] = MonitorServer,
@@ -113,6 +152,7 @@ class TeleopNode:
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.config = config
+        self._control_node = control_node
         self._controller_factory = controller_factory
         self._publisher_factory = publisher_factory
         self._monitor_factory = monitor_factory
@@ -140,6 +180,8 @@ class TeleopNode:
         stop_event = threading.Event() if stop_event is None else stop_event
         sampled_total = 0
         try:
+            if self._control_node is not None:
+                self._control_node.start()
             if self.config.monitor_enabled:
                 self._monitor = self._monitor_factory(
                     self.state,
@@ -147,7 +189,8 @@ class TeleopNode:
                     self.config.monitor_port,
                 )
                 self._monitor.start()
-            self._publisher = self._publisher_factory(self.config.publish_endpoint)
+            if self._control_node is None:
+                self._publisher = self._publisher_factory(self.config.publish_endpoint)
             self._publish_state("starting")
             if max_frames == 0:
                 return
@@ -188,7 +231,7 @@ class TeleopNode:
                             captured_utc_ns=self._utc_ns(),
                             action=action,
                         )
-                        published = self._publisher.publish_action(frame)
+                        published = self._publish_frame(frame)
                         if published:
                             rate_samples.append(started_at)
                         rate_hz = _sample_rate(rate_samples)
@@ -199,7 +242,7 @@ class TeleopNode:
                         )
                         sequence += 1
                         sampled_total += 1
-                        if started_at >= next_status_at:
+                        if self._publisher is not None and started_at >= next_status_at:
                             self._publisher.publish_status(self.state.snapshot_dict())
                             next_status_at = started_at + self.config.status_interval_s
                         if max_frames is not None and sampled_total >= max_frames:
@@ -231,6 +274,20 @@ class TeleopNode:
                     monitor.stop()
             finally:
                 self.state.set_state("stopped")
+                if self._control_node is not None:
+                    self._control_node.stop()
+
+    def _publish_frame(self, frame: TeleopFrame) -> bool:
+        """Publish one frame through the selected standalone or managed transport."""
+
+        if self._control_node is not None:
+            return self._control_node.publish(
+                encode_action_frame(frame),
+                captured_monotonic_ns=frame.captured_monotonic_ns,
+                captured_utc_ns=frame.captured_utc_ns,
+            )
+        assert self._publisher is not None
+        return self._publisher.publish_action(frame)
 
     def _publish_state(self, state: str, *, error: str | None = None) -> None:
         self.state.set_state(state, error=error)
@@ -306,4 +363,11 @@ if __name__ == "__main__":
     main()
 
 
-__all__ = ["MonitorServer", "TeleopNode", "TeleopNodeConfig", "main"]
+__all__ = [
+    "IsaacControllerNodeConfig",
+    "MonitorServer",
+    "TeleopNode",
+    "TeleopNodeConfig",
+    "main",
+    "make_isaac_controller_node",
+]

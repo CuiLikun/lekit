@@ -15,6 +15,9 @@ dependencies = [
     "scipy>=1.14",
 ]
 
+[project.scripts]
+lekit = "lekit.control.cli:main"
+
 [project.optional-dependencies]
 teleop = ['isaacteleop[cloudxr,retargeters]==1.3.131 ; sys_platform == "linux"']
 piper = [
@@ -29,6 +32,7 @@ python-can-agx-cando = { git = "https://github.com/agilexrobotics/python-can-agx
 where = ["src"]
 
 [tool.setuptools.package-data]
+"lekit.control" = ["hub.html"]
 "lekit.robots.jaka_robot" = ["web_debug.html"]
 "lekit.teleoperators.isaac_teleop" = ["teleop_node_monitor.html", "teleop_node_monitor.js", "three.*"]
 

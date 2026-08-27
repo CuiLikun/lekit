@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Lekit Hub</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    body { margin: 1rem; background: #111827; color: #e5e7eb; }
+    h1, h2 { margin: .6rem 0; } .connection { color: #93c5fd; }
+    .panel { margin: 1rem 0; overflow-x: auto; border: 1px solid #374151; border-radius: .4rem; }
+    table { width: 100%; min-width: 1680px; table-layout: fixed; border-collapse: collapse; }
+    th, td { padding: .45rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-bottom: 1px solid #374151; text-align: left; }
+    th { color: #93c5fd; background: #1f2937; } .badge { padding: .15rem .35rem; border-radius: .25rem; background: #374151; }
+    .mismatch { color: #fde68a; } .safety { color: #fff; background: #b91c1c; padding: .5rem; font-weight: bold; }
+    button { margin-right: .25rem; } .danger { color: #fecaca; } #history { white-space: pre-wrap; padding: .75rem; }
+  </style>
+</head>
+<body>
+  <h1>Lekit Hub <span id="connection" class="connection">connecting</span></h1>
+  <div id="alerts"></div>
+  <h2>Inventory and control state</h2>
+  <div class="panel"><table><thead><tr>
+    <th style="width:8%">Node</th><th style="width:4%">Role</th><th style="width:8%">Capabilities</th><th style="width:6%">Runtime</th><th style="width:6%">Control</th>
+    <th style="width:7%">Session</th><th style="width:7%">Assignment</th><th style="width:7%">Handle</th><th style="width:4%">TTL</th>
+    <th style="width:4%">Rate</th><th style="width:6%">Frame age</th><th style="width:5%">Sequence</th><th style="width:5%">Connected</th><th style="width:5%">Tracking</th><th style="width:5%">Engaged</th><th style="width:6%">Processor</th><th style="width:7%">Error</th><th style="width:8%">Actions</th>
+  </tr></thead><tbody id="rows"></tbody></table></div>
+  <h2>History</h2><div id="history" class="panel">No history loaded.</div>
+  <script>
+    const rows = document.querySelector('#rows'), alerts = document.querySelector('#alerts'), connection = document.querySelector('#connection');
+    const post = async (path, body) => { const response = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: body ? JSON.stringify(body) : undefined}); if (!response.ok) alert(await response.text()); return response; };
+    const value = input => input == null ? '—' : String(input);
+    const boolean = input => input == null ? '—' : input ? 'yes' : 'no';
+    const isSafetyCode = code => code === 'robot_safety_with_active_desire' || String(code || '').includes('safety');
+    const controlsFor = (controls, node) => controls.find(control => control.robot_id === node.descriptor?.node_id || control.controller_id === node.descriptor?.node_id);
+    const cell = (row, content, className = '') => { const element = document.createElement('td'); element.textContent = value(content); if (className) element.className = className; row.append(element); };
+    const actionButton = (action, label, data) => { const button = document.createElement('button'); button.dataset.action = action; Object.entries(data).forEach(([key, item]) => button.dataset[key] = item); button.textContent = label; return button; };
+    rows.addEventListener('click', event => { if (!(event.target instanceof Element)) return; const button = event.target.closest('button[data-action]'); if (!button) return; const {action, handle, robot} = button.dataset; if (action === 'hold') { const reason = prompt(`Force HOLD ${robot}: state the reason`); if (reason?.trim() && confirm(`Force HOLD ${robot}?`)) post(`/api/robots/${encodeURIComponent(robot)}/force-hold`, {reason}); } else if (action === 'revoke') { const reason = prompt(`Revoke ${handle}: state the reason`); if (reason?.trim() && confirm(`Revoke ${handle}?`)) post(`/api/handles/${encodeURIComponent(handle)}/revoke`, {reason}); } else if (action === 'take-over' || action === 'hand-over') post(`/api/handles/${encodeURIComponent(handle)}/${action}`, undefined); });
+    const render = state => {
+      const now = Date.now() * 1e6, controls = state.controls || [];
+      const alertFragment = document.createDocumentFragment();
+      (state.alerts || []).forEach(alert => { const element = document.createElement('div'); element.className = isSafetyCode(alert.code) ? 'safety' : 'mismatch'; element.textContent = `${value(alert.code || 'alert')}: ${value(alert.message || alert.reason || '')}`; alertFragment.append(element); });
+      alerts.replaceChildren(alertFragment);
+      const rowFragment = document.createDocumentFragment();
+      (state.nodes || []).forEach(node => { const descriptor = node.descriptor || {}, report = node.report || {}, control = controlsFor(controls, node), mismatch = control?.mismatch_codes?.join(', ') || '', safetyMismatch = (control?.mismatch_codes || []).some(isSafetyCode), ttl = control ? Math.max(0, (control.expires_at_ns - now) / 1e9).toFixed(1) + 's' : '—', row = document.createElement('tr'), id = descriptor.node_id || ''; cell(row, id); cell(row, descriptor.role); cell(row, (descriptor.capabilities || []).join(', ')); cell(row, report.runtime_state || (node.online ? 'ONLINE' : 'OFFLINE')); cell(row, report.robot_control_state || report.controller_control_state || control?.handle_state); cell(row, descriptor.session_id); cell(row, mismatch || control?.desired_state, safetyMismatch ? 'safety' : mismatch ? 'mismatch' : ''); cell(row, control?.handle_id); cell(row, ttl); cell(row, control?.action_rate_hz); cell(row, control?.frame_age_ms); cell(row, control?.last_sequence); cell(row, descriptor.role === 'robot' ? boolean(node.online) : '—'); cell(row, report.tracking); cell(row, report.engaged); cell(row, report.processor_state); cell(row, control?.error || report.error, 'danger'); const actions = document.createElement('td'); if (descriptor.role === 'robot') actions.append(actionButton('hold', 'HOLD', {robot: id})); if (control) { actions.append(actionButton('take-over', 'Take over', {handle: control.handle_id}), actionButton('hand-over', 'Hand over', {handle: control.handle_id}), actionButton('revoke', 'Revoke', {handle: control.handle_id})); } row.append(actions); rowFragment.append(row); });
+      rows.replaceChildren(rowFragment);
+    };
+    const loadHistory = async () => { const response = await fetch('/api/history?limit=50'); if (response.ok) document.querySelector('#history').textContent = (await response.json()).map(event => JSON.stringify(event)).join('\n') || 'No history.'; };
+    let delay = 250;
+    const connect = () => { const protocol = location.protocol === 'https:' ? 'wss' : 'ws', socket = new WebSocket(`${protocol}://${location.host}/ws`); socket.onopen = () => { delay = 250; connection.textContent = 'live'; loadHistory(); }; socket.onmessage = event => render(JSON.parse(event.data)); socket.onclose = () => { connection.textContent = `reconnecting in ${delay}ms`; setTimeout(connect, delay); delay = Math.min(delay * 2, 5000); }; socket.onerror = () => socket.close(); };
+    connect();
+  </script>
+</body>
+</html>

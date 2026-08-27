@@ -4,7 +4,7 @@ from collections import deque
 
 import pytest
 
-from lekit.teleoperators.isaac_teleop.protocol import ACTION_KEYS, neutral_action
+from lekit.teleoperators.isaac_teleop.protocol import ACTION_KEYS, decode_action_frame, neutral_action
 from lekit.teleoperators.isaac_teleop.teleop_node import TeleopNode, TeleopNodeConfig
 
 
@@ -78,6 +78,31 @@ class FakeMonitor:
 
     def stop(self) -> None:
         pass
+
+
+class FakeControlNode:
+    def __init__(self, *, published: bool = True) -> None:
+        self.events: list[str] = []
+        self.published = []
+        self._published = published
+
+    def start(self) -> None:
+        self.events.append("start")
+
+    def stop(self) -> None:
+        self.events.append("stop")
+
+    def publish(self, payload: bytes, *, captured_monotonic_ns: int, captured_utc_ns: int) -> bool:
+        self.published.append(
+            (
+                payload,
+                {
+                    "captured_monotonic_ns": captured_monotonic_ns,
+                    "captured_utc_ns": captured_utc_ns,
+                },
+            )
+        )
+        return self._published
 
 
 def tracked_action(trigger: float = 0.0):
@@ -253,3 +278,54 @@ def test_dropped_transport_frames_are_visible_and_not_counted_as_published() -> 
     assert snapshot.published_frames == 1
     assert snapshot.dropped_frames == 1
     assert snapshot.sequence == 1
+
+
+def test_managed_teleop_publishes_encoded_frame_with_exact_capture_metadata() -> None:
+    control_node = FakeControlNode()
+    controller = FakeController([tracked_action(0.3)])
+    clock = ManualTime()
+    node = TeleopNode(
+        TeleopNodeConfig(monitor_enabled=False),
+        control_node=control_node,
+        controller_factory=lambda _config: controller,
+        monotonic=clock.monotonic,
+        utc_ns=clock.time_ns,
+        sleep=clock.sleep,
+    )
+
+    node.run(max_frames=1)
+
+    payload, metadata = control_node.published[0]
+    decoded = decode_action_frame(payload)
+    assert set(decoded.action) == set(neutral_action())
+    assert metadata["captured_monotonic_ns"] == decoded.captured_monotonic_ns
+    assert metadata["captured_utc_ns"] == decoded.captured_utc_ns
+    assert control_node.events == ["start", "stop"]
+
+
+def test_managed_teleop_stops_control_node_after_xr_connect_failure() -> None:
+    control_node = FakeControlNode()
+    stop_event = __import__("threading").Event()
+    clock = ManualTime()
+
+    class FailingController(FakeController):
+        def __init__(self) -> None:
+            super().__init__([])
+
+        def connect(self) -> None:
+            self.connect_calls += 1
+            stop_event.set()
+            raise RuntimeError("XR unavailable")
+
+    node = TeleopNode(
+        TeleopNodeConfig(monitor_enabled=False),
+        control_node=control_node,
+        controller_factory=lambda _config: FailingController(),
+        monotonic=clock.monotonic,
+        utc_ns=clock.time_ns,
+        sleep=clock.sleep,
+    )
+
+    node.run(max_frames=1, stop_event=stop_event)
+
+    assert control_node.events == ["start", "stop"]
