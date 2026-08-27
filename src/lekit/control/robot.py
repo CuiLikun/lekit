@@ -819,10 +819,11 @@ class RobotNode:
         if not isinstance(action, Mapping):
             raise TypeError("action must be a mapping")
         features = self.robot.action_features
-        if set(action) != set(features):
-            raise ValueError("action keys must exactly match action_features")
-        for key, feature in features.items():
-            self._validate_feature_value(action[key], feature, key)
+        unknown = set(action) - set(features)
+        if unknown:
+            raise ValueError(f"action contains unsupported features: {sorted(unknown)}")
+        for key, value in action.items():
+            self._validate_feature_value(value, features[key], key)
 
     @classmethod
     def _validate_feature_value(cls, value: Any, feature: Any, name: str) -> None:

@@ -6,7 +6,8 @@ transport and persistence remain owned by their respective adapters.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import fields, is_dataclass
 from functools import partial
 from importlib.resources import files
 from typing import Annotated, Any
@@ -65,7 +66,22 @@ def _operator(request: Request, supplied: str | None) -> str:
 
 
 def _json(value: Any, *, status_code: int = 200) -> JSONResponse:
-    return JSONResponse(content=jsonable_encoder(value), status_code=status_code)
+    return JSONResponse(content=_encode(value), status_code=status_code)
+
+
+def _encode(value: Any) -> Any:
+    """Encode immutable domain dataclasses without deepcopying mapping proxies."""
+    return jsonable_encoder(_thaw_domain_value(value))
+
+
+def _thaw_domain_value(value: Any) -> Any:
+    if is_dataclass(value) and not isinstance(value, type):
+        return {field.name: _thaw_domain_value(getattr(value, field.name)) for field in fields(value)}
+    if isinstance(value, Mapping):
+        return {key: _thaw_domain_value(nested) for key, nested in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_thaw_domain_value(item) for item in value]
+    return value
 
 
 def _hub_error(error: Exception) -> HTTPException:
@@ -181,7 +197,7 @@ def create_hub_app(hub: Hub) -> FastAPI:
                 snapshot_value = await anyio.to_thread.run_sync(
                     partial(hub.watch, after_version=after_version, timeout_s=1.0)
                 )
-                encoded = jsonable_encoder(snapshot_value)
+                encoded = _encode(snapshot_value)
                 version = encoded.get("version") if isinstance(encoded, dict) else None
                 if not isinstance(version, int) or version <= after_version:
                     continue

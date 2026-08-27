@@ -150,10 +150,11 @@ def correlate_control(
     desired_active = record.state is HandleState.ACTIVE
     robot_controlling = robot_state is RobotControlState.CONTROLLING
     controller_streaming = controller_state is ControllerControlState.STREAMING
+    robot_engaged = robot_report is not None and robot_report.engaged is True
 
-    if desired_active and robot_state is RobotControlState.HOLD:
+    if desired_active and robot_state is RobotControlState.HOLD and robot_engaged:
         codes.append("desired_active_robot_hold")
-    if controller_streaming and not robot_controlling:
+    if controller_streaming and not robot_controlling and robot_engaged:
         codes.append("controller_streaming_robot_not_accepting")
     if (
         robot_controlling

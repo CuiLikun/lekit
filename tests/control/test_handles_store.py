@@ -81,6 +81,7 @@ def _robot_report(
     *,
     state: RobotControlState,
     runtime: RuntimeState = RuntimeState.ONLINE,
+    engaged: bool = True,
 ) -> NodeReport:
     return NodeReport(
         node_id=record.handle.robot_id,
@@ -94,7 +95,7 @@ def _robot_report(
         frame_age_ms=5.0,
         last_sequence=8,
         tracking=True,
-        engaged=True,
+        engaged=engaged,
         processor_state="active",
         active_hold=state is RobotControlState.HOLD,
         error=None,
@@ -253,6 +254,20 @@ def test_correlation_classifies_severe_control_mismatches(
     assert expected_code in snapshot.mismatch_codes
     assert snapshot.healthy is False
     assert snapshot.error in snapshot.mismatch_codes
+
+
+def test_active_clutch_released_hold_is_not_a_control_mismatch(handle_record) -> None:
+    record = replace(handle_record, state=HandleState.ACTIVE)
+
+    snapshot = correlate_control(
+        record,
+        _robot_report(record, state=RobotControlState.HOLD, engaged=False),
+        _controller_report(record, state=ControllerControlState.STREAMING),
+        now_ns=250,
+    )
+
+    assert snapshot.mismatch_codes == ()
+    assert snapshot.healthy is True
 
 
 def test_store_assigns_monotonic_fencing_and_exclusive_handle(tmp_path, descriptors):

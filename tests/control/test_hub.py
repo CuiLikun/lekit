@@ -322,6 +322,58 @@ def test_assign_checks_schema_mode_sessions_and_exclusivity(hub: Hub, registered
         hub.assign("piper-01", "quest3-main")
 
 
+def test_assignment_does_not_treat_pre_grant_reports_as_handle_mismatches(
+    hub: Hub,
+    runtime: SpyRuntime,
+    registered_pair: tuple[NodeDescriptor, NodeDescriptor],
+) -> None:
+    robot, controller = registered_pair
+    hub.receive_report(report(robot, robot_state=RobotControlState.HOLD))
+    hub.receive_report(report(controller, controller_state=ControllerControlState.IDLE))
+
+    handle = hub.assign(robot.node_id, controller.node_id)
+    hub.tick()
+
+    control = hub.get_snapshot(handle.handle_id)
+    assert control.handle_state is HandleState.ASSIGNED
+    assert control.mismatch_codes == ()
+    assert sent_messages(runtime, kind="revoke") == []
+
+
+def test_grant_ack_discards_unbound_status_that_was_in_flight_before_grant(
+    hub: Hub,
+    runtime: SpyRuntime,
+    registered_pair: tuple[NodeDescriptor, NodeDescriptor],
+) -> None:
+    robot, controller = registered_pair
+    handle = hub.assign(robot.node_id, controller.node_id)
+    hub.receive_report(report(robot, robot_state=RobotControlState.HOLD))
+    hub.receive_report(report(controller, controller_state=ControllerControlState.IDLE))
+
+    hub.tick()
+    assert hub.get_snapshot(handle.handle_id).handle_state is HandleState.ASSIGNED
+
+    for node in (robot, controller):
+        grant = sent_messages(runtime, kind="grant", peer_id=node.node_id)[-1][1]
+        ack = management(
+            "grant_ack",
+            node,
+            {"handle": as_wire(handle)},
+            sequence=1,
+            correlation_id=grant.correlation_id,
+        )
+        runtime.channel.inbox.append(
+            ReceivedManagement(node.node_id, ack, "10.0.0.8", 0)
+        )
+        assert hub.run_once() is True
+
+    hub.tick()
+
+    control = hub.get_snapshot(handle.handle_id)
+    assert control.handle_state is HandleState.ASSIGNED
+    assert control.mismatch_codes == ()
+
+
 def test_assignment_rejects_incompatible_mode_and_schema(hub: Hub, clock: Clock):
     robot = descriptor(NodeRole.ROBOT, modes=("policy",))
     controller = descriptor(NodeRole.CONTROLLER, schemas=("other.action.v1",))
@@ -683,6 +735,27 @@ def test_run_once_registers_and_dispatches_status_from_management_messages(
     assert snapshot.report.robot_control_state is RobotControlState.HOLD
 
 
+def test_service_loop_survives_stale_unregistered_node_packet(
+    hub: Hub, runtime: SpyRuntime, clock: Clock
+) -> None:
+    stale = descriptor(NodeRole.ROBOT, session="stale-session")
+    message = management("status", stale, {}, sequence=1)
+    runtime.channel.inbox.append(
+        ReceivedManagement(stale.node_id, message, "127.0.0.1", clock.monotonic_ns())
+    )
+
+    class StopAfterOneIteration:
+        calls = 0
+
+        def is_set(self) -> bool:
+            self.calls += 1
+            return self.calls > 1
+
+    hub.run(stop_event=StopAfterOneIteration())
+
+    assert runtime.channel.closed is True
+
+
 @pytest.mark.parametrize("kind", ["status", "fault"])
 def test_report_form_message_identity_is_bound_to_authenticated_sender(
     kind: str,
@@ -817,6 +890,20 @@ def test_force_hold_is_distinct_from_revocation(hub: Hub, runtime: SpyRuntime, r
 
     assert runtime.channel.sent[-1][1].kind == "force_hold"
     assert hub.get_snapshot(handle.handle_id).handle_state is HandleState.ACTIVE
+
+
+def test_handing_over_transient_is_not_auto_revoked(
+    hub: Hub,
+    runtime: SpyRuntime,
+    registered_pair: tuple[NodeDescriptor, NodeDescriptor],
+) -> None:
+    handle = activate(hub, registered_pair)
+
+    hub.request_hand_over(handle)
+    hub.tick()
+
+    assert hub.get_snapshot(handle.handle_id).handle_state is HandleState.HANDING_OVER
+    assert sent_messages(runtime, kind="revoke") == []
 
 
 def test_failed_grant_delivery_is_retried_by_tick(hub: Hub, runtime: SpyRuntime, registered_pair):

@@ -195,7 +195,8 @@ class ControllerNode:
                 raise HandleNotGranted(handle.handle_id)
             self._disable_streaming_locked("hand_over")
             self._control_state = ControllerControlState.HANDING_OVER
-            self._send_handle_event_locked("hand_over_requested", handle)
+            if self._send_handle_event_locked("hand_over_requested", handle):
+                self._complete_hand_over_locked(handle)
 
     def receive_grant(self, handle: ControlHandle) -> bool:
         """Cache a current Hub grant without enabling the direct action stream."""
@@ -433,7 +434,14 @@ class ControllerNode:
             return False
         self._disable_streaming_locked("hand_over")
         self._control_state = ControllerControlState.HANDING_OVER
-        return True
+        return self._send_handle_event_locked(
+            "hand_over_requested", handle
+        ) and self._complete_hand_over_locked(handle)
+
+    def _complete_hand_over_locked(self, handle: ControlHandle) -> bool:
+        self._disable_streaming_locked("hand_over", terminal=True)
+        self._control_state = ControllerControlState.IDLE
+        return self._send_handle_event_locked("controller_released", handle)
 
     def _accept_revoke_locked(self, handle: ControlHandle) -> bool:
         if not self._matches_current_handle_locked(handle):

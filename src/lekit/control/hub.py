@@ -6,6 +6,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from pathlib import Path
@@ -337,6 +338,10 @@ class Hub:
             record = self._store_required().get_handle(handle.handle_id)
             live = _LiveHandle(record=record, last_renewed_monotonic_ns=self._monotonic_ns())
             self._handles[handle.handle_id] = live
+            # Reports received before this assignment cannot describe its
+            # Handle identity. Wait for post-grant reports before correlating.
+            robot_node.report = None
+            controller_node.report = None
             self._audit_locked(
                 "assignment_requested",
                 actor=actor,
@@ -585,7 +590,10 @@ class Hub:
         wait_s = min(0.1, self._timing.heartbeat_interval_ns / 2_000_000_000)
         try:
             while not stop_event.is_set():
-                self.run_once(timeout_s=wait_s)
+                # A rejected or stale peer message is a protocol event, not
+                # a reason to terminate the authoritative service loop.
+                with suppress(ControlError):
+                    self.run_once(timeout_s=wait_s)
                 self.tick()
         finally:
             self.stop()
@@ -817,6 +825,10 @@ class Hub:
                 "node_id": message.sender_id,
             },
         )
+        if message.kind == "grant_ack":
+            # Any unbound status received before this ACK predates the
+            # node's acceptance of the new Handle.
+            node.report = None
         self._outstanding_commands.pop(key)
         self._touch_node_locked(message.sender_id, received_ns)
 
@@ -899,7 +911,16 @@ class Hub:
         if not self.config.auto_revoke_mismatches:
             return
         for live in tuple(self._handles.values()):
-            if live.record.state in TERMINAL_HANDLE_STATES or live.record.state is HandleState.REVOKING:
+            if live.record.state in TERMINAL_HANDLE_STATES or live.record.state in {
+                HandleState.HANDING_OVER,
+                HandleState.REVOKING,
+            }:
+                continue
+            if live.record.state in {HandleState.ASSIGNED, HandleState.TAKING_OVER} and any(
+                command.handle_id == live.record.handle.handle_id
+                and command.expected_ack_kind == "grant_ack"
+                for command in self._outstanding_commands.values()
+            ):
                 continue
             control = self._correlate_live(live)
             if not control.mismatch_codes:

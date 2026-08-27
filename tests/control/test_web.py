@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from lekit.control.hub import ControlConflict, IncompatibleNode, NodeUnavailable
+from lekit.control.model import HubSnapshot
 from lekit.control.web import create_hub_app
 
 
@@ -133,6 +134,26 @@ def test_websocket_emits_initial_and_new_snapshot_versions(client: TestClient, f
         assert socket.receive_json()["version"] == 1
         fake_hub.publish(version=2)
         assert socket.receive_json()["version"] == 2
+
+
+def test_snapshot_serializes_deeply_frozen_domain_mappings() -> None:
+    hub = FakeHub()
+    snapshot = HubSnapshot(
+        version=1,
+        hub_epoch="epoch-1",
+        generated_at_ns=1,
+        nodes=(),
+        controls=(),
+        alerts=({"code": "safety", "details": {"robot": "piper-01"}},),
+    )
+    hub.get_snapshot = lambda: snapshot  # type: ignore[method-assign]
+
+    response = TestClient(create_hub_app(hub)).get("/api/snapshot")
+
+    assert response.status_code == 200
+    assert response.json()["alerts"] == [
+        {"code": "safety", "details": {"robot": "piper-01"}}
+    ]
 
 
 def test_root_serves_fixed_layout_ui_with_required_control_routes(client: TestClient) -> None:

@@ -283,6 +283,10 @@ def test_hand_over_stops_publication_before_management_request(
 
     assert controller.publish(b"late", captured_monotonic_ns=30, captured_utc_ns=40) is False
     assert messages(runtime, "hand_over_requested")[-1].body["handle"] == asdict(handle)
+    assert messages(runtime, "controller_released")[-1].body["handle"] == asdict(handle)
+    assert controller.control_state is ControllerControlState.IDLE
+    replacement = replace(handle, handle_id="handle-2", fencing_token=2)
+    assert controller.receive_grant(replacement)
 
 
 def test_valid_management_command_acks_exact_handle_and_correlation(
@@ -294,6 +298,25 @@ def test_valid_management_command_acks_exact_handle_and_correlation(
     assert acknowledgement.correlation_id == "grant-1"
     assert acknowledgement.body == {"handle": asdict(handle)}
     assert controller.publish(b"frame", captured_monotonic_ns=10, captured_utc_ns=20) is False
+
+
+def test_routed_hand_over_reports_release_request_back_to_hub(
+    controller: ControllerNode,
+    handle: ControlHandle,
+    runtime: RecordingRuntime,
+) -> None:
+    assert controller.receive_management(registered(controller, runtime, sequence=0))
+    assert controller.receive_management(command("grant", handle, sequence=1))
+
+    assert controller.receive_management(
+        command("hand_over", handle, correlation_id="hand-over-1", sequence=2)
+    )
+
+    request = messages(runtime, "hand_over_requested")[-1]
+    assert request.body == {"handle": asdict(handle)}
+    assert messages(runtime, "controller_released")[-1].body == {"handle": asdict(handle)}
+    assert messages(runtime, "hand_over_ack")[-1].correlation_id == "hand-over-1"
+    assert controller.control_state is ControllerControlState.IDLE
 
 
 @pytest.mark.parametrize(

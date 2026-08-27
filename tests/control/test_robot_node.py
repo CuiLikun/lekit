@@ -819,6 +819,30 @@ def test_processor_and_action_validation_never_forward_invalid_output(
     assert robot_node.rejections[reason] == 1
 
 
+def test_action_validation_accepts_a_supported_feature_subset(
+    robot_node: RobotNode,
+    robot: FakeRobot,
+    processor: FakeProcessor,
+    runtime: RecordingRuntime,
+    clock: Clock,
+    handle: ControlHandle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        FakeRobot,
+        "action_features",
+        property(lambda self: {"x": float, "gripper": float}),
+    )
+    receiver = activate(robot_node, runtime, handle)
+    processor.outputs.append({"x": 0.5})
+    inject(receiver, envelope(handle), clock)
+
+    robot_node.run_cycle()
+
+    assert robot.sent == [{"x": 0.5}]
+    assert robot_node.control_state is RobotControlState.CONTROLLING
+
+
 def test_processor_exception_is_rejected_without_escaping_control_cycle(
     robot_node: RobotNode,
     robot: FakeRobot,
