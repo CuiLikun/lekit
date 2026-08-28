@@ -5,7 +5,11 @@ import math
 import numpy as np
 import pytest
 
-from lekit.robots.piper.cartesian_servo import PiperCartesianServo, PiperCartesianServoConfig
+from lekit.robots.piper.cartesian_servo import (
+    PiperCartesianServo,
+    PiperCartesianServoConfig,
+    _norm_bounded,
+)
 
 LIMITS = tuple((-math.pi, math.pi) for _ in range(6))
 
@@ -55,3 +59,21 @@ def test_exact_wrist_singularity_returns_bounded_continuous_target():
     assert step.joint_target[0] > joints[0]
     assert step.diagnostics.orientation_scale == pytest.approx(0.15, abs=0.02)
     assert step.diagnostics.position_error_m == pytest.approx(0.002)
+
+
+def test_three_axis_linear_task_velocity_is_norm_limited():
+    requested = np.array([1.0, 1.0, 1.0])
+
+    bounded = _norm_bounded(requested, 0.10)
+
+    assert np.linalg.norm(bounded) == pytest.approx(0.10)
+    assert np.all(bounded < requested)
+
+
+def test_three_axis_angular_task_velocity_is_norm_limited():
+    requested = np.array([1.0, 1.0, 1.0])
+
+    bounded = _norm_bounded(requested, 0.50)
+
+    assert np.linalg.norm(bounded) == pytest.approx(0.50)
+    assert np.all(bounded < requested)

@@ -91,6 +91,13 @@ def _damped_pinv(matrix: np.ndarray, damping: float) -> np.ndarray:
     )
 
 
+def _norm_bounded(vector: np.ndarray, maximum_norm: float) -> np.ndarray:
+    norm = float(np.linalg.norm(vector))
+    if norm <= maximum_norm:
+        return vector.copy()
+    return vector * (maximum_norm / norm)
+
+
 class PiperCartesianServo:
     def __init__(
         self,
@@ -162,15 +169,11 @@ class PiperCartesianServo:
         orientation_scale = self.config.minimum_orientation_scale + (1.0 - self.config.minimum_orientation_scale) * t
         damping = self.config.maximum_damping + (self.config.minimum_damping - self.config.maximum_damping) * t
 
-        bounded_position_velocity = np.clip(
-            self.config.position_gain_s * position_error,
-            -self.config.max_tcp_velocity_m_s,
-            self.config.max_tcp_velocity_m_s,
+        bounded_position_velocity = _norm_bounded(
+            self.config.position_gain_s * position_error, self.config.max_tcp_velocity_m_s
         )
-        bounded_rotation_velocity = np.clip(
-            self.config.orientation_gain_s * orientation_error,
-            -self.config.max_tcp_angular_velocity_rad_s,
-            self.config.max_tcp_angular_velocity_rad_s,
+        bounded_rotation_velocity = _norm_bounded(
+            self.config.orientation_gain_s * orientation_error, self.config.max_tcp_angular_velocity_rad_s
         )
         j_position = jacobian[:3]
         j_rotation = jacobian[3:]
