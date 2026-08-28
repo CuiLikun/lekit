@@ -102,8 +102,11 @@ def _jerk_limited_stopping_velocity_delta(
     acceleration: float, maximum_jerk: float, dt: float
 ) -> float:
     jerk_step = maximum_jerk * dt
-    steps = math.ceil(acceleration / jerk_step - 1e-12)
-    return dt * (steps * acceleration - jerk_step * steps * (steps + 1) / 2.0)
+    positive_steps = max(0, math.ceil(acceleration / jerk_step - 1e-12) - 1)
+    return dt * (
+        positive_steps * acceleration
+        - jerk_step * positive_steps * (positive_steps + 1) / 2.0
+    )
 
 
 class PiperCartesianServo:
@@ -130,10 +133,12 @@ class PiperCartesianServo:
         self.monotonic = monotonic
         self._previous_velocity = np.zeros(6, dtype=float)
         self._previous_acceleration = np.zeros(6, dtype=float)
+        self._velocity_braking_direction = np.zeros(6, dtype=int)
 
     def reset(self) -> None:
         self._previous_velocity = np.zeros(6, dtype=float)
         self._previous_acceleration = np.zeros(6, dtype=float)
+        self._velocity_braking_direction = np.zeros(6, dtype=int)
 
     def step(
         self,
@@ -224,20 +229,40 @@ class PiperCartesianServo:
         for index, (previous_velocity, previous_acceleration) in enumerate(
             zip(self._previous_velocity, self._previous_acceleration, strict=True)
         ):
-            if desired_velocity[index] > previous_velocity and previous_acceleration > 0.0:
-                remaining_velocity = self.config.max_joint_velocity_rad_s - previous_velocity
-                stopping_delta = _jerk_limited_stopping_velocity_delta(
-                    previous_acceleration, self.config.max_joint_jerk_rad_s3, dt
-                )
-                if remaining_velocity <= stopping_delta + 1e-12:
-                    desired_velocity[index] = previous_velocity
-            elif desired_velocity[index] < previous_velocity and previous_acceleration < 0.0:
-                remaining_velocity = self.config.max_joint_velocity_rad_s + previous_velocity
-                stopping_delta = _jerk_limited_stopping_velocity_delta(
-                    -previous_acceleration, self.config.max_joint_jerk_rad_s3, dt
-                )
-                if remaining_velocity <= stopping_delta + 1e-12:
-                    desired_velocity[index] = previous_velocity
+            if desired_velocity[index] > previous_velocity:
+                if self._velocity_braking_direction[index] < 0:
+                    self._velocity_braking_direction[index] = 0
+                if previous_acceleration > 0.0 or self._velocity_braking_direction[index] > 0:
+                    candidate_acceleration = min(
+                        max(previous_acceleration, 0.0) + self.config.max_joint_jerk_rad_s3 * dt,
+                        self.config.max_joint_acceleration_rad_s2,
+                    )
+                    remaining_velocity = self.config.max_joint_velocity_rad_s - previous_velocity
+                    stopping_delta = _jerk_limited_stopping_velocity_delta(
+                        candidate_acceleration, self.config.max_joint_jerk_rad_s3, dt
+                    )
+                    if remaining_velocity <= candidate_acceleration * dt + stopping_delta + 1e-12:
+                        desired_velocity[index] = previous_velocity
+                        self._velocity_braking_direction[index] = 1
+                    else:
+                        self._velocity_braking_direction[index] = 0
+            elif desired_velocity[index] < previous_velocity:
+                if self._velocity_braking_direction[index] > 0:
+                    self._velocity_braking_direction[index] = 0
+                if previous_acceleration < 0.0 or self._velocity_braking_direction[index] < 0:
+                    candidate_acceleration = min(
+                        max(-previous_acceleration, 0.0) + self.config.max_joint_jerk_rad_s3 * dt,
+                        self.config.max_joint_acceleration_rad_s2,
+                    )
+                    remaining_velocity = self.config.max_joint_velocity_rad_s + previous_velocity
+                    stopping_delta = _jerk_limited_stopping_velocity_delta(
+                        candidate_acceleration, self.config.max_joint_jerk_rad_s3, dt
+                    )
+                    if remaining_velocity <= candidate_acceleration * dt + stopping_delta + 1e-12:
+                        desired_velocity[index] = previous_velocity
+                        self._velocity_braking_direction[index] = -1
+                    else:
+                        self._velocity_braking_direction[index] = 0
         desired_acceleration = np.clip(
             (desired_velocity - self._previous_velocity) / dt,
             -self.config.max_joint_acceleration_rad_s2,
@@ -271,6 +296,7 @@ class PiperCartesianServo:
         self._previous_acceleration = acceleration.copy()
         self._previous_velocity[hard_limit_clipped & outward] = 0.0
         self._previous_acceleration[hard_limit_clipped & outward] = 0.0
+        self._velocity_braking_direction[hard_limit_clipped & outward] = 0
         elapsed_ms = (self.monotonic() - started) * 1000.0
         diagnostics = PiperCartesianServoDiagnostics(
             state="singular" if orientation_scale < 1.0 else "nominal",

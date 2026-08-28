@@ -107,6 +107,31 @@ def test_repeated_steps_obey_velocity_acceleration_and_jerk_limits():
     assert np.max(np.abs(jerks)) <= 4.0 + 1e-8
 
 
+def test_velocity_cap_preserves_jerk_limit_with_partial_final_jerk_step():
+    servo = make_servo(
+        max_tcp_velocity_m_s=1.0,
+        max_joint_velocity_rad_s=0.099,
+        max_joint_acceleration_rad_s2=0.3,
+        max_joint_jerk_rad_s3=8.0,
+    )
+    dt = 1.0 / 30.0
+    joints = np.array([0.0, 0.0, 0.0, 0.2, 0.5, -0.2])
+    target = wrist_fk(joints) + np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    velocities = []
+
+    for _ in range(14):
+        step = servo.step(joints, wrist_fk(joints), target, dt=dt)
+        next_joints = np.asarray(step.joint_target)
+        velocities.append((next_joints - joints) / dt)
+        joints = next_joints
+
+    accelerations = np.diff(np.asarray(velocities), axis=0) / dt
+    jerks = np.diff(accelerations, axis=0) / dt
+    assert np.max(np.abs(velocities)) <= 0.099 + 1e-8
+    assert np.max(np.abs(accelerations)) <= 0.3 + 1e-8
+    assert np.max(np.abs(jerks)) <= 8.0 + 1e-8
+
+
 def test_reset_seeds_zero_motion_without_first_frame_jump():
     servo = make_servo()
     joints = np.array([0.0, 0.0, 0.0, 0.1, 0.4, -0.1])
@@ -138,7 +163,7 @@ def test_so3_wraparound_uses_the_short_orientation_error():
 
 def test_repeated_singular_steps_keep_j4_and_j6_motion_continuous():
     servo = make_servo(max_joint_acceleration_rad_s2=100.0, max_joint_jerk_rad_s3=1000.0)
-    joints = np.array([0.0, 0.0, 0.0, 0.2, 0.0, -0.2])
+    joints = np.array([0.0, 0.0, 0.0, 0.2, 0.01, -0.2])
     target = wrist_fk(joints) + np.array([0.002, 0.0, 0.0, 0.0, 0.10, 0.0])
     wrist_velocities = []
 
@@ -149,7 +174,8 @@ def test_repeated_singular_steps_keep_j4_and_j6_motion_continuous():
         joints = next_joints
 
     wrist_velocities = np.asarray(wrist_velocities)
-    assert np.all(wrist_velocities[1:] * wrist_velocities[:-1] >= -1e-9)
+    assert np.all(np.abs(wrist_velocities) > 1e-6)
+    assert np.all(np.sign(wrist_velocities[1:]) == np.sign(wrist_velocities[:-1]))
     assert np.max(np.abs(wrist_velocities)) <= servo.config.max_joint_velocity_rad_s + 1e-8
 
 
