@@ -11,7 +11,8 @@ from __future__ import annotations
 import logging
 import math
 import time
-from dataclasses import dataclass, field
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, field
 from functools import cached_property
 from typing import Any, ClassVar, Literal
 
@@ -23,6 +24,12 @@ from lerobot.robots.robot import Robot
 from lerobot.robots.utils import ensure_safe_goal_position
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
+
+from .cartesian_servo import (
+    PiperCartesianServo,
+    PiperCartesianServoConfig,
+    PiperCartesianServoDiagnostics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +99,7 @@ class PiperRobotConfig(RobotConfig):
     eef_workspace_max_m: tuple[float, float, float] = (0.65, 0.65, 0.75)
     max_eef_target_lead_m: float | None = 0.005
     max_eef_target_lead_rad: float | None = math.radians(2.0)
+    cartesian_servo: PiperCartesianServoConfig = field(default_factory=PiperCartesianServoConfig)
 
     auto_enable: bool = True
     feedback_timeout_s: float = 2.0
@@ -107,6 +115,10 @@ class PiperRobotConfig(RobotConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if isinstance(self.cartesian_servo, dict):
+            self.cartesian_servo = PiperCartesianServoConfig(**self.cartesian_servo)
+        elif not isinstance(self.cartesian_servo, PiperCartesianServoConfig):
+            raise TypeError("PiperRobotConfig.cartesian_servo must be a PiperCartesianServoConfig")
         if not self.channel.strip():
             raise ValueError("PiperRobotConfig.channel must not be empty.")
         for field_name, choices in (
@@ -244,6 +256,11 @@ class PiperRobot(Robot):
         self.arm: Any | None = None
         self.gripper: Any | None = None
         self._joint_limits: dict[str, tuple[float, float]] | None = None
+        self._motion_mode: Literal["j", "p"] | None = None
+        self._cartesian_servo: PiperCartesianServo | None = None
+        self._cartesian_servo_diagnostics: PiperCartesianServoDiagnostics | None = None
+        self._last_eef_action_s: float | None = None
+        self._last_action_representation: Literal["joints", "eef"] | None = None
 
     @cached_property
     def observation_features(self) -> dict[str, Any]:
@@ -303,6 +320,7 @@ class PiperRobot(Robot):
             arm.connect()
             self._wait_for_initial_feedback()
             self.configure()
+            self.reset_cartesian_servo()
             if self.config.auto_enable:
                 self._enable_arm()
             for camera in self.cameras.values():
@@ -361,10 +379,29 @@ class PiperRobot(Robot):
         """Enable model limits and apply the global motion speed percentage."""
 
         if self.arm is not None:
+            self.arm.set_auto_set_motion_mode_enabled(False)
+            self._motion_mode = None
             self.arm.set_joint_limits_enabled(True)
             if not self.arm.get_joint_limits_enabled():
                 raise RuntimeError("pyAgxArm did not enable Piper model joint limits.")
             self._joint_limits = self._read_model_joint_limits()
+
+            def fk_tcp(joints: Sequence[float]) -> list[float]:
+                assert self.arm is not None
+                try:
+                    flange = self._validate_sdk_pose(self.arm.fk(list(joints)), "FK flange pose")
+                    tcp = self.arm.get_flange2tcp_pose(flange)
+                except Exception as exc:
+                    raise PiperFeedbackError(
+                        "Piper Cartesian servo FK failed; refusing to move."
+                    ) from exc
+                return self._validate_sdk_pose(tcp, "FK TCP pose")
+
+            self._cartesian_servo = PiperCartesianServo(
+                self.config.cartesian_servo,
+                joint_limits=[self._joint_limits[key] for key in self._JOINT_KEYS],
+                fk_tcp=fk_tcp,
+            )
             self.arm.set_speed_percent(self.config.speed_percent)
             self.arm.set_tcp_offset(list(self.config.tcp_offset))
 
@@ -415,9 +452,13 @@ class PiperRobot(Robot):
             finally:
                 arm.disconnect()
         finally:
+            self.reset_cartesian_servo()
             self.arm = None
             self.gripper = None
             self._joint_limits = None
+            self._motion_mode = None
+            self._cartesian_servo = None
+            self._last_action_representation = None
 
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
@@ -532,6 +573,14 @@ class PiperRobot(Robot):
             raise ValueError(f"Unsupported Piper action fields: {sorted(unknown)}")
         validated_action = {key: self._finite_action_value(key, value) for key, value in action.items()}
         representation = self._action_representation(action)
+        if (
+            representation is not None
+            and self._last_action_representation is not None
+            and representation != self._last_action_representation
+        ):
+            self.reset_cartesian_servo()
+        if representation is not None:
+            self._last_action_representation = representation
         if representation == "eef":
             return self._send_eef_action(validated_action)
 
@@ -580,6 +629,7 @@ class PiperRobot(Robot):
                 )
                 for key, value in applied.items()
             }
+            self._ensure_motion_mode("j")
             self.arm.move_j([applied[key] for key in self._JOINT_KEYS])
 
         applied.update(current_tcp)
@@ -634,14 +684,27 @@ class PiperRobot(Robot):
         requested_pose = [action[key] for key in self._EEF_KEYS]
         safe_pose = self._bound_eef_pose(current_pose, requested_pose)
 
-        try:
-            flange_target = self.arm.get_tcp2flange_pose(safe_pose)
-        except Exception as exc:  # nosec B110 - fail closed at the SDK conversion seam
-            raise PiperFeedbackError("Piper TCP-to-flange conversion failed; refusing to move.") from exc
-        flange_target = self._validate_sdk_pose(flange_target, "TCP-to-flange conversion")
-        self.arm.move_p(flange_target)
+        if self._cartesian_servo is None:
+            raise RuntimeError("Piper Cartesian servo is unavailable.")
+        now = time.monotonic()
+        dt = (
+            1.0 / 30.0
+            if self._last_eef_action_s is None
+            else min(max(now - self._last_eef_action_s, 1.0 / 120.0), 0.1)
+        )
+        step = self._cartesian_servo.step(
+            [current_joints[key] for key in self._JOINT_KEYS],
+            current_pose,
+            safe_pose,
+            dt=dt,
+        )
+        self._last_eef_action_s = now
+        self._cartesian_servo_diagnostics = step.diagnostics
+        joint_target = [self._quantize_joint_target(value) for value in step.joint_target]
+        self._ensure_motion_mode("j")
+        self.arm.move_j(joint_target)
 
-        applied: dict[str, float] = dict(current_joints)
+        applied: dict[str, float] = dict(zip(self._JOINT_KEYS, joint_target, strict=True))
         applied.update(dict(zip(self._EEF_KEYS, safe_pose, strict=True)))
         if self.config.include_gripper:
             assert prepared_gripper_width is not None
@@ -653,6 +716,25 @@ class PiperRobot(Robot):
                 )
             applied["gripper.pos"] = prepared_gripper_width
         return applied
+
+    def reset_cartesian_servo(self) -> None:
+        if self._cartesian_servo is not None:
+            self._cartesian_servo.reset()
+        self._cartesian_servo_diagnostics = None
+        self._last_eef_action_s = None
+
+    def cartesian_servo_status(self) -> dict[str, object]:
+        diagnostics = self._cartesian_servo_diagnostics
+        return {} if diagnostics is None else asdict(diagnostics)
+
+    def _ensure_motion_mode(self, mode: Literal["j", "p"]) -> None:
+        """Select an SDK motion mode once, keeping streamed targets uninterrupted."""
+
+        assert self.arm is not None
+        if self._motion_mode == mode:
+            return
+        self.arm.set_motion_mode(mode)
+        self._motion_mode = mode
 
     def _bound_eef_pose(self, current_pose: list[float], requested_pose: list[float]) -> list[float]:
         safe_position = [

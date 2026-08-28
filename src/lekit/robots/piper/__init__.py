@@ -1,3 +1,9 @@
+from .cartesian_servo import (
+    PiperCartesianServo,
+    PiperCartesianServoConfig,
+    PiperCartesianServoDiagnostics,
+    PiperCartesianServoStep,
+)
 from .piper_robot import (
     PiperCameraTimeoutError,
     PiperFeedbackError,
@@ -22,6 +28,10 @@ from .teleop_processor import (
 
 __all__ = [
     "PiperCameraTimeoutError",
+    "PiperCartesianServo",
+    "PiperCartesianServoConfig",
+    "PiperCartesianServoDiagnostics",
+    "PiperCartesianServoStep",
     "PiperFeedbackError",
     "PiperRobot",
     "PiperRobotConfig",

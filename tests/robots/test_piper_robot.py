@@ -8,6 +8,11 @@ import pytest
 from scipy.spatial.transform import Rotation
 
 from lekit.robots.piper import piper_robot as driver
+from lekit.robots.piper.cartesian_servo import (
+    PiperCartesianServoConfig,
+    PiperCartesianServoDiagnostics,
+    PiperCartesianServoStep,
+)
 
 CURRENT_TIME_S = 1_700_000_000.0
 
@@ -57,10 +62,13 @@ class FakeArm:
         self.tcp_feedback_timestamp: object = CURRENT_TIME_S
         self.tcp_offset = [0.0] * 6
         self.healthy = True
-        self.tcp2flange_result = None
-        self.tcp2flange_error = None
+        self.fk_result = [0.35, -0.10, 0.20, 0.10, -0.20, 0.30]
+        self.fk_error = None
+        self.flange2tcp_result = None
+        self.flange2tcp_error = None
         self.effector = FakeEffector()
         self.joint_limits_enabled = False
+        self.auto_set_motion_mode_enabled = True
         self._parser = SimpleNamespace(
             joint_12=object(),
             joint_34=object(),
@@ -106,6 +114,13 @@ class FakeArm:
     def set_speed_percent(self, percent: int) -> None:
         self.events.append(("set_speed_percent", percent))
 
+    def set_auto_set_motion_mode_enabled(self, enabled: bool) -> None:
+        self.auto_set_motion_mode_enabled = enabled
+        self.events.append(("set_auto_set_motion_mode_enabled", enabled))
+
+    def set_motion_mode(self, mode: str) -> None:
+        self.events.append(("set_motion_mode", mode))
+
     def set_joint_limits_enabled(self, enabled: bool) -> None:
         self.joint_limits_enabled = enabled
         self.events.append(("set_joint_limits_enabled", enabled))
@@ -139,20 +154,70 @@ class FakeArm:
             timestamp=self.tcp_feedback_timestamp,
         )
 
-    def get_tcp2flange_pose(self, tcp_pose: list[float]) -> list[float]:
-        self.events.append(("get_tcp2flange_pose", list(tcp_pose)))
-        if self.tcp2flange_error is not None:
-            raise self.tcp2flange_error
-        if self.tcp2flange_result is not None:
-            return self.tcp2flange_result
-        return [tcp_pose[0], tcp_pose[1], tcp_pose[2] - 0.10, *tcp_pose[3:]]
+    def fk(self, joints: list[float]) -> list[float]:
+        self.events.append(("fk", list(joints)))
+        if self.fk_error is not None:
+            raise self.fk_error
+        return self.fk_result
+
+    def get_flange2tcp_pose(self, flange_pose: list[float]) -> list[float]:
+        self.events.append(("get_flange2tcp_pose", list(flange_pose)))
+        if self.flange2tcp_error is not None:
+            raise self.flange2tcp_error
+        if self.flange2tcp_result is not None:
+            return self.flange2tcp_result
+        return [flange_pose[0], flange_pose[1], flange_pose[2] + 0.10, *flange_pose[3:]]
 
     def move_p(self, flange_pose: list[float]) -> None:
+        if self.auto_set_motion_mode_enabled:
+            self.set_motion_mode("p")
         self.events.append(("move_p", list(flange_pose)))
 
     def move_j(self, joints: list[float]) -> None:
+        if self.auto_set_motion_mode_enabled:
+            self.set_motion_mode("j")
         self.joints = list(joints)
         self.events.append(("move_j", list(joints)))
+
+
+class FakeCartesianServo:
+    instances: list[FakeCartesianServo] = []
+
+    def __init__(self, config, *, joint_limits, fk_tcp, **_kwargs) -> None:
+        self.config = config
+        self.joint_limits = tuple(joint_limits)
+        self.fk_tcp = fk_tcp
+        self.reset_count = 0
+        self.steps: list[tuple[list[float], list[float], list[float], float]] = []
+        self.instances.append(self)
+
+    def reset(self) -> None:
+        self.reset_count += 1
+
+    def step(self, measured_joints, measured_tcp, target_tcp, *, dt) -> PiperCartesianServoStep:
+        measured_joints = list(measured_joints)
+        measured_tcp = list(measured_tcp)
+        target_tcp = list(target_tcp)
+        self.steps.append((measured_joints, measured_tcp, target_tcp, dt))
+        self.fk_tcp(measured_joints)
+        diagnostics = PiperCartesianServoDiagnostics(
+            state="tracking",
+            minimum_singular_value=0.02,
+            damping=0.12,
+            orientation_scale=0.25,
+            position_error_m=0.01,
+            orientation_error_rad=0.02,
+            maximum_joint_velocity_rad_s=0.1,
+            solver_duration_ms=0.2,
+            joint_limit_saturated=False,
+        )
+        return PiperCartesianServoStep((0.01, 0.1, -0.2, 0.3, 0.0, 0.5), diagnostics)
+
+
+@pytest.fixture(autouse=True)
+def fake_cartesian_servo(monkeypatch):
+    FakeCartesianServo.instances.clear()
+    monkeypatch.setattr(driver, "PiperCartesianServo", FakeCartesianServo, raising=False)
 
 
 class FakeCamera:
@@ -222,6 +287,15 @@ def test_tcp_config_normalizes_valid_values():
     assert config.eef_workspace_max_m == (0.5, 0.4, 0.7)
     assert config.max_eef_target_lead_m == 0.0
     assert config.max_eef_target_lead_rad == 2.0
+
+
+def test_cartesian_servo_config_normalizes_json_mapping_and_rejects_other_types():
+    config = driver.PiperRobotConfig(cartesian_servo={"max_joint_velocity_rad_s": 0.25})
+
+    assert isinstance(config.cartesian_servo, PiperCartesianServoConfig)
+    assert config.cartesian_servo.max_joint_velocity_rad_s == pytest.approx(0.25)
+    with pytest.raises(TypeError, match="cartesian_servo"):
+        driver.PiperRobotConfig(cartesian_servo=object())
 
 
 def test_tcp_feedback_max_age_defaults_to_point_one_seconds():
@@ -431,6 +505,7 @@ def test_connect_builds_documented_sdk_config_and_initializes_effector_before_co
     assert arm.events == [
         ("init_effector", "agx_gripper"),
         ("connect",),
+        ("set_auto_set_motion_mode_enabled", False),
         ("set_joint_limits_enabled", True),
         ("set_speed_percent", 20),
         ("set_tcp_offset", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
@@ -561,7 +636,7 @@ def test_observation_uses_sdk_si_units_and_reads_camera(robot):
     assert np.all(observation["wrist"] == 7)
 
 
-def test_complete_tcp_action_is_bounded_converted_and_sent(robot):
+def test_tcp_action_uses_cartesian_servo_and_move_j(robot):
     piper, arm, _sdk_configs = robot
     piper.connect()
 
@@ -577,20 +652,176 @@ def test_complete_tcp_action_is_bounded_converted_and_sent(robot):
         }
     )
 
-    conversion_index = next(
-        index for index, event in enumerate(arm.events) if event[0] == "get_tcp2flange_pose"
-    )
-    move_index = next(index for index, event in enumerate(arm.events) if event[0] == "move_p")
-    tcp_target = arm.events[conversion_index][1]
-    flange_target = arm.events[move_index][1]
+    servo = FakeCartesianServo.instances[-1]
+    measured_joints, measured_tcp, tcp_target, dt = servo.steps[-1]
 
-    assert conversion_index < move_index
+    assert measured_joints == pytest.approx([0.0, 0.1, -0.2, 0.3, 0.4, 0.5])
+    assert measured_tcp == pytest.approx(arm.tcp_pose)
     assert np.linalg.norm(np.subtract(tcp_target[:3], arm.tcp_pose[:3])) <= 0.005 + 1e-12
-    assert flange_target == pytest.approx(
-        [tcp_target[0], tcp_target[1], tcp_target[2] - 0.10, *tcp_target[3:]]
-    )
+    assert dt == pytest.approx(1.0 / 30.0)
+    move_target = next(event[1] for event in arm.events if event[0] == "move_j")
+    assert not any(event[0] == "move_p" for event in arm.events)
+    assert [applied[key] for key in piper._JOINT_KEYS] == pytest.approx(move_target)
+    assert applied["joint_5.pos"] == pytest.approx(0.0)
     assert [applied[key] for key in piper._EEF_KEYS] == pytest.approx(tcp_target)
     assert arm.effector.moves == [(0.02, 1.0)]
+
+
+def test_eef_motion_mode_selects_joint_mode_once_across_repeated_frames(robot):
+    piper, arm, _sdk_configs = robot
+    piper.connect()
+    arm.events.clear()
+    tcp_action = dict(zip(piper._EEF_KEYS, arm.tcp_pose, strict=True))
+
+    piper.send_action(tcp_action)
+    piper.send_action(tcp_action)
+
+    assert [event for event in arm.events if event[0] == "set_motion_mode"] == [
+        ("set_motion_mode", "j"),
+    ]
+
+
+def test_cartesian_servo_receives_sdk_fk_tcp_adapter_and_model_limits(robot):
+    piper, arm, _sdk_configs = robot
+    piper.connect()
+    servo = FakeCartesianServo.instances[-1]
+    joints = [0.01, 0.1, -0.2, 0.3, 0.0, 0.5]
+
+    tcp = servo.fk_tcp(joints)
+
+    fk_index = next(index for index, event in enumerate(arm.events) if event == ("fk", joints))
+    tcp_index = next(
+        index
+        for index, event in enumerate(arm.events)
+        if event == ("get_flange2tcp_pose", arm.fk_result)
+    )
+    assert fk_index < tcp_index
+    assert tcp == pytest.approx([0.35, -0.10, 0.30, 0.10, -0.20, 0.30])
+    assert servo.joint_limits == (
+        (-2.617994, 2.617994),
+        (0.0, 3.141593),
+        (-2.967060, 0.0),
+        (-1.745330, 1.745330),
+        (-1.221730, 1.221730),
+        (-2.094396, 2.094396),
+    )
+
+
+def test_requested_gripper_is_prepared_before_servo_motion_and_sent_after(robot):
+    piper, arm, _sdk_configs = robot
+    piper.connect()
+    arm.events.clear()
+    servo = FakeCartesianServo.instances[-1]
+
+    class RecordingWidth(float):
+        def __gt__(self, other):
+            arm.events.append(("prepare_gripper",))
+            return super().__gt__(other)
+
+        def __lt__(self, other):
+            arm.events.append(("prepare_gripper",))
+            return super().__lt__(other)
+
+    piper.config.gripper_min_width_m = RecordingWidth(0.0)
+    piper.config.gripper_max_width_m = RecordingWidth(0.07)
+    original_step = servo.step
+    original_move_gripper = arm.effector.move_gripper_m
+
+    def recording_step(*args, **kwargs):
+        arm.events.append(("servo_step",))
+        return original_step(*args, **kwargs)
+
+    def recording_move_gripper(*, value: float, force: float) -> None:
+        arm.events.append(("move_gripper", value, force))
+        original_move_gripper(value=value, force=force)
+
+    servo.step = recording_step
+    arm.effector.move_gripper_m = recording_move_gripper
+    action = dict(zip(piper._EEF_KEYS, arm.tcp_pose, strict=True))
+
+    applied = piper.send_action(action | {"gripper.pos": 0.20})
+
+    prepare_index = next(index for index, event in enumerate(arm.events) if event[0] == "prepare_gripper")
+    step_index = next(index for index, event in enumerate(arm.events) if event[0] == "servo_step")
+    move_index = next(index for index, event in enumerate(arm.events) if event[0] == "move_j")
+    gripper_index = next(index for index, event in enumerate(arm.events) if event[0] == "move_gripper")
+    assert prepare_index < step_index < move_index < gripper_index
+    assert arm.events[gripper_index][1:] == pytest.approx((0.07, 1.0))
+    assert applied["gripper.pos"] == pytest.approx(0.07)
+
+
+@pytest.mark.parametrize(
+    "fk_result",
+    [
+        [0.0] * 5,
+        ["invalid", 0.0, 0.0, 0.0, 0.0, 0.0],
+        [float("nan"), 0.0, 0.0, 0.0, 0.0, 0.0],
+    ],
+)
+def test_malformed_fk_output_rejects_cartesian_action_before_move_j(robot, fk_result):
+    piper, arm, _sdk_configs = robot
+    piper.connect()
+    arm.events.clear()
+    arm.effector.moves.clear()
+    arm.fk_result = fk_result
+
+    with pytest.raises(driver.PiperFeedbackError, match="Cartesian servo FK failed"):
+        piper.send_action(dict(zip(piper._EEF_KEYS, arm.tcp_pose, strict=True)) | {"gripper.pos": 0.02})
+
+    assert any(event[0] == "fk" for event in arm.events)
+    assert not any(event[0] in {"move_j", "move_p"} for event in arm.events)
+    assert arm.effector.moves == []
+
+
+def test_switching_from_eef_to_explicit_joints_resets_cartesian_servo(robot):
+    piper, arm, _sdk_configs = robot
+    piper.connect()
+    servo = FakeCartesianServo.instances[-1]
+    initial_resets = servo.reset_count
+
+    piper.send_action(dict(zip(piper._EEF_KEYS, arm.tcp_pose, strict=True)))
+    piper.send_action({"joint_1.pos": arm.joints[0]})
+
+    assert servo.reset_count == initial_resets + 1
+
+
+def test_connect_and_disconnect_reset_and_clear_cartesian_servo(robot):
+    piper, arm, _sdk_configs = robot
+
+    piper.connect()
+    servo = FakeCartesianServo.instances[-1]
+    assert servo.reset_count == 1
+    piper.send_action(dict(zip(piper._EEF_KEYS, arm.tcp_pose, strict=True)))
+    assert piper.cartesian_servo_status()
+
+    piper.disconnect()
+
+    assert servo.reset_count == 2
+    assert piper._cartesian_servo is None
+    assert piper.cartesian_servo_status() == {}
+
+
+def test_cartesian_servo_status_is_plain_mapping_and_empty_before_first_step(robot):
+    piper, arm, _sdk_configs = robot
+    assert piper.cartesian_servo_status() == {}
+    piper.connect()
+    assert piper.cartesian_servo_status() == {}
+
+    piper.send_action(dict(zip(piper._EEF_KEYS, arm.tcp_pose, strict=True)))
+
+    status = piper.cartesian_servo_status()
+    assert type(status) is dict
+    assert status == {
+        "state": "tracking",
+        "minimum_singular_value": 0.02,
+        "damping": 0.12,
+        "orientation_scale": 0.25,
+        "position_error_m": 0.01,
+        "orientation_error_rad": 0.02,
+        "maximum_joint_velocity_rad_s": 0.1,
+        "solver_duration_ms": 0.2,
+        "joint_limit_saturated": False,
+    }
 
 
 def test_joint_and_tcp_fields_cannot_be_mixed(robot):
@@ -615,7 +846,7 @@ def test_partial_tcp_action_is_rejected(robot):
     assert arm.effector.moves == []
 
 
-def test_invalid_gripper_rejects_before_move_p(robot):
+def test_invalid_gripper_rejects_before_cartesian_motion(robot):
     piper, arm, _sdk_configs = robot
     piper.connect()
 
@@ -650,7 +881,7 @@ def test_tcp_translation_is_clamped_to_workspace(monkeypatch):
         }
     )
 
-    tcp_target = next(event[1] for event in arm.events if event[0] == "get_tcp2flange_pose")
+    tcp_target = FakeCartesianServo.instances[-1].steps[-1][2]
     assert tcp_target[:3] == pytest.approx([0.40, 0.5, 0.10])
 
 
@@ -673,7 +904,7 @@ def test_tcp_target_lead_is_limited_from_measured_pose(monkeypatch):
         }
     )
 
-    tcp_target = next(event[1] for event in arm.events if event[0] == "get_tcp2flange_pose")
+    tcp_target = FakeCartesianServo.instances[-1].steps[-1][2]
     assert np.linalg.norm(np.subtract(tcp_target[:3], arm.tcp_pose[:3])) == pytest.approx(0.01)
 
 
@@ -697,7 +928,7 @@ def test_tcp_rotation_uses_shortest_so3_limit_across_euler_wrap(monkeypatch):
         }
     )
 
-    tcp_target = next(event[1] for event in arm.events if event[0] == "get_tcp2flange_pose")
+    tcp_target = FakeCartesianServo.instances[-1].steps[-1][2]
     rotation_delta = (
         Rotation.from_euler("xyz", tcp_target[3:]) * Rotation.from_euler("xyz", arm.tcp_pose[3:]).inv()
     )
@@ -737,7 +968,8 @@ def test_stale_tcp_feedback_rejects_cartesian_and_gripper_before_dispatch(robot)
             }
         )
 
-    assert not any(event[0] in {"get_tcp2flange_pose", "move_p"} for event in arm.events)
+    assert FakeCartesianServo.instances[-1].steps == []
+    assert not any(event[0] in {"move_j", "move_p"} for event in arm.events)
     assert arm.effector.moves == []
 
 
@@ -763,11 +995,12 @@ def test_tcp_workspace_rejects_lead_limited_target_when_current_tcp_is_outside(m
             }
         )
 
-    assert not any(event[0] in {"get_tcp2flange_pose", "move_p"} for event in arm.events)
+    assert FakeCartesianServo.instances[-1].steps == []
+    assert not any(event[0] in {"move_j", "move_p"} for event in arm.events)
     assert arm.effector.moves == []
 
 
-def test_tcp_action_rejects_missing_gripper_before_conversion(robot):
+def test_tcp_action_rejects_missing_gripper_before_servo(robot):
     piper, arm, _sdk_configs = robot
     piper.connect()
     piper.gripper = None
@@ -776,11 +1009,12 @@ def test_tcp_action_rejects_missing_gripper_before_conversion(robot):
     with pytest.raises(driver.PiperFeedbackError, match="gripper"):
         piper.send_action({**dict.fromkeys(piper._EEF_KEYS, 0.0), "gripper.pos": 0.02})
 
-    assert not any(event[0] in {"get_tcp2flange_pose", "move_p"} for event in arm.events)
+    assert FakeCartesianServo.instances[-1].steps == []
+    assert not any(event[0] in {"move_j", "move_p"} for event in arm.events)
     assert arm.effector.moves == []
 
 
-def test_tcp_action_reads_current_gripper_before_conversion(robot):
+def test_tcp_action_reads_current_gripper_before_servo(robot):
     piper, arm, _sdk_configs = robot
     piper.connect()
     arm.events.clear()
@@ -791,47 +1025,53 @@ def test_tcp_action_reads_current_gripper_before_conversion(robot):
         return original_get_status()
 
     arm.effector.get_gripper_status = recording_get_status
+    servo = FakeCartesianServo.instances[-1]
+    original_step = servo.step
+
+    def recording_step(*args, **kwargs):
+        arm.events.append(("servo_step",))
+        return original_step(*args, **kwargs)
+
+    servo.step = recording_step
     piper.send_action(dict.fromkeys(piper._EEF_KEYS, 0.0))
 
     read_index = next(index for index, event in enumerate(arm.events) if event[0] == "read_gripper")
-    conversion_index = next(
-        index for index, event in enumerate(arm.events) if event[0] == "get_tcp2flange_pose"
-    )
-    move_index = next(index for index, event in enumerate(arm.events) if event[0] == "move_p")
-    assert read_index < conversion_index < move_index
+    servo_index = next(index for index, event in enumerate(arm.events) if event[0] == "servo_step")
+    move_index = next(index for index, event in enumerate(arm.events) if event[0] == "move_j")
+    assert read_index < servo_index < move_index
 
 
-def test_tcp_conversion_exception_rejects_before_motion(robot):
+def test_tcp_fk_exception_rejects_before_motion(robot):
     piper, arm, _sdk_configs = robot
     piper.connect()
-    arm.tcp2flange_error = RuntimeError("conversion failed")
+    arm.fk_error = RuntimeError("FK failed")
 
-    with pytest.raises(driver.PiperFeedbackError, match="conversion"):
+    with pytest.raises(driver.PiperFeedbackError, match="Cartesian servo FK failed"):
         piper.send_action(dict.fromkeys(piper._EEF_KEYS, 0.0) | {"gripper.pos": 0.02})
 
-    assert any(event[0] == "get_tcp2flange_pose" for event in arm.events)
-    assert not any(event[0] == "move_p" for event in arm.events)
+    assert any(event[0] == "fk" for event in arm.events)
+    assert not any(event[0] in {"move_j", "move_p"} for event in arm.events)
     assert arm.effector.moves == []
 
 
 @pytest.mark.parametrize(
-    "tcp2flange_result",
+    "flange2tcp_result",
     [
         [0.0] * 5,
         ["invalid", 0.0, 0.0, 0.0, 0.0, 0.0],
         [float("nan"), 0.0, 0.0, 0.0, 0.0, 0.0],
     ],
 )
-def test_malformed_tcp_conversion_result_rejects_before_motion(robot, tcp2flange_result):
+def test_malformed_fk_tcp_conversion_result_rejects_before_motion(robot, flange2tcp_result):
     piper, arm, _sdk_configs = robot
     piper.connect()
-    arm.tcp2flange_result = tcp2flange_result
+    arm.flange2tcp_result = flange2tcp_result
 
-    with pytest.raises(driver.PiperFeedbackError, match="TCP-to-flange conversion"):
+    with pytest.raises(driver.PiperFeedbackError, match="FK TCP pose"):
         piper.send_action(dict.fromkeys(piper._EEF_KEYS, 0.0) | {"gripper.pos": 0.02})
 
-    assert any(event[0] == "get_tcp2flange_pose" for event in arm.events)
-    assert not any(event[0] == "move_p" for event in arm.events)
+    assert any(event[0] == "get_flange2tcp_pose" for event in arm.events)
+    assert not any(event[0] in {"move_j", "move_p"} for event in arm.events)
     assert arm.effector.moves == []
 
 
