@@ -58,5 +58,10 @@ while true; do sleep 0.1; done
     commands = command_log.read_text(encoding="utf-8").splitlines()
     assert any(line.startswith("run lekit hub ") for line in commands)
     assert any(line.startswith("run lekit teleop ") for line in commands)
-    assert any(line.startswith("run lekit robot ") for line in commands)
+    robot_command = next(line for line in commands if line.startswith("run lekit robot "))
+    assert "--control-rate-hz 30" in robot_command
+    assert "--processor.translation_scale 1.0" in robot_command
+    assert "--processor.rotation_scale 0.1" in robot_command
+    assert "--processor.max_translation_from_anchor_m 0.10" in robot_command
+    assert "--processor.max_rotation_from_anchor_rad 0.17453292519943295" in robot_command
     assert "192.168.5.24" in result.stdout

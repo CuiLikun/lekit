@@ -33,6 +33,7 @@ _PIPER_ROBOT_FIELDS = (
     "eef_workspace_max_m",
     "max_eef_target_lead_m",
     "max_eef_target_lead_rad",
+    "cartesian_servo",
     "auto_enable",
     "feedback_timeout_s",
     "feedback_poll_interval_s",

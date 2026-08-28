@@ -1,5 +1,28 @@
 {
   "channel": "can0",
+  "speed_percent": 10,
+  "max_eef_target_lead_m": 0.005,
+  "max_eef_target_lead_rad": 0.017453292519943295,
+  "cartesian_servo": {
+    "position_gain_s": 4.0,
+    "orientation_gain_s": 4.0,
+    "max_tcp_velocity_m_s": 0.1,
+    "max_tcp_angular_velocity_rad_s": 0.5,
+    "max_joint_velocity_rad_s": 0.5,
+    "max_joint_acceleration_rad_s2": 1.5,
+    "max_joint_jerk_rad_s3": 8.0,
+    "joint_limit_margin_rad": 0.17453292519943295,
+    "jacobian_step_rad": 0.0001,
+    "characteristic_length_m": 0.25,
+    "singular_value_low": 0.03,
+    "singular_value_high": 0.12,
+    "minimum_orientation_scale": 0.15,
+    "minimum_damping": 0.005,
+    "maximum_damping": 0.15
+  },
+  "gripper_force_n": 1.0,
+  "gripper_min_width_m": 0.0,
+  "gripper_max_width_m": 0.05,
   "cameras": {
     "HAND_VIEW": {
       "type": "realsense",
