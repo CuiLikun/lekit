@@ -5,11 +5,13 @@ from __future__ import annotations
 import math
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
+from ipaddress import ip_address
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+from urllib.parse import urlsplit
 
 PROTOCOL_VERSION = 1
 
@@ -102,6 +104,58 @@ def _require_text_tuple(name: str, value: object) -> tuple[str, ...]:
     return value
 
 
+def _browser_ipv4_value(host: str) -> int | None:
+    """Return a browser-style numeric IPv4 host value, or None for non-numeric hosts."""
+    parts = (host[:-1] if host.endswith(".") else host).split(".")
+    if not 1 <= len(parts) <= 4:
+        return None
+    numbers: list[int] = []
+    for part in parts:
+        if not part:
+            return None
+        if part[:2].lower() == "0x":
+            digits, base = part[2:], 16
+        elif len(part) > 1 and part[0] == "0":
+            digits, base = part[1:], 8
+        else:
+            digits, base = part, 10
+        if not digits:
+            return None
+        try:
+            numbers.append(int(digits, base))
+        except ValueError:
+            return None
+    if any(number > 255 for number in numbers[:-1]):
+        return None
+    if numbers[-1] >= 256 ** (5 - len(numbers)):
+        return None
+    return sum(number << (8 * (3 - index)) for index, number in enumerate(numbers[:-1])) + numbers[-1]
+
+
+def _require_advertised_http_url(name: str, value: object) -> str:
+    url = _require_text(name, value)
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError(f"{name} must be an HTTP(S) URL") from error
+    if parsed.scheme not in {"http", "https"} or host in {None, "*"}:
+        raise ValueError(f"{name} must be an advertised HTTP(S) URL")
+    if _browser_ipv4_value(host) == 0:
+        raise ValueError(f"{name} must be an advertised HTTP(S) URL")
+    try:
+        address = ip_address(host)
+    except ValueError:
+        pass
+    else:
+        if address.is_unspecified:
+            raise ValueError(f"{name} must be an advertised HTTP(S) URL")
+    if port is not None and port < 1:
+        raise ValueError(f"{name} must be an advertised HTTP(S) URL")
+    return url
+
+
 def _normalize_json_value(value: object, *, feature_metadata: bool = False) -> Any:
     if feature_metadata and value is float:
         return "float"
@@ -158,6 +212,45 @@ def normalize_feature_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
 
 
 @dataclass(frozen=True, slots=True)
+class CameraStreamDescriptor:
+    """One browser-reachable camera stream advertised by a Robot node."""
+
+    name: str
+    stream_url: str
+    width: int
+    height: int
+    fps: float
+
+    def __post_init__(self) -> None:
+        _require_text("name", self.name)
+        _require_advertised_http_url("stream_url", self.stream_url)
+        _require_positive_int("width", self.width)
+        _require_positive_int("height", self.height)
+        _require_finite_positive("fps", self.fps)
+
+
+@dataclass(frozen=True, slots=True)
+class NodePresentation:
+    """Low-rate browser presentation metadata for a registered node."""
+
+    monitor_url: str | None = None
+    video_status_url: str | None = None
+    cameras: tuple[CameraStreamDescriptor, ...] = ()
+
+    def __post_init__(self) -> None:
+        for name in ("monitor_url", "video_status_url"):
+            value = getattr(self, name)
+            if value is not None:
+                _require_advertised_http_url(name, value)
+        if not isinstance(self.cameras, tuple) or not all(
+            isinstance(camera, CameraStreamDescriptor) for camera in self.cameras
+        ):
+            raise ValueError("cameras must be a tuple of CameraStreamDescriptor")
+        if len({camera.name for camera in self.cameras}) != len(self.cameras):
+            raise ValueError("camera names must be unique")
+
+
+@dataclass(frozen=True, slots=True)
 class NodeDescriptor:
     protocol_version: int
     schema_version: int
@@ -174,6 +267,7 @@ class NodeDescriptor:
     action_features: Mapping[str, Any]
     software_version: str
     diagnostics: Mapping[str, Any]
+    presentation: NodePresentation = field(default_factory=NodePresentation)
 
     def __post_init__(self) -> None:
         _require_positive_int("protocol_version", self.protocol_version)
@@ -188,6 +282,8 @@ class NodeDescriptor:
             _require_text_tuple(name, getattr(self, name))
         if self.action_endpoint is not None:
             _require_text("action_endpoint", self.action_endpoint)
+        if not isinstance(self.presentation, NodePresentation):
+            raise ValueError("presentation must be a NodePresentation")
         if self.role is NodeRole.CONTROLLER:
             if self.action_endpoint is None:
                 raise ValueError("controller action_endpoint must not be empty")

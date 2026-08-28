@@ -382,6 +382,7 @@ def unregistered_node(
     processor: FakeProcessor,
     *,
     hold=None,
+    observation_sinks=(),
 ) -> RobotNode:
     node = RobotNode(
         robot,
@@ -393,6 +394,7 @@ def unregistered_node(
         ),
         runtime=runtime,
         hold=hold,
+        observation_sinks=observation_sinks,
         monotonic_ns=clock.monotonic_ns,
         utc_ns=clock.utc_ns,
     )
@@ -426,6 +428,11 @@ def test_start_connects_once_registers_real_features_and_starts_in_hold(
     assert descriptor["observation_features"] == {"x": "float"}
     assert descriptor["action_features"] == {"x": "float"}
     assert descriptor["administratively_enabled"] is True
+    assert descriptor["presentation"] == {
+        "monitor_url": None,
+        "video_status_url": None,
+        "cameras": (),
+    }
     assert robot_node.control_state is RobotControlState.HOLD
 
 
@@ -541,6 +548,60 @@ def test_valid_action_uses_nonblocking_receiver_and_standard_robot_path(
     assert robot_node.stream_session_id == "stream-1"
 
 
+def test_observation_sink_failure_is_diagnostic_and_does_not_prevent_valid_action(
+    tmp_path: Path,
+    clock: Clock,
+    runtime: RecordingRuntime,
+    robot: FakeRobot,
+    processor: FakeProcessor,
+) -> None:
+    published: list[tuple[dict[str, float], int]] = []
+
+    class RaisingSink:
+        def publish(self, observation: dict[str, float], *, captured_monotonic_ns: int) -> None:
+            del observation, captured_monotonic_ns
+            raise RuntimeError("camera unavailable")
+
+    class RecordingSink:
+        def publish(self, observation: dict[str, float], *, captured_monotonic_ns: int) -> None:
+            published.append((dict(observation), captured_monotonic_ns))
+
+    node = unregistered_node(
+        tmp_path,
+        clock,
+        runtime,
+        robot,
+        processor,
+        observation_sinks=(RaisingSink(), RecordingSink()),
+    )
+    node.receive_management(registered(node, runtime))
+    handle = ControlHandle(
+        handle_id="sink-handle",
+        hub_epoch="hub-epoch-1",
+        robot_id=node.node_id,
+        robot_session_id=node.session_id,
+        controller_id="controller-1",
+        controller_session_id="controller-session-1",
+        controller_action_endpoint="memory://sink-actions",
+        action_schema="lekit.action.v1",
+        control_mode="teleop",
+        fencing_token=1,
+        issued_at_ns=clock.utc_ns(),
+        expires_at_ns=clock.utc_ns() + 3_000_000_000,
+    )
+    try:
+        receiver = activate(node, runtime, handle)
+        inject(receiver, envelope(handle), clock)
+
+        node.run_cycle()
+
+        assert published == [({"x": 0.25}, 0)]
+        assert robot.sent == [{"x": 0.5}]
+        assert node.status["observation_sink_errors"] == {"RuntimeError: camera unavailable": 1}
+    finally:
+        node.stop()
+
+
 def test_status_includes_processor_observability_and_rejection_counters(
     robot_node: RobotNode,
     processor: FakeProcessor,
@@ -574,6 +635,7 @@ def test_management_status_carries_coalesced_robot_diagnostics(
     status = messages(runtime, "status")[-1].body
     assert status["diagnostics"] == {
         "rejections": {"stale_action": 3},
+        "observation_sink_errors": {},
         "robot_connected": robot.is_connected,
     }
 
@@ -683,6 +745,29 @@ def test_watchdog_uses_received_monotonic_time_not_controller_capture_clock(
     assert robot_node.control_state is RobotControlState.HOLD
     assert processor.reset_count == resets_after_control + 1
     assert robot_node.rejections["stale_action"] == 1
+
+
+def test_watchdog_waits_for_first_action_before_timing_stream_staleness(
+    robot_node: RobotNode,
+    robot: FakeRobot,
+    runtime: RecordingRuntime,
+    clock: Clock,
+    handle: ControlHandle,
+) -> None:
+    receiver = activate(robot_node, runtime, handle)
+
+    clock.advance(0.101)
+    robot_node.run_cycle()
+
+    assert receiver.closed is False
+    assert robot_node.rejections["stale_action"] == 0
+    assert robot_node.status["report"]["frame_age_ms"] is None
+
+    inject(receiver, envelope(handle), clock)
+    robot_node.run_cycle()
+
+    assert robot_node.control_state is RobotControlState.CONTROLLING
+    assert robot.sent == [{"x": 0.5}]
 
 
 def test_empty_processor_output_does_not_reset_on_each_idle_frame_but_resets_on_transition(
@@ -817,6 +902,27 @@ def test_processor_and_action_validation_never_forward_invalid_output(
     assert robot.sent == []
     assert robot_node.control_state is RobotControlState.HOLD
     assert robot_node.rejections[reason] == 1
+
+
+def test_unarmed_processor_is_reported_as_safe_hold_instead_of_a_fault(
+    robot_node: RobotNode,
+    robot: FakeRobot,
+    processor: FakeProcessor,
+    runtime: RecordingRuntime,
+    clock: Clock,
+    handle: ControlHandle,
+) -> None:
+    receiver = activate(robot_node, runtime, handle)
+    processor.outputs.append({})
+    inject(receiver, envelope(handle), clock)
+
+    robot_node.run_cycle()
+
+    assert robot.sent == []
+    assert robot_node.control_state is RobotControlState.HOLD
+    assert robot_node.status["report"]["error"] is None
+    assert robot_node.status["report"]["handle_id"] == handle.handle_id
+    assert not receiver.closed
 
 
 def test_action_validation_accepts_a_supported_feature_subset(

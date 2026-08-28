@@ -3,52 +3,56 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Lekit Hub</title>
+  <title>LeHub</title>
   <style>
-    :root { color-scheme: dark; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-    body { margin: 1rem; background: #111827; color: #e5e7eb; }
-    h1, h2 { margin: .6rem 0; } .connection { color: #93c5fd; }
-    .panel { margin: 1rem 0; overflow-x: auto; border: 1px solid #374151; border-radius: .4rem; }
-    table { width: 100%; min-width: 1680px; table-layout: fixed; border-collapse: collapse; }
-    th, td { padding: .45rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-bottom: 1px solid #374151; text-align: left; }
-    th { color: #93c5fd; background: #1f2937; } .badge { padding: .15rem .35rem; border-radius: .25rem; background: #374151; }
-    .mismatch { color: #fde68a; } .safety { color: #fff; background: #b91c1c; padding: .5rem; font-weight: bold; }
-    button { margin-right: .25rem; } .danger { color: #fecaca; } #history { white-space: pre-wrap; padding: .75rem; }
+    :root { font-family: Inter, system-ui, sans-serif; color:#172033; --brand:#ff9d00; --line:#e4e9f1; --muted:#66758b; --live:#129b70; --fault:#db3d5d; }
+    * { box-sizing:border-box } body { margin:0; background:#fff; } button { font:inherit; cursor:pointer; }
+    header { display:grid; grid-template-columns:1fr auto 1fr; align-items:center; height:58px; padding:0 24px; border-bottom:1px solid var(--line); }
+    h1 { margin:0; color:var(--brand); font-size:28px; letter-spacing:-.06em; } #robot-identity { text-align:center; font-size:14px; } .tools { justify-self:end; display:flex; gap:8px; }
+    .icon { width:36px; height:36px; border:1px solid var(--line); border-radius:8px; background:#fff; } .icon:disabled { opacity:.45; cursor:default; }
+    main { width:min(100% - 40px, 1400px); margin:0 auto; padding:18px 0 28px; } #status { min-height:20px; margin-bottom:12px; color:var(--muted); font:700 11px/1 ui-monospace,monospace; text-align:center; text-transform:uppercase; }
+    #camera-stage { display:flex; justify-content:center; align-items:flex-start; gap:16px; min-height:480px; overflow:auto; padding:2px 0 12px; }
+    .camera { position:relative; flex:0 0 640px; width:640px; height:480px; overflow:hidden; border:1px solid var(--line); border-radius:10px; background:#edf1f5; } .camera img { display:block; width:640px; height:480px; object-fit:none; }
+    .camera span { position:absolute; bottom:12px; padding:6px 8px; border-radius:6px; color:#fff; background:rgba(23,32,51,.72); font:700 10px/1 ui-monospace,monospace; text-transform:uppercase; } .camera .name { left:12px; } .camera .state { right:12px; } .camera .fps { top:12px; right:12px; bottom:auto; min-width:68px; text-align:right; } .camera .state.live { background:rgba(18,155,112,.9); } .camera .state.stale { background:rgba(217,133,8,.9); } .camera .state.offline { background:rgba(219,61,93,.9); }
+    .empty { display:grid; width:100%; min-height:120px; place-items:center; color:var(--muted); text-align:center; } #runtime-panel { display:grid; grid-template-columns:1.3fr 1fr; border:1px solid var(--line); border-radius:10px; overflow:hidden; } .pipeline { display:flex; align-items:center; gap:8px; padding:17px; border-right:1px solid var(--line); } .pipeline div { flex:1; min-width:0; } .pipeline b,.pipeline small { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .pipeline small { margin-top:5px; color:var(--muted); font:700 10px/1 ui-monospace,monospace; text-transform:uppercase; } .arrow { color:var(--brand); } .metrics { display:grid; grid-template-columns:repeat(2,1fr); gap:12px; padding:16px; } .metrics small { display:block; color:var(--muted); font:700 10px/1 ui-monospace,monospace; text-transform:uppercase; } .metrics b { display:block; margin-top:5px; font-size:13px; } .agent { grid-column:1 / -1; color:var(--muted); font-size:12px; }
+    #log-panel { position:fixed; right:20px; top:72px; bottom:20px; width:min(900px,calc(100vw - 40px)); padding:16px; overflow:auto; border:1px solid var(--line); border-radius:10px; background:#fff; box-shadow:0 16px 45px rgba(23,32,51,.16); } #history { white-space:pre-wrap; font:12px/1.45 ui-monospace,monospace; } @media(max-width:1050px){ #runtime-panel { grid-template-columns:1fr; }.pipeline { border-right:0; border-bottom:1px solid var(--line); } }
   </style>
 </head>
 <body>
-  <h1>Lekit Hub <span id="connection" class="connection">connecting</span></h1>
-  <div id="alerts"></div>
-  <h2>Inventory and control state</h2>
-  <div class="panel"><table><thead><tr>
-    <th style="width:8%">Node</th><th style="width:4%">Role</th><th style="width:8%">Capabilities</th><th style="width:6%">Runtime</th><th style="width:6%">Control</th>
-    <th style="width:7%">Session</th><th style="width:7%">Assignment</th><th style="width:7%">Handle</th><th style="width:4%">TTL</th>
-    <th style="width:4%">Rate</th><th style="width:6%">Frame age</th><th style="width:5%">Sequence</th><th style="width:5%">Connected</th><th style="width:5%">Tracking</th><th style="width:5%">Engaged</th><th style="width:6%">Processor</th><th style="width:7%">Error</th><th style="width:8%">Actions</th>
-  </tr></thead><tbody id="rows"></tbody></table></div>
-  <h2>History</h2><div id="history" class="panel">No history loaded.</div>
+  <header>
+    <h1>LeHub</h1>
+    <strong id="robot-identity">Waiting for robot</strong>
+    <div class="tools">
+      <button id="quest-controller" class="icon" title="Quest 3 monitor" aria-label="Open Quest 3 monitor" disabled>🎮</button>
+      <button id="log-button" class="icon" title="Diagnostics" aria-label="Open diagnostics">☰</button>
+    </div>
+  </header>
+  <main>
+    <div id="status">Connecting to Hub</div>
+    <section id="camera-stage" aria-label="Robot camera streams"><div class="empty">Waiting for camera metadata.</div></section>
+    <section id="runtime-panel" aria-label="Control runtime">
+      <div class="pipeline"><div><b>Quest 3</b><small id="quest-state">—</small></div><span class="arrow">→</span><div><b>Retarget</b><small id="retarget-state">—</small></div><span class="arrow">→</span><div><b>Safety</b><small id="safety-state">—</small></div><span class="arrow">→</span><div><b>Piper</b><small id="piper-state">—</small></div></div>
+      <div class="metrics"><div><small>Handle</small><b id="handle-state">—</b></div><div><small>Action rate</small><b id="action-rate">—</b></div><div><small>Frame age</small><b id="frame-age">—</b></div><div><small>Robot state</small><b id="hold-state">—</b></div><div class="agent">Manual teleoperation · No agent assigned</div></div>
+    </section>
+  </main>
+  <section id="log-panel" hidden><button id="log-close" type="button">Close</button><pre id="history">No diagnostics loaded.</pre></section>
   <script>
-    const rows = document.querySelector('#rows'), alerts = document.querySelector('#alerts'), connection = document.querySelector('#connection');
-    const post = async (path, body) => { const response = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: body ? JSON.stringify(body) : undefined}); if (!response.ok) alert(await response.text()); return response; };
-    const value = input => input == null ? '—' : String(input);
-    const boolean = input => input == null ? '—' : input ? 'yes' : 'no';
-    const isSafetyCode = code => code === 'robot_safety_with_active_desire' || String(code || '').includes('safety');
-    const controlsFor = (controls, node) => controls.find(control => control.robot_id === node.descriptor?.node_id || control.controller_id === node.descriptor?.node_id);
-    const cell = (row, content, className = '') => { const element = document.createElement('td'); element.textContent = value(content); if (className) element.className = className; row.append(element); };
-    const actionButton = (action, label, data) => { const button = document.createElement('button'); button.dataset.action = action; Object.entries(data).forEach(([key, item]) => button.dataset[key] = item); button.textContent = label; return button; };
-    rows.addEventListener('click', event => { if (!(event.target instanceof Element)) return; const button = event.target.closest('button[data-action]'); if (!button) return; const {action, handle, robot} = button.dataset; if (action === 'hold') { const reason = prompt(`Force HOLD ${robot}: state the reason`); if (reason?.trim() && confirm(`Force HOLD ${robot}?`)) post(`/api/robots/${encodeURIComponent(robot)}/force-hold`, {reason}); } else if (action === 'revoke') { const reason = prompt(`Revoke ${handle}: state the reason`); if (reason?.trim() && confirm(`Revoke ${handle}?`)) post(`/api/handles/${encodeURIComponent(handle)}/revoke`, {reason}); } else if (action === 'take-over' || action === 'hand-over') post(`/api/handles/${encodeURIComponent(handle)}/${action}`, undefined); });
-    const render = state => {
-      const now = Date.now() * 1e6, controls = state.controls || [];
-      const alertFragment = document.createDocumentFragment();
-      (state.alerts || []).forEach(alert => { const element = document.createElement('div'); element.className = isSafetyCode(alert.code) ? 'safety' : 'mismatch'; element.textContent = `${value(alert.code || 'alert')}: ${value(alert.message || alert.reason || '')}`; alertFragment.append(element); });
-      alerts.replaceChildren(alertFragment);
-      const rowFragment = document.createDocumentFragment();
-      (state.nodes || []).forEach(node => { const descriptor = node.descriptor || {}, report = node.report || {}, control = controlsFor(controls, node), mismatch = control?.mismatch_codes?.join(', ') || '', safetyMismatch = (control?.mismatch_codes || []).some(isSafetyCode), ttl = control ? Math.max(0, (control.expires_at_ns - now) / 1e9).toFixed(1) + 's' : '—', row = document.createElement('tr'), id = descriptor.node_id || ''; cell(row, id); cell(row, descriptor.role); cell(row, (descriptor.capabilities || []).join(', ')); cell(row, report.runtime_state || (node.online ? 'ONLINE' : 'OFFLINE')); cell(row, report.robot_control_state || report.controller_control_state || control?.handle_state); cell(row, descriptor.session_id); cell(row, mismatch || control?.desired_state, safetyMismatch ? 'safety' : mismatch ? 'mismatch' : ''); cell(row, control?.handle_id); cell(row, ttl); cell(row, control?.action_rate_hz); cell(row, control?.frame_age_ms); cell(row, control?.last_sequence); cell(row, descriptor.role === 'robot' ? boolean(node.online) : '—'); cell(row, report.tracking); cell(row, report.engaged); cell(row, report.processor_state); cell(row, control?.error || report.error, 'danger'); const actions = document.createElement('td'); if (descriptor.role === 'robot') actions.append(actionButton('hold', 'HOLD', {robot: id})); if (control) { actions.append(actionButton('take-over', 'Take over', {handle: control.handle_id}), actionButton('hand-over', 'Hand over', {handle: control.handle_id}), actionButton('revoke', 'Revoke', {handle: control.handle_id})); } row.append(actions); rowFragment.append(row); });
-      rows.replaceChildren(rowFragment);
-    };
-    const loadHistory = async () => { const response = await fetch('/api/history?limit=50'); if (response.ok) document.querySelector('#history').textContent = (await response.json()).map(event => JSON.stringify(event)).join('\n') || 'No history.'; };
-    let delay = 250;
-    const connect = () => { const protocol = location.protocol === 'https:' ? 'wss' : 'ws', socket = new WebSocket(`${protocol}://${location.host}/ws`); socket.onopen = () => { delay = 250; connection.textContent = 'live'; loadHistory(); }; socket.onmessage = event => render(JSON.parse(event.data)); socket.onclose = () => { connection.textContent = `reconnecting in ${delay}ms`; setTimeout(connect, delay); delay = Math.min(delay * 2, 5000); }; socket.onerror = () => socket.close(); };
-    connect();
+    const q=s=>document.querySelector(s); let snapshot={nodes:[],controls:[]}, videoStatusUrl=null,renderedCameraKey='';const cameraSamples=new Map();
+    const lower=v=>String(v||'').toLowerCase(), online=n=>n&&n.online, role=(n,r)=>lower(n?.descriptor?.role)===r;
+    const only=(items,pred)=>{const found=items.filter(pred);return found.length===1?found[0]:null}; const live=c=>!['released','revoked','expired','fault'].includes(lower(c?.handle_state));
+    const safeUrl=value=>{try{const u=new URL(value);return ['http:','https:'].includes(u.protocol)&&!['0.0.0.0','::','*'].includes(u.hostname)?u.href:null}catch{return null}};
+    const selected=()=>{const robot=only(snapshot.nodes,n=>role(n,'robot')&&online(n));const controller=only(snapshot.nodes,n=>role(n,'controller')&&online(n));const control=robot&&controller?snapshot.controls.find(c=>live(c)&&c.robot_id===robot.descriptor.node_id&&c.controller_id===controller.descriptor.node_id):null;return{robot,controller,control}};
+    const cameraState=(name,state)=>{const item=q('[data-camera="'+CSS.escape(name)+'"] .state');if(item&&item.textContent!==state.toUpperCase()){item.className='state '+state;item.textContent=state.toUpperCase()}};
+    const cameraFps=(name,fps)=>{const item=q('[data-camera="'+CSS.escape(name)+'"] .fps');if(item)item.textContent=(Number.isFinite(fps)?fps:0).toFixed(1)+' FPS'};
+    const renderCameras=robot=>{const stage=q('#camera-stage'),descriptor=robot?.descriptor,presentation=descriptor?.presentation,cameras=presentation?.cameras||[];const key=robot?descriptor.node_id+'|'+cameras.map(c=>[c.name,c.stream_url,c.width,c.height].join(':')).join('|'):'none';if(key===renderedCameraKey)return;renderedCameraKey=key;cameraSamples.clear();stage.replaceChildren(); // descriptor.presentation.cameras
+      if(!robot){stage.innerHTML='<div class="empty">Connect exactly one online robot to view cameras.</div>';return} if(!cameras.length){stage.innerHTML='<div class="empty">Robot has not advertised cameras.</div>';return}
+      cameras.forEach(camera=>{const card=document.createElement('article'),img=document.createElement('img'),name=document.createElement('span'),state=document.createElement('span'),fps=document.createElement('span');card.className='camera';card.dataset.camera=camera.name;img.src=camera.stream_url;img.alt=camera.name;img.width=camera.width;img.height=camera.height;name.className='name';name.textContent=camera.name;state.className='state';state.textContent='CONNECTING';fps.className='fps';fps.textContent='0.0 FPS';card.append(img,name,state,fps);stage.append(card)})};
+    const render=state=>{snapshot={...state,nodes:state.nodes||[],controls:state.controls||[]};const {robot,controller,control}=selected(),rr=robot?.report||{},cr=controller?.report||{};q('#robot-identity').textContent=robot?.descriptor?.display_name||robot?.descriptor?.node_id||'Waiting for robot';q('#status').textContent=robot&&controller?(control?'Default control route ready':'Compatible pair detected · awaiting auto-route'):'Connect exactly one online robot and controller';q('#quest-state').textContent=cr.engaged?'engaged':cr.controller_control_state||'—';q('#retarget-state').textContent=cr.processor_state||'—';q('#safety-state').textContent=control?.healthy===false||lower(rr.robot_control_state)==='safety'?'fault':control?.handle_state||'—';q('#piper-state').textContent=rr.robot_control_state||'—';q('#handle-state').textContent=control?.handle_state||'—';const rate=control?.action_rate_hz??cr.action_rate_hz,age=control?.frame_age_ms??cr.frame_age_ms;q('#action-rate').textContent=rate==null?'—':Number(rate).toFixed(1)+' Hz';q('#frame-age').textContent=age==null?'—':Number(age).toFixed(1)+' ms';q('#hold-state').textContent=rr.active_hold?'HOLD':rr.robot_control_state||'—';const quest=q('#quest-controller'),monitor=safeUrl(controller?.descriptor?.presentation?.monitor_url); // presentation.monitor_url
+      quest.disabled=!monitor;quest.dataset.monitor=monitor||'';const nextVideoStatusUrl=safeUrl(robot?.descriptor?.presentation?.video_status_url);if(nextVideoStatusUrl!==videoStatusUrl){videoStatusUrl=nextVideoStatusUrl;cameraSamples.clear()} // presentation.video_status_url
+      renderCameras(robot)};
+    const pollVideo=async()=>{if(!videoStatusUrl)return;try{const r=await fetch(videoStatusUrl,{cache:'no-store'});if(!r.ok)throw Error();const body=await r.json(),now=Date.now();(body.cameras||[]).forEach(c=>{const health=c.health||{},sequence=Number(health.sequence),previous=cameraSamples.get(c.name),advanced=Number.isFinite(sequence)&&(!previous||previous.sequence!==sequence),elapsed=previous?(now-previous.sampledAt)/1000:0,instant=advanced&&previous&&elapsed>0?(sequence-previous.sequence)/elapsed:0,fps=advanced?(previous?.fps?previous.fps*.65+instant*.35:instant):(previous?.fps||0),changedAt=advanced?now:(previous?.changedAt||now),sample={sequence,changedAt,sampledAt:now,fps};cameraSamples.set(c.name,sample);const stale=now-changedAt>1500;cameraState(c.name,health.state==='live'?(stale?'stale':'live'):'offline');cameraFps(c.name,stale?0:fps)})}catch{q('#camera-stage').querySelectorAll('.state').forEach(s=>{s.className='state offline';s.textContent='OFFLINE'});q('#camera-stage').querySelectorAll('.fps').forEach(s=>s.textContent='0.0 FPS')}};
+    q('#quest-controller').onclick=e=>{if(e.currentTarget.dataset.monitor)window.open(e.currentTarget.dataset.monitor,'_blank','noopener')};q('#log-button').onclick=async()=>{q('#log-panel').hidden=false;try{const r=await fetch('/api/history?limit=100');q('#history').textContent=JSON.stringify(await r.json(),null,2)}catch{q('#history').textContent='Unable to load diagnostics.'}};q('#log-close').onclick=()=>q('#log-panel').hidden=true;
+    let delay=250;const connect=()=>{const ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');ws.onmessage=e=>render(JSON.parse(e.data));ws.onclose=()=>{setTimeout(connect,delay);delay=Math.min(delay*2,5000)};ws.onopen=()=>delay=250;ws.onerror=()=>ws.close()};fetch('/api/snapshot').then(r=>r.json()).then(render).catch(()=>{});setInterval(pollVideo,1000);connect();
   </script>
 </body>
 </html>

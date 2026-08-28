@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "camera-stream",
-    "lerobot[core_scripts,training,evaluation]==0.6.0",
+    "lerobot[core_scripts,training,evaluation,intelrealsense]==0.6.0",
     "cmake>=3.29.0,<4.0.0",
     "fastapi>=0.115",
     "pyzmq>=27.1.0",

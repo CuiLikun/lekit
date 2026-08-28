@@ -19,9 +19,11 @@ from urllib.parse import urlsplit
 import uvicorn
 
 from lekit.control.controller import ControllerNode, ControllerNodeConfig
+from lekit.control.model import NodePresentation
 from lekit.control.runtime import Runtime
 
 from .config import IsaacTeleopConfig
+from .engage_authority import EngageAuthority
 from .node_state import TeleopNodeState, create_monitor_app
 from .protocol import ACTION_SCHEMA, ACTION_SCHEMA_VERSION, TeleopFrame, encode_action_frame
 from .transport import ZmqTeleopPublisher
@@ -80,11 +82,14 @@ class IsaacControllerNodeConfig:
     display_name: str = "Isaac Quest 3 Teleop"
     action_endpoint: str = "tcp://0.0.0.0:5557"
     hub_seed: str | None = None
+    presentation: NodePresentation = field(default_factory=NodePresentation)
 
     def __post_init__(self) -> None:
         self.node_id_path = Path(self.node_id_path)
         if not isinstance(self.teleop, TeleopNodeConfig):
             raise TypeError("teleop must be a TeleopNodeConfig")
+        if not isinstance(self.presentation, NodePresentation):
+            raise TypeError("presentation must be a NodePresentation")
 
 
 def make_isaac_controller_node(config: IsaacControllerNodeConfig, runtime: Runtime) -> ControllerNode:
@@ -100,6 +105,8 @@ def make_isaac_controller_node(config: IsaacControllerNodeConfig, runtime: Runti
             hub_seed=config.hub_seed,
             action_schemas=(f"{ACTION_SCHEMA}.v{ACTION_SCHEMA_VERSION}",),
             control_modes=("teleop",),
+            defer_take_over_until_first_action=True,
+            presentation=config.presentation,
         ),
         runtime=runtime,
     )
@@ -169,6 +176,7 @@ class TeleopNode:
         )
         self._publisher: Any | None = None
         self._monitor: Any | None = None
+        self._engage_authority = EngageAuthority()
 
     def run(self, *, max_frames: int | None = None, stop_event: threading.Event | None = None) -> None:
         """Run until stopped, or until ``max_frames`` have been sampled for tests."""
@@ -231,6 +239,8 @@ class TeleopNode:
                             captured_utc_ns=self._utc_ns(),
                             action=action,
                         )
+                        if self._control_node is not None:
+                            self._engage_authority.update(action, self._control_node)
                         published = self._publish_frame(frame)
                         if published:
                             rate_samples.append(started_at)
@@ -260,6 +270,8 @@ class TeleopNode:
                         if self.config.retry_delay_s > 0.0:
                             self._sleep_until_stopped(stop_event, self.config.retry_delay_s)
                 finally:
+                    if self._control_node is not None:
+                        self._engage_authority.reset(self._control_node, release=True)
                     if controller is not None:
                         with contextlib.suppress(Exception):
                             controller.disconnect()

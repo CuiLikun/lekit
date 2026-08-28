@@ -15,7 +15,10 @@ from lekit.robots.piper.robot_node import (
     make_piper_robot_node,
     piper_active_hold,
 )
-from lekit.robots.piper.teleop_processor import PiperTeleopProcessorConfig
+from lekit.robots.piper.teleop_processor import (
+    PiperTeleopProcessorConfig,
+    make_piper_isaac_processor,
+)
 from lekit.teleoperators.isaac_teleop.protocol import TeleopFrame, encode_action_frame, neutral_action
 
 
@@ -92,6 +95,22 @@ def test_payload_processor_decodes_frame_and_reuses_existing_pipeline():
     }
     processor.reset()
     assert pipeline.reset_count == 1
+
+
+def test_managed_processor_reset_accepts_first_neutral_engage_frame():
+    processor = PiperIsaacPayloadProcessor(make_piper_isaac_processor())
+    action = neutral_action()
+    action["right.is_tracking"] = True
+    action["right.is_engaged"] = True
+    frame = TeleopFrame("xr-session", 0, 10, 20, action)
+    observation = {key: index / 10.0 for index, key in enumerate(PiperRobot._EEF_KEYS)}
+
+    processor.reset()
+    result = processor(encode_action_frame(frame), observation)
+
+    for key, value in observation.items():
+        assert result[key] == pytest.approx(value)
+    assert processor.status()["processor_state"] == "engaged"
 
 
 def test_active_hold_sends_one_complete_measured_tcp_and_reports_passive_failures():

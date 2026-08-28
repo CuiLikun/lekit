@@ -6,7 +6,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -19,6 +19,7 @@ from .model import (
     ControllerControlState,
     ManagementMessage,
     NodeDescriptor,
+    NodePresentation,
     NodeReport,
     NodeRole,
     RuntimeState,
@@ -46,6 +47,8 @@ class ControllerNodeConfig:
     action_endpoint: str = "tcp://0.0.0.0:5557"
     control_modes: tuple[str, ...] = ("teleop",)
     hub_seed: str | None = None
+    presentation: NodePresentation = field(default_factory=NodePresentation)
+    defer_take_over_until_first_action: bool = False
     timing: TimingConfig = field(default_factory=TimingConfig)
 
     def __post_init__(self) -> None:
@@ -62,6 +65,10 @@ class ControllerNodeConfig:
             raise ValueError("action_endpoint must not be empty")
         if self.hub_seed is not None and (not isinstance(self.hub_seed, str) or not self.hub_seed):
             raise ValueError("hub_seed must be non-empty when present")
+        if not isinstance(self.presentation, NodePresentation):
+            raise ValueError("presentation must be a NodePresentation")
+        if not isinstance(self.defer_take_over_until_first_action, bool):
+            raise ValueError("defer_take_over_until_first_action must be a boolean")
         if not isinstance(self.timing, TimingConfig):
             raise ValueError("timing must be a TimingConfig")
 
@@ -127,6 +134,12 @@ class ControllerNode:
             return self._control_state
 
     @property
+    def current_handle(self) -> ControlHandle | None:
+        """Return the immutable Handle currently granted to this Controller."""
+        with self._lock:
+            return self._handle
+
+    @property
     def stream_session_id(self) -> str | None:
         """Return the current direct-action stream identity, if streaming."""
         with self._lock:
@@ -183,7 +196,9 @@ class ControllerNode:
                 return
             self._streaming_enabled = False
             self._control_state = ControllerControlState.TAKING_OVER
-            self._send_take_over_requested_locked(self._handle)
+            self._take_over_correlation = None
+            if not self.config.defer_take_over_until_first_action:
+                self._send_take_over_requested_locked(self._handle)
 
     def hand_over(self, handle: ControlHandle) -> None:
         """Stop direct action publication before asking the Hub to release authority."""
@@ -313,11 +328,19 @@ class ControllerNode:
     def publish(self, payload: bytes, *, captured_monotonic_ns: int, captured_utc_ns: int) -> bool:
         """Publish one non-blocking Handle-wrapped frame, if local authority is current."""
         with self._lock:
-            if not self._streaming_enabled or self._handle is None or self._stream_session_id is None:
+            if self._handle is None:
                 return False
             if self._monotonic_ns() >= self._local_expiry_monotonic_ns:
                 self._disable_streaming_locked("handle_expired", terminal=True)
                 self._control_state = ControllerControlState.IDLE
+                return False
+            if not self._streaming_enabled or self._stream_session_id is None:
+                if (
+                    self.config.defer_take_over_until_first_action
+                    and self._control_state is ControllerControlState.TAKING_OVER
+                    and self._take_over_correlation is None
+                ):
+                    self._send_take_over_requested_locked(self._handle)
                 return False
             publisher = self._action_publisher
             if publisher is None:
@@ -388,6 +411,7 @@ class ControllerNode:
             action_features={},
             software_version="lekit",
             diagnostics={},
+            presentation=self.config.presentation,
         )
 
     def _accept_grant_locked(self, handle: ControlHandle) -> bool:
@@ -427,7 +451,12 @@ class ControllerNode:
             return False
         self._streaming_enabled = False
         self._control_state = ControllerControlState.TAKING_OVER
-        return self._send_take_over_requested_locked(handle)
+        self._take_over_correlation = None
+        return (
+            True
+            if self.config.defer_take_over_until_first_action
+            else self._send_take_over_requested_locked(handle)
+        )
 
     def _accept_hand_over_locked(self, handle: ControlHandle) -> bool:
         if not self._matches_current_handle_locked(handle):
@@ -441,7 +470,10 @@ class ControllerNode:
     def _complete_hand_over_locked(self, handle: ControlHandle) -> bool:
         self._disable_streaming_locked("hand_over", terminal=True)
         self._control_state = ControllerControlState.IDLE
-        return self._send_handle_event_locked("controller_released", handle)
+        completed = self._send_handle_event_locked("controller_released", handle)
+        if completed and self._last_error == "hand_over":
+            self._last_error = None
+        return completed
 
     def _accept_revoke_locked(self, handle: ControlHandle) -> bool:
         if not self._matches_current_handle_locked(handle):
@@ -618,11 +650,21 @@ class ControllerNode:
 
     @staticmethod
     def _wire(value: object) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for data_field in fields(value):  # type: ignore[arg-type]
-            item = getattr(value, data_field.name)
-            result[data_field.name] = item.value if isinstance(item, Enum) else item
-        return result
+        def wire(item: object) -> object:
+            if isinstance(item, Enum):
+                return item.value
+            if is_dataclass(item) and not isinstance(item, type):
+                return {data_field.name: wire(getattr(item, data_field.name)) for data_field in fields(item)}
+            if isinstance(item, Mapping):
+                return {key: wire(nested) for key, nested in item.items()}
+            if isinstance(item, tuple):
+                return [wire(nested) for nested in item]
+            return item
+
+        encoded = wire(value)
+        if not isinstance(encoded, dict):
+            raise TypeError("wire values must be dataclasses")
+        return encoded
 
     @staticmethod
     def _new_correlation(prefix: str) -> str:

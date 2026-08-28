@@ -8,7 +8,7 @@ import time
 import uuid
 from collections import Counter, deque
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from enum import Enum
 from numbers import Integral, Real
 from pathlib import Path
@@ -22,6 +22,7 @@ from .model import (
     ControlHandle,
     ManagementMessage,
     NodeDescriptor,
+    NodePresentation,
     NodeReport,
     NodeRole,
     RobotControlState,
@@ -41,6 +42,14 @@ class PayloadProcessor(Protocol):
 
     def reset(self) -> None:
         """Clear all state that could retain motion authority."""
+        raise NotImplementedError
+
+
+class ObservationSink(Protocol):
+    """Accept one successfully-read Robot observation without affecting control."""
+
+    def publish(self, observation: RobotObservation, *, captured_monotonic_ns: int) -> None:
+        """Offer an observation to an optional non-blocking side channel."""
         raise NotImplementedError
 
 
@@ -83,6 +92,7 @@ class RobotNodeConfig:
     control_rate_hz: float = 60.0
     action_stale_s: float = 0.1
     hub_seed: str | None = None
+    presentation: NodePresentation = field(default_factory=NodePresentation)
     timing: TimingConfig = field(default_factory=TimingConfig)
 
     def __post_init__(self) -> None:
@@ -109,6 +119,8 @@ class RobotNodeConfig:
             setattr(self, name, value)
         if self.hub_seed is not None and (not isinstance(self.hub_seed, str) or not self.hub_seed):
             raise ValueError("hub_seed must be non-empty when present")
+        if not isinstance(self.presentation, NodePresentation):
+            raise ValueError("presentation must be a NodePresentation")
         if not isinstance(self.timing, TimingConfig):
             raise ValueError("timing must be a TimingConfig")
 
@@ -146,6 +158,7 @@ class RobotNode:
         *,
         runtime: Runtime,
         hold: Callable[[Robot, RobotObservation | None, str], HoldResult] | None = None,
+        observation_sinks: tuple[ObservationSink, ...] = (),
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
         utc_ns: Callable[[], int] = time.time_ns,
     ) -> None:
@@ -153,6 +166,10 @@ class RobotNode:
             raise TypeError("config must be a RobotNodeConfig")
         if not callable(processor) or not callable(getattr(processor, "reset", None)):
             raise TypeError("processor must be callable and provide reset()")
+        if not isinstance(observation_sinks, tuple) or not all(
+            callable(getattr(sink, "publish", None)) for sink in observation_sinks
+        ):
+            raise TypeError("observation_sinks must be a tuple of ObservationSink")
         self.robot = robot
         self.processor = processor
         self.config = config
@@ -160,6 +177,7 @@ class RobotNode:
         self._hold = hold or PassiveHold()
         self._monotonic_ns = monotonic_ns
         self._utc_ns = utc_ns
+        self._observation_sinks = observation_sinks
         self._lock = threading.RLock()
         self._node_id = load_or_create_node_id(config.node_id_path)
         self._session_id = "not-started"
@@ -191,6 +209,7 @@ class RobotNode:
         self._last_received_monotonic_ns: int | None = None
         self._accepted_timestamps: deque[int] = deque()
         self._last_error: str | None = None
+        self._observation_sink_errors: Counter[str] = Counter()
         self._active_hold = False
         self._safety_reason: str | None = None
         self.rejections: Counter[str] = Counter()
@@ -364,6 +383,13 @@ class RobotNode:
     def run_cycle(self) -> RobotObservation:
         """Read observation and consider at most the latest non-blocking action."""
         observation = self.robot.get_observation()
+        captured_monotonic_ns = self._monotonic_ns()
+        for sink in self._observation_sinks:
+            try:
+                sink.publish(observation, captured_monotonic_ns=captured_monotonic_ns)
+            except Exception as error:
+                with self._lock:
+                    self._observation_sink_errors[f"{type(error).__name__}: {error}"] += 1
         with self._lock:
             if self._authority_transition_depth:
                 return observation
@@ -425,6 +451,8 @@ class RobotNode:
                 ):
                     self.rejections["processor_not_armed"] += 1
                     self._enter_hold_locked("processor_not_armed", observation)
+                    if self._last_error == "processor_not_armed":
+                        self._last_error = None
             return observation
         try:
             self._validate_robot_action(action)
@@ -716,6 +744,7 @@ class RobotNode:
             action_features=self.robot.action_features,
             software_version="lekit",
             diagnostics={"passive_hold": isinstance(self._hold, PassiveHold)},
+            presentation=self.config.presentation,
         )
 
     def _accept_grant_locked(self, handle: ControlHandle) -> bool:
@@ -771,7 +800,7 @@ class RobotNode:
         self._authority_generation += 1
         self._stream_session_id = None
         self._last_sequence = None
-        self._last_received_monotonic_ns = self._monotonic_ns()
+        self._last_received_monotonic_ns = None
         self._last_error = None
         return self._send_handle_event_locked("robot_ready", handle, correlation_id)
 
@@ -1247,6 +1276,7 @@ class RobotNode:
     def _diagnostics_locked(self) -> dict[str, Any]:
         return {
             "rejections": dict(sorted(self.rejections.items())),
+            "observation_sink_errors": dict(sorted(self._observation_sink_errors.items())),
             "robot_connected": bool(self.robot.is_connected),
         }
 
@@ -1257,15 +1287,21 @@ class RobotNode:
 
     @staticmethod
     def _wire(value: object) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for data_field in fields(value):  # type: ignore[arg-type]
-            item = getattr(value, data_field.name)
+        def wire(item: object) -> object:
             if isinstance(item, Enum):
-                item = item.value
-            elif isinstance(item, Mapping):
-                item = dict(item)
-            result[data_field.name] = item
-        return result
+                return item.value
+            if is_dataclass(item) and not isinstance(item, type):
+                return {data_field.name: wire(getattr(item, data_field.name)) for data_field in fields(item)}
+            if isinstance(item, Mapping):
+                return {key: wire(nested) for key, nested in item.items()}
+            if isinstance(item, tuple):
+                return [wire(nested) for nested in item]
+            return item
+
+        encoded = wire(value)
+        if not isinstance(encoded, dict):
+            raise TypeError("wire values must be dataclasses")
+        return encoded
 
     @staticmethod
     def _new_correlation(prefix: str) -> str:

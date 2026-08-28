@@ -7,7 +7,14 @@ import struct
 from collections.abc import Mapping
 from typing import Any
 
-from .model import ActionEnvelope, ManagementMessage
+from .model import (
+    ActionEnvelope,
+    CameraStreamDescriptor,
+    ManagementMessage,
+    NodeDescriptor,
+    NodePresentation,
+    NodeRole,
+)
 
 _HEADER_LENGTH = struct.Struct("!I")
 _MAX_HEADER_BYTES = 64 * 1024
@@ -39,6 +46,8 @@ _MANAGEMENT_FIELDS = frozenset(
         "body",
     }
 )
+_PRESENTATION_FIELDS = frozenset({"monitor_url", "video_status_url", "cameras"})
+_CAMERA_DESCRIPTOR_FIELDS = frozenset({"name", "stream_url", "width", "height", "fps"})
 
 
 def _reject_json_constant(value: str) -> None:
@@ -101,6 +110,41 @@ def decode_management(data: bytes) -> ManagementMessage:
         return ManagementMessage(**value)
     except (TypeError, ValueError) as error:
         raise ValueError("invalid management message") from error
+
+
+def decode_node_descriptor(value: Mapping[str, Any]) -> NodeDescriptor:
+    """Decode the strict wire representation of one registered Node descriptor."""
+    if not isinstance(value, Mapping):
+        raise ValueError("registration descriptor body is invalid")
+    values = dict(value)
+    try:
+        values["role"] = NodeRole(values["role"])
+        for name in ("capabilities", "action_schemas", "control_modes"):
+            values[name] = tuple(values[name])
+        if "presentation" not in values:
+            values["presentation"] = NodePresentation()
+        else:
+            presentation = values["presentation"]
+            if not isinstance(presentation, Mapping):
+                raise ValueError("presentation must be an object")
+            _require_exact_fields(presentation, _PRESENTATION_FIELDS, label="presentation")
+            cameras = presentation["cameras"]
+            if not isinstance(cameras, (list, tuple)):
+                raise ValueError("cameras must be an array")
+            decoded_cameras = []
+            for camera in cameras:
+                if not isinstance(camera, Mapping):
+                    raise ValueError("camera descriptor must be an object")
+                _require_exact_fields(camera, _CAMERA_DESCRIPTOR_FIELDS, label="camera descriptor")
+                decoded_cameras.append(CameraStreamDescriptor(**dict(camera)))
+            values["presentation"] = NodePresentation(
+                monitor_url=presentation["monitor_url"],
+                video_status_url=presentation["video_status_url"],
+                cameras=tuple(decoded_cameras),
+            )
+        return NodeDescriptor(**values)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("registration descriptor body is invalid") from error
 
 
 def encode_action_envelope(envelope: ActionEnvelope) -> bytes:

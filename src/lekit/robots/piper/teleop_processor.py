@@ -138,6 +138,9 @@ class PiperIsaacRetargetingStep(RobotActionProcessorStep):
     _state: PiperTeleopState = field(init=False, default=PiperTeleopState.UNARMED)
     _anchor_position: np.ndarray | None = field(init=False, default=None, repr=False)
     _anchor_rotation: Rotation | None = field(init=False, default=None, repr=False)
+    _operator_anchor_position: np.ndarray | None = field(init=False, default=None, repr=False)
+    _operator_anchor_rotation: Rotation | None = field(init=False, default=None, repr=False)
+    _validated_release: bool = field(init=False, default=False, repr=False)
     _requires_release: bool = field(init=False, default=False, repr=False)
     _last_target: RobotAction | None = field(init=False, default=None, repr=False)
     _fault_reason: str | None = field(init=False, default=None, repr=False)
@@ -167,9 +170,20 @@ class PiperIsaacRetargetingStep(RobotActionProcessorStep):
         self._state = PiperTeleopState.UNARMED
         self._anchor_position = None
         self._anchor_rotation = None
+        self._operator_anchor_position = None
+        self._operator_anchor_rotation = None
+        self._validated_release = False
         self._requires_release = False
         self._last_target = None
         self._fault_reason = None
+
+    def arm_after_validated_release(self) -> None:
+        """Arm a fresh stream after its authority layer observed a release."""
+
+        if self._state is not PiperTeleopState.UNARMED:
+            raise RuntimeError("validated release can only arm an unarmed processor")
+        self._state = PiperTeleopState.IDLE
+        self._validated_release = True
 
     def action(self, action: RobotAction) -> RobotAction:
         try:
@@ -203,14 +217,20 @@ class PiperIsaacRetargetingStep(RobotActionProcessorStep):
                     self._requires_release = False
                 return {}
             if not tracked:
+                self._validated_release = False
                 self._requires_release = True
                 return {}
             if not engaged:
                 return {}
-            if not self._is_neutral(hand["translation"], hand["rotation"]):
+            if not self._validated_release and not self._is_neutral(
+                hand["translation"], hand["rotation"]
+            ):
                 return self._fault("engage frame is not neutral", measured)
             self._anchor_position = measured[:3].copy()
             self._anchor_rotation = Rotation.from_euler("xyz", measured[3:])
+            self._operator_anchor_position = hand["translation"].copy()
+            self._operator_anchor_rotation = Rotation.from_quat(hand["rotation"])
+            self._validated_release = False
             self._state = PiperTeleopState.ENGAGED
             return self._target_action(hand, measured)
 
@@ -237,13 +257,20 @@ class PiperIsaacRetargetingStep(RobotActionProcessorStep):
         return transformed
 
     def _target_action(self, hand: dict[str, Any], measured: np.ndarray) -> RobotAction:
-        assert self._anchor_position is not None and self._anchor_rotation is not None
-        delta_position = self.config.translation_scale * hand["translation"]
+        assert (
+            self._anchor_position is not None
+            and self._anchor_rotation is not None
+            and self._operator_anchor_position is not None
+            and self._operator_anchor_rotation is not None
+        )
+        delta_position = self.config.translation_scale * (
+            hand["translation"] - self._operator_anchor_position
+        )
         delta_position = self._clamp_norm(delta_position, self.config.max_translation_from_anchor_m)
         base_delta = np.asarray(self.config.operator_to_base_rotation) @ delta_position
         target_position = self._anchor_position + base_delta
 
-        delta_operator = Rotation.from_quat(hand["rotation"])
+        delta_operator = Rotation.from_quat(hand["rotation"]) * self._operator_anchor_rotation.inv()
         delta_rotvec = self._clamp_norm(
             delta_operator.as_rotvec() * self.config.rotation_scale,
             self.config.max_rotation_from_anchor_rad,
@@ -346,6 +373,8 @@ class PiperIsaacRetargetingStep(RobotActionProcessorStep):
     def _clear_anchor(self) -> None:
         self._anchor_position = None
         self._anchor_rotation = None
+        self._operator_anchor_position = None
+        self._operator_anchor_rotation = None
 
 
 def make_piper_isaac_processor(

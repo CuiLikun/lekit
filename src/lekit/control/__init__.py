@@ -32,6 +32,7 @@ from .model import (
     PROTOCOL_VERSION,
     TERMINAL_HANDLE_STATES,
     ActionEnvelope,
+    CameraStreamDescriptor,
     ControlHandle,
     ControllerControlState,
     ControlSnapshot,
@@ -39,6 +40,7 @@ from .model import (
     HubSnapshot,
     ManagementMessage,
     NodeDescriptor,
+    NodePresentation,
     NodeReport,
     NodeRole,
     NodeSnapshot,
@@ -48,7 +50,7 @@ from .model import (
     load_or_create_node_id,
     normalize_feature_metadata,
 )
-from .robot import HoldResult, PassiveHold, PayloadProcessor, RobotNode, RobotNodeConfig
+from .robot import HoldResult, ObservationSink, PassiveHold, PayloadProcessor, RobotNode, RobotNodeConfig
 from .runtime import (
     ActionPublisher,
     HubChannel,
@@ -58,6 +60,7 @@ from .runtime import (
     ReceivedManagement,
     Runtime,
 )
+from .video import EncodedFrame, LatestJpegStore, RobotVideoServer, RobotVideoServerConfig
 from .web import create_hub_app
 from .zmq_runtime import (
     MalformedAction,
@@ -73,6 +76,7 @@ __all__ = [
     "PROTOCOL_VERSION",
     "TERMINAL_HANDLE_STATES",
     "ActionEnvelope",
+    "CameraStreamDescriptor",
     "ActionPublisher",
     "ControlHandle",
     "ControlConflict",
@@ -104,14 +108,20 @@ __all__ = [
     "MemoryRuntime",
     "LatestActionReceiver",
     "HoldResult",
+    "ObservationSink",
     "NodeChannel",
     "NodeDescriptor",
+    "NodePresentation",
     "NodeReport",
     "NodeRole",
     "NodeSnapshot",
     "NodeUnavailable",
     "PassiveHold",
     "PayloadProcessor",
+    "EncodedFrame",
+    "LatestJpegStore",
+    "RobotVideoServer",
+    "RobotVideoServerConfig",
     "RobotControlState",
     "RobotNode",
     "RobotNodeConfig",

@@ -1,6 +1,6 @@
 import sqlite3
 import threading
-from dataclasses import fields, replace
+from dataclasses import fields, is_dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -187,15 +187,20 @@ def management(
 
 
 def as_wire(value: object) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for field in fields(value):  # type: ignore[arg-type]
-        item = getattr(value, field.name)
+    def wire(item: object) -> object:
         if hasattr(item, "value"):
-            item = item.value
-        elif isinstance(item, MappingProxyType):
-            item = dict(item)
-        result[field.name] = item
-    return result
+            return item.value
+        if is_dataclass(item) and not isinstance(item, type):
+            return {field.name: wire(getattr(item, field.name)) for field in fields(item)}
+        if isinstance(item, MappingProxyType):
+            return {key: wire(nested) for key, nested in item.items()}
+        if isinstance(item, tuple):
+            return [wire(nested) for nested in item]
+        return item
+
+    encoded = wire(value)
+    assert isinstance(encoded, dict)
+    return encoded
 
 
 @pytest.fixture
@@ -511,6 +516,23 @@ def test_active_requires_both_ready_and_streaming_reports(hub: Hub, registered_p
     assert hub.get_snapshot(handle.handle_id).handle_state is HandleState.ACTIVE
 
 
+def test_active_tolerates_robot_hold_during_status_propagation_grace(
+    hub: Hub,
+    clock: Clock,
+    registered_pair: tuple[NodeDescriptor, NodeDescriptor],
+) -> None:
+    handle = activate(hub, registered_pair)
+
+    hub.tick()
+
+    assert hub.get_snapshot(handle.handle_id).handle_state is HandleState.ACTIVE
+
+    clock.advance(0.31)
+    hub.tick()
+
+    assert hub.get_snapshot(handle.handle_id).handle_state is HandleState.REVOKING
+
+
 def test_streaming_without_robot_ready_does_not_activate(hub: Hub, registered_pair):
     robot, controller = registered_pair
     handle = hub.assign(robot.node_id, controller.node_id)
@@ -646,6 +668,24 @@ def test_robot_hold_is_sufficient_to_finish_release_when_controller_ack_is_lost(
     hub.receive_report(report(robot, handle=handle, robot_state=RobotControlState.HOLD))
 
     assert hub.get_snapshot(handle.handle_id).handle_state is HandleState.RELEASED
+
+
+def test_terminal_handle_mismatches_do_not_raise_live_alerts(hub: Hub, registered_pair):
+    """Historical Handle/report differences must not look like a current control fault."""
+    robot, controller = registered_pair
+    previous = activate(hub, registered_pair)
+    hub.request_hand_over(previous)
+    hub.receive_report(report(robot, handle=previous, robot_state=RobotControlState.HOLD))
+    current = hub.assign(robot.node_id, controller.node_id)
+
+    hub.receive_report(report(robot, handle=current, robot_state=RobotControlState.HOLD))
+    hub.receive_report(report(controller, handle=current, controller_state=ControllerControlState.IDLE))
+
+    assert not any(
+        alert.get("handle_id") == previous.handle_id
+        and alert.get("code") in {"robot_handle_mismatch", "controller_handle_mismatch"}
+        for alert in hub.get_snapshot().alerts
+    )
 
 
 def test_revocation_transitions_through_revoking_and_robot_hold_finishes_it(hub: Hub, registered_pair):
@@ -1030,6 +1070,7 @@ def trigger_automatic_revoke(
         )
     elif source == "mismatch":
         hub.receive_report(report(robot, handle=live_handle, robot_state=RobotControlState.HOLD))
+        clock.advance(0.31)
         hub.tick()
     elif source == "safety":
         hub.receive_report(report(robot, handle=live_handle, robot_state=RobotControlState.SAFETY))

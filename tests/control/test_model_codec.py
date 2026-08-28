@@ -5,10 +5,12 @@ import pytest
 
 from lekit.control import (
     ActionEnvelope,
+    CameraStreamDescriptor,
     ControlHandle,
     HubSnapshot,
     ManagementMessage,
     NodeDescriptor,
+    NodePresentation,
     NodeRole,
     TimingConfig,
     decode_action_envelope,
@@ -18,6 +20,7 @@ from lekit.control import (
     load_or_create_node_id,
     normalize_feature_metadata,
 )
+from lekit.control.codec import decode_node_descriptor
 
 
 def action_envelope() -> ActionEnvelope:
@@ -58,9 +61,203 @@ def controller_descriptor(**overrides: object) -> NodeDescriptor:
     return NodeDescriptor(**fields)  # type: ignore[arg-type]
 
 
+def descriptor_wire(*, presentation: dict[str, object] | None = None) -> dict[str, object]:
+    descriptor = {
+        "protocol_version": 1,
+        "schema_version": 1,
+        "node_id": "quest",
+        "session_id": "controller-session",
+        "role": "controller",
+        "display_name": "Quest controller",
+        "administratively_enabled": True,
+        "capabilities": ["teleop"],
+        "action_schemas": ["lekit.isaac_teleop.action.v1"],
+        "control_modes": ["teleop"],
+        "action_endpoint": "tcp://controller:5557",
+        "observation_features": {},
+        "action_features": {},
+        "software_version": "1.0.0",
+        "diagnostics": {},
+    }
+    if presentation is not None:
+        descriptor["presentation"] = presentation
+    return descriptor
+
+
 def test_action_envelope_round_trip_keeps_payload_opaque():
     envelope = action_envelope()
     assert decode_action_envelope(encode_action_envelope(envelope)) == envelope
+
+
+def test_node_presentation_round_trip_is_typed_and_strict():
+    presentation = NodePresentation(
+        monitor_url="http://192.168.5.24:8000",
+        video_status_url="http://192.168.5.24:8081/api/cameras",
+        cameras=(
+            CameraStreamDescriptor(
+                "HAND_VIEW",
+                "http://192.168.5.24:8081/api/cameras/HAND_VIEW/stream.mjpg",
+                640,
+                480,
+                30.0,
+            ),
+        ),
+    )
+
+    decoded = decode_node_descriptor(
+        descriptor_wire(
+            presentation={
+                "monitor_url": "http://192.168.5.24:8000",
+                "video_status_url": "http://192.168.5.24:8081/api/cameras",
+                "cameras": [
+                    {
+                        "name": "HAND_VIEW",
+                        "stream_url": "http://192.168.5.24:8081/api/cameras/HAND_VIEW/stream.mjpg",
+                        "width": 640,
+                        "height": 480,
+                        "fps": 30.0,
+                    }
+                ],
+            }
+        )
+    )
+
+    assert decoded.presentation == presentation
+    assert isinstance(decoded.presentation.cameras[0], CameraStreamDescriptor)
+
+
+@pytest.mark.parametrize("url", ["", "tcp://192.168.5.24:8081", "http://0.0.0.0:8081/stream"])
+def test_presentation_rejects_empty_non_http_and_wildcard_urls(url: str):
+    with pytest.raises(ValueError):
+        NodePresentation(monitor_url=url)
+
+
+@pytest.mark.parametrize("field", ["monitor_url", "video_status_url"])
+def test_presentation_rejects_expanded_ipv6_unspecified_urls(field: str):
+    with pytest.raises(ValueError):
+        NodePresentation(**{field: "http://[0:0:0:0:0:0:0:0]:8081/stream"})
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["0", "0.0", "0.0.0", "0x0", "0000000000", "00.00.00.00", "0.", "0x0.", "00."],
+)
+@pytest.mark.parametrize("field", ["monitor_url", "video_status_url", "stream_url"])
+def test_presentation_rejects_browser_ipv4_unspecified_shorthand(field: str, host: str):
+    url = f"http://{host}:8081/stream"
+
+    with pytest.raises(ValueError):
+        if field == "stream_url":
+            CameraStreamDescriptor("HAND_VIEW", url, 640, 480, 30.0)
+        else:
+            NodePresentation(**{field: url})
+
+
+@pytest.mark.parametrize("field", ["monitor_url", "video_status_url", "stream_url"])
+@pytest.mark.parametrize("host", ["camera.local", "camera.local."])
+def test_presentation_allows_dns_hosts(field: str, host: str):
+    url = f"https://{host}/stream"
+
+    if field == "stream_url":
+        assert CameraStreamDescriptor("HAND_VIEW", url, 640, 480, 30.0).stream_url == url
+    else:
+        assert getattr(NodePresentation(**{field: url}), field) == url
+
+
+def test_camera_descriptor_rejects_expanded_ipv6_unspecified_url():
+    with pytest.raises(ValueError):
+        CameraStreamDescriptor(
+            "HAND_VIEW",
+            "http://[0:0:0:0:0:0:0:0]:8081/stream.mjpg",
+            640,
+            480,
+            30.0,
+        )
+
+
+def test_node_descriptor_decode_defaults_missing_presentation_for_compatibility():
+    decoded = decode_node_descriptor(descriptor_wire())
+
+    assert decoded.presentation == NodePresentation()
+
+
+@pytest.mark.parametrize("missing", ["monitor_url", "video_status_url", "cameras"])
+def test_node_descriptor_decode_rejects_missing_presentation_fields(missing: str):
+    presentation = {
+        "monitor_url": None,
+        "video_status_url": None,
+        "cameras": [],
+    }
+    del presentation[missing]
+
+    with pytest.raises(ValueError, match="registration descriptor body is invalid"):
+        decode_node_descriptor(descriptor_wire(presentation=presentation))
+
+
+@pytest.mark.parametrize("missing", ["name", "stream_url", "width", "height", "fps"])
+def test_node_descriptor_decode_rejects_missing_camera_fields(missing: str):
+    camera = {
+        "name": "HAND_VIEW",
+        "stream_url": "http://camera.local/stream.mjpg",
+        "width": 640,
+        "height": 480,
+        "fps": 30.0,
+    }
+    del camera[missing]
+
+    with pytest.raises(ValueError, match="registration descriptor body is invalid"):
+        decode_node_descriptor(
+            descriptor_wire(
+                presentation={
+                    "monitor_url": None,
+                    "video_status_url": None,
+                    "cameras": [camera],
+                }
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "presentation",
+    [
+        {
+            "monitor_url": None,
+            "video_status_url": None,
+            "cameras": [],
+            "unexpected": True,
+        },
+        {
+            "monitor_url": None,
+            "video_status_url": None,
+            "cameras": [
+                {
+                    "name": "HAND_VIEW",
+                    "stream_url": "http://camera.local/stream.mjpg",
+                    "width": 640,
+                    "height": 480,
+                    "fps": 30.0,
+                    "unexpected": True,
+                }
+            ],
+        },
+    ],
+)
+def test_node_descriptor_decode_rejects_unknown_nested_presentation_fields(
+    presentation: dict[str, object],
+):
+    with pytest.raises(ValueError, match="registration descriptor body is invalid"):
+        decode_node_descriptor(descriptor_wire(presentation=presentation))
+
+
+def test_presentation_rejects_invalid_cameras_and_duplicate_names():
+    valid = CameraStreamDescriptor("HAND_VIEW", "https://camera.local/stream.mjpg", 640, 480, 30.0)
+
+    with pytest.raises(ValueError):
+        CameraStreamDescriptor("HAND_VIEW", "https://camera.local/stream.mjpg", 0, 480, 30.0)
+    with pytest.raises(ValueError):
+        CameraStreamDescriptor("HAND_VIEW", "https://camera.local/stream.mjpg", 640, 480, 0.0)
+    with pytest.raises(ValueError):
+        NodePresentation(cameras=(valid, valid))
 
 
 def test_action_codec_rejects_truncated_header():

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from dataclasses import asdict, replace
+from dataclasses import FrozenInstanceError, asdict, replace
 from pathlib import Path
 
 import pytest
@@ -239,6 +239,25 @@ def test_start_registers_controller_identity_and_never_enables_publication(
     assert controller.publish(b"frame", captured_monotonic_ns=10, captured_utc_ns=20) is False
 
 
+def test_controller_advertises_presentation_and_exposes_frozen_current_handle(
+    controller: ControllerNode,
+    handle: ControlHandle,
+    runtime: RecordingRuntime,
+) -> None:
+    assert controller.current_handle is None
+
+    controller.receive_grant(handle)
+
+    assert controller.current_handle == handle
+    with pytest.raises(FrozenInstanceError):
+        controller.current_handle.handle_id = "other"  # type: ignore[misc]
+    assert messages(runtime, "register")[0].body["descriptor"]["presentation"] == {
+        "monitor_url": None,
+        "video_status_url": None,
+        "cameras": (),
+    }
+
+
 def test_controller_public_types_are_exported() -> None:
     import lekit.control as control
 
@@ -275,6 +294,62 @@ def test_robot_ready_starts_new_stream_and_wraps_payload(
     assert received.envelope.stream_session_id == controller.stream_session_id
 
 
+def test_deferred_take_over_waits_for_source_action_before_requesting_robot(
+    tmp_path: Path,
+    clock: Clock,
+    runtime: RecordingRuntime,
+) -> None:
+    node_id_path = tmp_path / "deferred-controller-id"
+    node_id_path.write_text("deferred-controller\n", encoding="utf-8")
+    controller = ControllerNode(
+        ControllerNodeConfig(
+            node_id_path=node_id_path,
+            display_name="Deferred Controller",
+            action_schemas=("lekit.action.v1",),
+            action_endpoint="memory://deferred-actions",
+            defer_take_over_until_first_action=True,
+            timing=TimingConfig(handle_ttl_s=3.0),
+        ),
+        runtime=runtime,
+        monotonic_ns=clock.monotonic_ns,
+        utc_ns=clock.utc_ns,
+    )
+    controller.start()
+    handle = ControlHandle(
+        handle_id="deferred-handle",
+        hub_epoch="hub-epoch-1",
+        robot_id="robot-1",
+        robot_session_id="robot-session-1",
+        controller_id=controller.node_id,
+        controller_session_id=controller.session_id,
+        controller_action_endpoint="memory://deferred-actions",
+        action_schema="lekit.action.v1",
+        control_mode="teleop",
+        fencing_token=1,
+        issued_at_ns=clock.utc_ns(),
+        expires_at_ns=clock.utc_ns() + 10_000_000_000,
+    )
+
+    try:
+        assert controller.receive_management(registered(controller, runtime, sequence=0))
+        assert controller.receive_management(command("grant", handle, sequence=1))
+        assert controller.receive_management(command("take_over", handle, sequence=2))
+        assert controller.control_state is ControllerControlState.TAKING_OVER
+        assert messages(runtime, "take_over_requested") == []
+
+        assert not controller.publish(b"ready", captured_monotonic_ns=10, captured_utc_ns=20)
+        request = messages(runtime, "take_over_requested")[-1]
+        assert controller.receive_management(
+            command("robot_ready", handle, correlation_id=request.correlation_id, sequence=3)
+        )
+        assert controller.control_state is ControllerControlState.STREAMING
+
+        assert controller.publish(b"first", captured_monotonic_ns=30, captured_utc_ns=40)
+        assert len(messages(runtime, "controller_streaming")) == 1
+    finally:
+        controller.stop()
+
+
 def test_hand_over_stops_publication_before_management_request(
     controller: ControllerNode, handle: ControlHandle, runtime: RecordingRuntime
 ) -> None:
@@ -304,6 +379,7 @@ def test_routed_hand_over_reports_release_request_back_to_hub(
     controller: ControllerNode,
     handle: ControlHandle,
     runtime: RecordingRuntime,
+    clock: Clock,
 ) -> None:
     assert controller.receive_management(registered(controller, runtime, sequence=0))
     assert controller.receive_management(command("grant", handle, sequence=1))
@@ -317,6 +393,9 @@ def test_routed_hand_over_reports_release_request_back_to_hub(
     assert messages(runtime, "controller_released")[-1].body == {"handle": asdict(handle)}
     assert messages(runtime, "hand_over_ack")[-1].correlation_id == "hand-over-1"
     assert controller.control_state is ControllerControlState.IDLE
+    clock.advance(round(1_000_000_000 / controller.config.timing.status_rate_hz))
+    controller.run_management_once()
+    assert messages(runtime, "status")[-1].body["report"]["error"] is None
 
 
 @pytest.mark.parametrize(

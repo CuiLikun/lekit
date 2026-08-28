@@ -1014,6 +1014,22 @@ def test_action_fails_closed_when_measured_joint_is_outside_model_limits(monkeyp
     assert not any(event[0] == "move_j" for event in arm.events)
 
 
+def test_action_accepts_measured_joint_within_default_zero_position_tolerance(monkeypatch):
+    arm = FakeArm()
+    arm.joints[2] = 0.020403
+    monkeypatch.setattr(driver, "create_piper_sdk_arm", lambda _config: arm)
+    piper = driver.PiperRobot(driver.PiperRobotConfig())
+    piper.connect()
+
+    try:
+        applied = piper.send_action({"joint_1.pos": 0.01})
+    finally:
+        piper.disconnect()
+
+    assert any(event[0] == "move_j" for event in arm.events)
+    assert applied["joint_1.pos"] == pytest.approx(0.010000736613927507)
+
+
 def test_action_returns_the_millidegree_target_encoded_by_sdk(monkeypatch):
     arm = FakeArm()
     monkeypatch.setattr(driver, "create_piper_sdk_arm", lambda _config: arm)

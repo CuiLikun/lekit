@@ -8,7 +8,7 @@ import threading
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import fields
+from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -628,6 +628,8 @@ class HubStore:
 
     @staticmethod
     def _json_default(value: Any) -> Any:
+        if is_dataclass(value) and not isinstance(value, type):
+            return {field.name: getattr(value, field.name) for field in fields(value)}
         if isinstance(value, Mapping):
             return dict(value)
         if isinstance(value, tuple):

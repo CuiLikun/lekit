@@ -156,35 +156,46 @@ def test_snapshot_serializes_deeply_frozen_domain_mappings() -> None:
     ]
 
 
-def test_root_serves_fixed_layout_ui_with_required_control_routes(client: TestClient) -> None:
-    """Would fail if a packaged UI lost operational columns or a control route."""
+def test_root_serves_single_robot_control_dashboard(client: TestClient) -> None:
+    """Would fail if the packaged one-robot control view lost its main regions."""
     response = client.get("/")
 
     assert response.status_code == 200
-    for label in (
-        "Node",
-        "Role",
-        "Capabilities",
-        "Runtime",
-        "Control",
-        "Session",
-        "Assignment",
-        "Handle",
-        "TTL",
-        "Rate",
-        "Frame age",
-        "Sequence",
-        "Connected",
-        "Tracking",
-        "Engaged",
-        "Processor",
-        "Error",
-        "Actions",
-    ):
-        assert label in response.text
-    assert "table-layout: fixed" in response.text
-    assert "onclick=" not in response.text
-    assert "data-action" in response.text
-    assert "robot_safety_with_active_desire" in response.text
-    assert "/api/handles/" in response.text
-    assert "/api/robots/" in response.text
+    assert "<title>LeHub</title>" in response.text
+    assert "<h1>LeHub</h1>" in response.text
+    assert 'id="robot-identity"' in response.text
+    assert 'id="camera-stage"' in response.text
+    assert 'id="runtime-panel"' in response.text
+    assert 'id="handle-state"' in response.text
+    assert 'id="action-rate"' in response.text
+    assert 'id="frame-age"' in response.text
+    assert 'id="hold-state"' in response.text
+    assert "/api/snapshot" in response.text
+    assert "/ws" in response.text
+
+
+def test_root_keeps_camera_pixels_unscaled_and_displays_live_fps(client: TestClient) -> None:
+    """Would fail if the approved 640x480 camera presentation regressed."""
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "flex:0 0 640px" in response.text
+    assert "width:640px; height:480px" in response.text
+    assert "object-fit:none" in response.text
+    assert "fps.className='fps'" in response.text
+    assert "cameraFps(c.name" in response.text
+    assert "setInterval(pollVideo,1000)" in response.text
+
+
+def test_root_exposes_quest_monitor_and_hidden_diagnostics(client: TestClient) -> None:
+    """Would fail if the compact operator tools lost monitoring or diagnostics."""
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "--brand:#ff9d00" in response.text
+    assert 'id="quest-controller"' in response.text
+    assert 'aria-label="Open Quest 3 monitor"' in response.text
+    assert 'id="log-button"' in response.text
+    assert '<section id="log-panel" hidden>' in response.text
+    assert "/api/history?limit=100" in response.text
+    assert "presentation?.monitor_url" in response.text

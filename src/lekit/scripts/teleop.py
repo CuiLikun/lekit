@@ -294,19 +294,19 @@ def _format_pose(pose: Mapping[str, float]) -> str:
 
 
 def _render_status(status: TeleopStatus) -> Table:
-    table = Table(title="Piper Isaac Teleop", expand=False)
-    for heading in (
-        "state",
-        "hand",
-        "tracking",
-        "engaged",
-        "Hz",
-        "measured TCP",
-        "target TCP",
-        "mode",
-        "fault",
+    table = Table(title="Piper Isaac Teleop", width=184, expand=False)
+    for heading, width in (
+        ("state", 9),
+        ("hand", 5),
+        ("tracking", 8),
+        ("engaged", 7),
+        ("Hz", 6),
+        ("measured TCP", 41),
+        ("target TCP", 41),
+        ("mode", 7),
+        ("fault", 32),
     ):
-        table.add_column(heading)
+        table.add_column(heading, width=width, no_wrap=True, overflow="ellipsis")
     table.add_row(
         status.state,
         status.hand,

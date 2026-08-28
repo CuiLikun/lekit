@@ -85,6 +85,50 @@ def test_neutral_engage_latches_same_frame_measured_tcp_without_jump():
     assert step.last_target == result
 
 
+def test_managed_takeover_uses_nonzero_first_frame_as_operator_anchor():
+    config = PiperTeleopProcessorConfig(rotation_scale=1.0)
+    step = PiperIsaacRetargetingStep(config)
+    obs = observation((0.30, -0.10, 0.40, 0.10, -0.20, 0.30))
+    first_translation = np.array([0.012, -0.008, 0.006])
+    first_rotation = Rotation.from_euler("xyz", [0.08, -0.04, 0.06])
+
+    step.arm_after_validated_release()
+    first = process(
+        step,
+        xr_frame(
+            engaged=True,
+            translation=first_translation,
+            rotation=first_rotation.as_quat(),
+        ),
+        obs,
+    )
+
+    for key, value in obs.items():
+        assert first[key] == pytest.approx(value)
+    assert step.state is PiperTeleopState.ENGAGED
+    assert step.fault_reason is None
+
+    translation_delta = np.array([0.01, 0.02, 0.03])
+    rotation_delta = Rotation.from_euler("xyz", [0.05, -0.03, 0.04])
+    second = process(
+        step,
+        xr_frame(
+            engaged=True,
+            translation=first_translation + translation_delta,
+            rotation=(rotation_delta * first_rotation).as_quat(),
+        ),
+        obs,
+    )
+
+    assert [second[key] for key in EE_KEYS[:3]] == pytest.approx([0.32, -0.11, 0.43])
+    operator_to_base = np.asarray(config.operator_to_base_rotation)
+    expected_rotation = Rotation.from_matrix(
+        operator_to_base @ rotation_delta.as_matrix() @ operator_to_base.T
+    ) * Rotation.from_euler("xyz", [obs[key] for key in EE_KEYS[3:]])
+    actual_rotation = Rotation.from_euler("xyz", [second[key] for key in EE_KEYS[3:]])
+    assert actual_rotation.as_matrix() == pytest.approx(expected_rotation.as_matrix())
+
+
 def test_cumulative_operator_translation_maps_right_forward_and_up_to_piper_axes():
     step = PiperIsaacRetargetingStep(PiperTeleopProcessorConfig())
     obs = observation((0.0, 0.0, 0.3, 0.0, 0.0, 0.0))

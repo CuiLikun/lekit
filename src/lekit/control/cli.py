@@ -9,6 +9,7 @@ import signal
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
+from dataclasses import replace
 from pathlib import Path
 from types import FrameType
 from typing import Any
@@ -80,6 +81,24 @@ def derive_advertise_endpoint(management_endpoint: str, advertise_host: str | No
     return f"tcp://{rendered_host}:{port}"
 
 
+def _advertised_http_url(
+    bind_host: str,
+    port: int,
+    advertise_host: str | None,
+    *,
+    label: str,
+) -> str:
+    host = bind_host.strip().strip("[]")
+    if host in _WILDCARD_HOSTS and not advertise_host:
+        raise ValueError(f"--advertise-host is required for a wildcard {label} host")
+    if advertise_host:
+        host = advertise_host.strip().strip("[]")
+    if not host or "://" in host or "/" in host:
+        raise ValueError("--advertise-host must be a host name or IP address without a port")
+    rendered_host = f"[{host}]" if ":" in host else host
+    return f"http://{rendered_host}:{port}"
+
+
 def _json_value(value: str) -> Any:
     try:
         return json.loads(value)
@@ -110,6 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
     hub.add_argument("--database", type=Path, default=Path(".lekit/control-hub.sqlite3"))
     hub.add_argument("--web-host", default="127.0.0.1")
     hub.add_argument("--web-port", type=int, default=8080)
+    hub.add_argument("--auto-route-single-pair", action="store_true")
     hub.add_argument("--multicast-group", default="239.255.42.99")
     hub.add_argument("--discovery-port", type=int, default=45990)
     hub.set_defaults(runner=_run_hub)
@@ -128,6 +148,7 @@ def build_parser() -> argparse.ArgumentParser:
     teleop.add_argument("--retry-delay-s", type=float, default=2.0)
     teleop.add_argument("--monitor-host", default="127.0.0.1")
     teleop.add_argument("--monitor-port", type=int, default=8000)
+    teleop.add_argument("--advertise-host")
     teleop.add_argument("--no-monitor", action="store_true")
     teleop.add_argument("--cloudxr-env-file")
     teleop.add_argument("--cloudxr-install-dir", default=".cloudxr")
@@ -145,6 +166,9 @@ def build_parser() -> argparse.ArgumentParser:
     robot.add_argument("--enable-motion", action="store_true")
     robot.add_argument("--robot-config", type=Path, help="JSON object for PiperRobotConfig")
     robot.add_argument("--processor-config", type=Path, help="JSON object for Piper processor config")
+    robot.add_argument("--video-host", default="127.0.0.1")
+    robot.add_argument("--video-port", type=int, default=8081)
+    robot.add_argument("--advertise-host")
     _add_dotted_arguments(robot, "robot", _PIPER_ROBOT_FIELDS)
     _add_dotted_arguments(robot, "processor", _PIPER_PROCESSOR_FIELDS)
     robot.set_defaults(runner=_run_robot)
@@ -209,6 +233,7 @@ def _run_hub(args: argparse.Namespace) -> int:
             management_endpoint=args.management_endpoint,
             advertise_endpoint=advertise_endpoint,
             database_path=args.database,
+            auto_route_single_pair=args.auto_route_single_pair,
         ),
         runtime=runtime,
     )
@@ -237,6 +262,7 @@ def _run_teleop(args: argparse.Namespace) -> int:
         make_isaac_controller_node,
     )
 
+    from .model import NodePresentation
     from .zmq_runtime import ZmqRuntime
 
     runtime = ZmqRuntime()
@@ -262,6 +288,18 @@ def _run_teleop(args: argparse.Namespace) -> int:
             display_name=args.display_name,
             action_endpoint=args.action_endpoint,
             hub_seed=args.hub_seed,
+            presentation=NodePresentation(
+                monitor_url=(
+                    _advertised_http_url(
+                        args.monitor_host,
+                        args.monitor_port,
+                        args.advertise_host,
+                        label="monitor",
+                    )
+                    if not args.no_monitor
+                    else None
+                )
+            ),
         ),
         runtime,
     )
@@ -300,7 +338,10 @@ def _build_piper_node(args: argparse.Namespace, runtime: Any) -> Any:
         PiperNodeConfig,
         PiperRobotConfig,
         PiperTeleopProcessorConfig,
+        _decode_piper_cameras,
         make_piper_robot_node,
+        make_piper_video_server,
+        piper_video_presentation,
     )
     from lekit.teleoperators.isaac_teleop.protocol import ACTION_SCHEMA, ACTION_SCHEMA_VERSION
 
@@ -310,6 +351,9 @@ def _build_piper_node(args: argparse.Namespace, runtime: Any) -> Any:
     processor_values = _config_values(args, "processor", args.processor_config)
     if "calibration_dir" in robot_values and robot_values["calibration_dir"] is not None:
         robot_values["calibration_dir"] = Path(robot_values["calibration_dir"])
+    robot_values["cameras"] = _decode_piper_cameras(robot_values.pop("cameras", {}))
+    robot_config = PiperRobotConfig(**robot_values)
+    video = None
     node_config = RobotNodeConfig(
         node_id_path=args.node_id_file,
         display_name=args.display_name,
@@ -318,22 +362,32 @@ def _build_piper_node(args: argparse.Namespace, runtime: Any) -> Any:
         control_rate_hz=args.control_rate_hz,
         hub_seed=args.hub_seed,
     )
-    return make_piper_robot_node(
+    if robot_config.cameras:
+        video = make_piper_video_server(
+            robot_config,
+            host=args.video_host,
+            port=args.video_port,
+            advertise_host=args.advertise_host,
+        )
+        node_config = replace(node_config, presentation=piper_video_presentation(video))
+    node = make_piper_robot_node(
         PiperNodeConfig(
             node=node_config,
-            robot=PiperRobotConfig(**robot_values),
+            robot=robot_config,
             processor=PiperTeleopProcessorConfig(**processor_values),
             enable_motion=args.enable_motion,
+            observation_sinks=(video,) if video is not None else (),
         ),
         runtime,
     )
+    return node, video
 
 
 def _run_robot(args: argparse.Namespace) -> int:
     from .zmq_runtime import ZmqRuntime
 
     runtime = ZmqRuntime()
-    node = _build_piper_node(args, runtime)
+    node, video = _build_piper_node(args, runtime)
     mode = "MOTION ENABLED" if args.enable_motion else "READ-ONLY (motion disabled)"
     print(f"Robot {args.display_name}: {mode}", flush=True)
     print(f"Hub seed: {args.hub_seed or 'automatic discovery'}", flush=True)
@@ -342,6 +396,9 @@ def _run_robot(args: argparse.Namespace) -> int:
     period_s = 1.0 / args.control_rate_hz
     try:
         with _signal_stop_event() as stop_event:
+            if video is not None:
+                video.start()
+                print(f"Robot video: http://{args.advertise_host or args.video_host}:{args.video_port}", flush=True)
             node.start()
             while not stop_event.is_set():
                 started = time.monotonic()
@@ -349,8 +406,14 @@ def _run_robot(args: argparse.Namespace) -> int:
                 stop_event.wait(max(0.0, period_s - (time.monotonic() - started)))
     finally:
         # RobotNode.stop enters local HOLD before disconnecting the LeRobot Robot.
-        node.stop()
-        runtime.close()
+        try:
+            node.stop()
+        finally:
+            try:
+                if video is not None:
+                    video.stop()
+            finally:
+                runtime.close()
     return 0
 
 

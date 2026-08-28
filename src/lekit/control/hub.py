@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from .codec import decode_node_descriptor
 from .handles import HandleRecord, InvalidHandleTransition, correlate_control
 from .model import (
     PROTOCOL_VERSION,
@@ -36,6 +37,9 @@ from .store import HubStore
 
 _HUB_ID = "hub"
 _WILDCARD_HOSTS = frozenset({"0.0.0.0", "::", "*"})
+_ACTIVE_PROPAGATION_MISMATCHES = frozenset(
+    {"desired_active_robot_hold", "controller_streaming_robot_not_accepting"}
+)
 _HANDLE_IDENTITY_FIELDS = (
     "handle_id",
     "hub_epoch",
@@ -76,6 +80,7 @@ class HubConfig:
     database_path: Path = Path(".lekit/control-hub.sqlite3")
     timing: TimingConfig = field(default_factory=TimingConfig)
     auto_revoke_mismatches: bool = True
+    auto_route_single_pair: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.management_endpoint, str) or not self.management_endpoint:
@@ -89,6 +94,8 @@ class HubConfig:
             raise ValueError("timing must be a TimingConfig")
         if not isinstance(self.auto_revoke_mismatches, bool):
             raise ValueError("auto_revoke_mismatches must be a bool")
+        if not isinstance(self.auto_route_single_pair, bool):
+            raise ValueError("auto_route_single_pair must be a bool")
 
 
 @dataclass(slots=True)
@@ -107,6 +114,7 @@ class _LiveHandle:
     controller_released: bool = False
     pending_grants: set[str] = field(default_factory=set)
     last_renewed_monotonic_ns: int = 0
+    active_since_monotonic_ns: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -573,6 +581,7 @@ class Hub:
                     self._send_grant_locked(live, only=tuple(live.pending_grants))
 
             self._respond_to_mismatches_locked()
+            self._reconcile_auto_route_locked()
             self._publish_snapshot_locked()
             if (
                 self._last_persisted_monotonic_ns is None
@@ -892,6 +901,7 @@ class Hub:
                 HandleState.ACTIVE,
                 correlation_id=correlation_id,
             )
+            live.active_since_monotonic_ns = self._monotonic_ns()
 
     def _finish_from_robot_hold_locked(self, live: _LiveHandle, correlation_id: str) -> None:
         if live.record.state is HandleState.HANDING_OVER:
@@ -924,6 +934,14 @@ class Hub:
                 continue
             control = self._correlate_live(live)
             if not control.mismatch_codes:
+                continue
+            if (
+                live.record.state is HandleState.ACTIVE
+                and live.active_since_monotonic_ns is not None
+                and self._monotonic_ns() - live.active_since_monotonic_ns
+                < round(3_000_000_000 / self._timing.status_rate_hz)
+                and set(control.mismatch_codes) <= _ACTIVE_PROPAGATION_MISMATCHES
+            ):
                 continue
             reason = f"live mismatch: {control.mismatch_codes[0]}"
             self._automatic_revoke_locked(
@@ -1309,6 +1327,80 @@ class Hub:
             raise ControlConflict(f"Robot {node_id} already has a non-terminal Handle")
         return node
 
+    def _reconcile_auto_route_locked(self) -> None:
+        """Create the opt-in default route only for one schedulable pair.
+
+        This deliberately reuses :meth:`assign` so the automatic path has the
+        same compatibility, exclusivity, persistence, audit, and grant
+        behaviour as an operator-created Handle.
+        """
+        if not self.config.auto_route_single_pair:
+            return
+
+        robots = [
+            node
+            for node in self._nodes.values()
+            if node.descriptor.role is NodeRole.ROBOT and self._is_auto_routable_robot(node)
+        ]
+        controllers = [
+            node
+            for node in self._nodes.values()
+            if node.descriptor.role is NodeRole.CONTROLLER and self._is_auto_routable_controller(node)
+        ]
+        if len(robots) != 1 or len(controllers) != 1:
+            return
+
+        robot = robots[0]
+        controller = controllers[0]
+        if (
+            self._live_handle_for_node(robot.descriptor.node_id) is not None
+            or self._live_handle_for_node(controller.descriptor.node_id) is not None
+        ):
+            return
+        try:
+            self.assign(
+                robot.descriptor.node_id,
+                controller.descriptor.node_id,
+                control_mode="teleop",
+                actor="hub:auto-route",
+            )
+        except (NodeUnavailable, IncompatibleNode, ControlConflict) as error:
+            self._audit_locked(
+                "auto_route_refused",
+                actor="hub:auto-route",
+                correlation_id=self._new_correlation("auto-route-refused"),
+                details={
+                    "controller_id": controller.descriptor.node_id,
+                    "reason": str(error),
+                    "robot_id": robot.descriptor.node_id,
+                },
+            )
+
+    @staticmethod
+    def _is_auto_routable_robot(node: _LiveNode) -> bool:
+        if not node.online or not node.descriptor.administratively_enabled:
+            return False
+        report = node.report
+        return not (
+            report is not None
+            and (
+                report.robot_control_state is RobotControlState.SAFETY
+                or report.runtime_state is RuntimeState.FAULT
+                or (report.runtime_state is RuntimeState.DEGRADED and report.error is not None)
+            )
+        )
+
+    @staticmethod
+    def _is_auto_routable_controller(node: _LiveNode) -> bool:
+        return bool(
+            node.online
+            and node.descriptor.administratively_enabled
+            and (
+                node.report is None
+                or node.report.runtime_state not in {RuntimeState.FAULT, RuntimeState.STOPPED}
+            )
+        )
+
     def _require_online_controller(self, node_id: str) -> _LiveNode:
         node = self._nodes.get(node_id)
         if node is None or node.descriptor.role is not NodeRole.CONTROLLER:
@@ -1387,6 +1479,7 @@ class Hub:
                 "severity": "error",
             }
             for control in controls
+            if control.handle_state not in TERMINAL_HANDLE_STATES
             for code in control.mismatch_codes
         )
         delivery_alerts = tuple(pending.alert() for _, pending in sorted(self._pending_deliveries.items()))
@@ -1474,15 +1567,9 @@ class Hub:
 
     def _descriptor_from_body(self, body: Mapping[str, Any]) -> NodeDescriptor:
         value = body.get("descriptor", body)
-        if not isinstance(value, Mapping):
-            raise IncompatibleNode("registration descriptor body is invalid")
-        values = dict(value)
         try:
-            values["role"] = NodeRole(values["role"])
-            for name in ("capabilities", "action_schemas", "control_modes"):
-                values[name] = tuple(values[name])
-            return NodeDescriptor(**values)
-        except (KeyError, TypeError, ValueError) as error:
+            return decode_node_descriptor(value)
+        except ValueError as error:
             raise IncompatibleNode("registration descriptor body is invalid") from error
 
     def _report_from_body(self, body: Mapping[str, Any]) -> NodeReport:

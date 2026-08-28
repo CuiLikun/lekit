@@ -7,6 +7,8 @@ import draccus
 import numpy as np
 import pytest
 from draccus.argparsing import ArgumentParser
+from rich.cells import cell_len
+from rich.console import Console
 
 from lekit.robots.piper import PiperCameraTimeoutError
 from lekit.robots.piper.piper_robot import PiperRobotConfig
@@ -977,6 +979,50 @@ def test_status_callback_receives_control_and_tcp_snapshot() -> None:
     assert status.target_tcp == target
     assert status.mode == "dry-run"
     assert status.fault == "fault detail"
+
+
+def test_status_table_keeps_fixed_column_and_total_widths() -> None:
+    expected_columns = [
+        ("state", 9),
+        ("hand", 5),
+        ("tracking", 8),
+        ("engaged", 7),
+        ("Hz", 6),
+        ("measured TCP", 41),
+        ("target TCP", 41),
+        ("mode", 7),
+        ("fault", 32),
+    ]
+
+    def render(fault: str | None) -> tuple[object, list[int]]:
+        table = teleop_module._render_status(
+            teleop_module.TeleopStatus(
+                state="engaged",
+                hand="right",
+                tracking=True,
+                engaged=True,
+                hz=29.95,
+                measured_tcp=measured_tcp(),
+                target_tcp=measured_tcp(**{"ee.x": 0.31}),
+                mode="motion",
+                fault=fault,
+            )
+        )
+        console = Console(width=240, color_system=None)
+        with console.capture() as capture:
+            console.print(table)
+        return table, [cell_len(line) for line in capture.get().splitlines()]
+
+    short_table, short_widths = render(None)
+    long_table, long_widths = render("controller feedback became unavailable during motion")
+
+    for table in (short_table, long_table):
+        assert table.width == 184
+        assert [(column.header, column.width) for column in table.columns] == expected_columns
+        assert all(column.no_wrap for column in table.columns)
+        assert all(column.overflow == "ellipsis" for column in table.columns)
+    assert short_widths == long_widths
+    assert set(short_widths) == {184}
 
 
 class FakeLive:

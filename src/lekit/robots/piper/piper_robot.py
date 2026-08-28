@@ -103,7 +103,7 @@ class PiperRobotConfig(RobotConfig):
     disable_on_disconnect: bool = False
 
     max_relative_target: float | dict[str, float] | None = 0.05
-    joint_limit_tolerance_rad: float = 0.02
+    joint_limit_tolerance_rad: float = 0.03
 
     def __post_init__(self) -> None:
         super().__post_init__()
