@@ -98,6 +98,14 @@ def _norm_bounded(vector: np.ndarray, maximum_norm: float) -> np.ndarray:
     return vector * (maximum_norm / norm)
 
 
+def _jerk_limited_stopping_velocity_delta(
+    acceleration: float, maximum_jerk: float, dt: float
+) -> float:
+    jerk_step = maximum_jerk * dt
+    steps = math.ceil(acceleration / jerk_step - 1e-12)
+    return dt * (steps * acceleration - jerk_step * steps * (steps + 1) / 2.0)
+
+
 class PiperCartesianServo:
     def __init__(
         self,
@@ -120,9 +128,12 @@ class PiperCartesianServo:
         self.joint_limits = tuple(validated_limits)
         self.fk_tcp = fk_tcp
         self.monotonic = monotonic
+        self._previous_velocity = np.zeros(6, dtype=float)
+        self._previous_acceleration = np.zeros(6, dtype=float)
 
     def reset(self) -> None:
-        pass
+        self._previous_velocity = np.zeros(6, dtype=float)
+        self._previous_acceleration = np.zeros(6, dtype=float)
 
     def step(
         self,
@@ -185,16 +196,81 @@ class PiperCartesianServo:
             bounded_rotation_velocity * orientation_scale - j_rotation @ qdot_position
         )
         qdot = qdot_position + null_position @ qdot_rotation
-        qdot = np.clip(qdot, -self.config.max_joint_velocity_rad_s, self.config.max_joint_velocity_rad_s)
-        unclipped_target = joints + qdot * dt
-        joint_target_array = np.array(
-            [
-                np.clip(value, lower, upper)
-                for value, (lower, upper) in zip(unclipped_target, self.joint_limits, strict=True)
-            ],
-            dtype=float,
+        desired_velocity = np.clip(
+            qdot,
+            -self.config.max_joint_velocity_rad_s,
+            self.config.max_joint_velocity_rad_s,
         )
-        saturated = not np.array_equal(joint_target_array, unclipped_target)
+        lower_limits = np.asarray([lower for lower, _ in self.joint_limits], dtype=float)
+        upper_limits = np.asarray([upper for _, upper in self.joint_limits], dtype=float)
+        saturated = False
+        for index, (lower, upper) in enumerate(self.joint_limits):
+            if desired_velocity[index] < 0.0:
+                scale = np.clip(
+                    (joints[index] - lower) / self.config.joint_limit_margin_rad,
+                    0.0,
+                    1.0,
+                )
+                desired_velocity[index] *= scale
+                saturated |= scale < 1.0
+            elif desired_velocity[index] > 0.0:
+                scale = np.clip(
+                    (upper - joints[index]) / self.config.joint_limit_margin_rad,
+                    0.0,
+                    1.0,
+                )
+                desired_velocity[index] *= scale
+                saturated |= scale < 1.0
+        for index, (previous_velocity, previous_acceleration) in enumerate(
+            zip(self._previous_velocity, self._previous_acceleration, strict=True)
+        ):
+            if desired_velocity[index] > previous_velocity and previous_acceleration > 0.0:
+                remaining_velocity = self.config.max_joint_velocity_rad_s - previous_velocity
+                stopping_delta = _jerk_limited_stopping_velocity_delta(
+                    previous_acceleration, self.config.max_joint_jerk_rad_s3, dt
+                )
+                if remaining_velocity <= stopping_delta + 1e-12:
+                    desired_velocity[index] = previous_velocity
+            elif desired_velocity[index] < previous_velocity and previous_acceleration < 0.0:
+                remaining_velocity = self.config.max_joint_velocity_rad_s + previous_velocity
+                stopping_delta = _jerk_limited_stopping_velocity_delta(
+                    -previous_acceleration, self.config.max_joint_jerk_rad_s3, dt
+                )
+                if remaining_velocity <= stopping_delta + 1e-12:
+                    desired_velocity[index] = previous_velocity
+        desired_acceleration = np.clip(
+            (desired_velocity - self._previous_velocity) / dt,
+            -self.config.max_joint_acceleration_rad_s2,
+            self.config.max_joint_acceleration_rad_s2,
+        )
+        jerk = np.clip(
+            (desired_acceleration - self._previous_acceleration) / dt,
+            -self.config.max_joint_jerk_rad_s3,
+            self.config.max_joint_jerk_rad_s3,
+        )
+        acceleration = self._previous_acceleration + jerk * dt
+        acceleration = np.clip(
+            acceleration,
+            -self.config.max_joint_acceleration_rad_s2,
+            self.config.max_joint_acceleration_rad_s2,
+        )
+        velocity = self._previous_velocity + acceleration * dt
+        velocity = np.clip(
+            velocity,
+            -self.config.max_joint_velocity_rad_s,
+            self.config.max_joint_velocity_rad_s,
+        )
+        unclipped_target = joints + velocity * dt
+        joint_target_array = np.clip(unclipped_target, lower_limits, upper_limits)
+        hard_limit_clipped = joint_target_array != unclipped_target
+        saturated |= bool(np.any(hard_limit_clipped))
+        outward = ((velocity < 0.0) & (unclipped_target < lower_limits)) | (
+            (velocity > 0.0) & (unclipped_target > upper_limits)
+        )
+        self._previous_velocity = velocity.copy()
+        self._previous_acceleration = acceleration.copy()
+        self._previous_velocity[hard_limit_clipped & outward] = 0.0
+        self._previous_acceleration[hard_limit_clipped & outward] = 0.0
         elapsed_ms = (self.monotonic() - started) * 1000.0
         diagnostics = PiperCartesianServoDiagnostics(
             state="singular" if orientation_scale < 1.0 else "nominal",
@@ -203,7 +279,7 @@ class PiperCartesianServo:
             orientation_scale=orientation_scale,
             position_error_m=float(np.linalg.norm(position_error)),
             orientation_error_rad=float(np.linalg.norm(orientation_error)),
-            maximum_joint_velocity_rad_s=float(np.max(np.abs(qdot))),
+            maximum_joint_velocity_rad_s=float(np.max(np.abs(velocity))),
             solver_duration_ms=elapsed_ms,
             joint_limit_saturated=saturated,
         )
