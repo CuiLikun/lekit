@@ -1297,7 +1297,7 @@ class RobotNode:
             "rejections": dict(sorted(self.rejections.items())),
             "observation_sink_errors": dict(sorted(self._observation_sink_errors.items())),
             "robot_connected": bool(self.robot.is_connected),
-            "processor_status": dict(processor_status),
+            "processor_status": self._wire(processor_status),
         }
 
     def _trim_action_rate_locked(self, now: int) -> None:
@@ -1314,7 +1314,7 @@ class RobotNode:
                 return {data_field.name: wire(getattr(item, data_field.name)) for data_field in fields(item)}
             if isinstance(item, Mapping):
                 return {key: wire(nested) for key, nested in item.items()}
-            if isinstance(item, tuple):
+            if isinstance(item, (tuple, list)):
                 return [wire(nested) for nested in item]
             return item
 

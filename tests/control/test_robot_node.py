@@ -140,6 +140,21 @@ class CustomStatusProcessor(FakeProcessor):
         return {"processor_state": "engaged", "custom": {"value": 3}}
 
 
+class NestedStatusProcessor(FakeProcessor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.status_mapping = {
+            "processor_state": "engaged",
+            "cartesian_servo": {
+                "limits": {"velocity": 0.2},
+                "modes": ["hold"],
+            },
+        }
+
+    def status(self) -> dict[str, object]:
+        return self.status_mapping
+
+
 class RecordingReceiver:
     def __init__(self) -> None:
         self.frames: deque[ReceivedAction] = deque()
@@ -640,6 +655,30 @@ def test_status_preserves_complete_processor_diagnostics(
         node.stop()
 
 
+def test_local_processor_diagnostics_are_recursively_detached(
+    tmp_path: Path,
+    clock: Clock,
+    runtime: RecordingRuntime,
+    robot: FakeRobot,
+) -> None:
+    processor = NestedStatusProcessor()
+    node = unregistered_node(tmp_path, clock, runtime, robot, processor)
+    try:
+        processor_status = node.status["processor_status"]
+        processor_status["cartesian_servo"]["limits"]["velocity"] = 9.0
+        processor_status["cartesian_servo"]["modes"].append("mutated")
+
+        assert processor.status_mapping == {
+            "processor_state": "engaged",
+            "cartesian_servo": {
+                "limits": {"velocity": 0.2},
+                "modes": ["hold"],
+            },
+        }
+    finally:
+        node.stop()
+
+
 def test_management_status_carries_coalesced_robot_diagnostics(
     robot_node: RobotNode,
     robot: FakeRobot,
@@ -663,6 +702,33 @@ def test_management_status_carries_coalesced_robot_diagnostics(
             "error": None,
         },
     }
+
+
+def test_management_processor_diagnostics_are_recursively_detached(
+    tmp_path: Path,
+    clock: Clock,
+    runtime: RecordingRuntime,
+    robot: FakeRobot,
+) -> None:
+    processor = NestedStatusProcessor()
+    node = unregistered_node(tmp_path, clock, runtime, robot, processor)
+    try:
+        clock.advance(0.1)
+        node.run_management_once()
+
+        processor_status = messages(runtime, "status")[-1].body["diagnostics"]["processor_status"]
+        processor.status_mapping["cartesian_servo"]["limits"]["velocity"] = 9.0
+        processor.status_mapping["cartesian_servo"]["modes"].append("mutated")
+
+        assert processor_status == {
+            "processor_state": "engaged",
+            "cartesian_servo": {
+                "limits": {"velocity": 0.2},
+                "modes": ("hold",),
+            },
+        }
+    finally:
+        node.stop()
 
 
 def test_wrong_fencing_and_duplicate_sequence_never_reach_robot(
