@@ -785,6 +785,35 @@ def test_switching_from_eef_to_explicit_joints_resets_cartesian_servo(robot):
     assert servo.reset_count == initial_resets + 1
 
 
+def test_reconfigure_replaces_cartesian_servo_with_fresh_lifecycle(monkeypatch, robot):
+    piper, arm, _sdk_configs = robot
+    piper.connect()
+    arm.events.clear()
+    action = dict(zip(piper._EEF_KEYS, arm.tcp_pose, strict=True))
+    monotonic_times = iter((10.0, 20.0))
+    monkeypatch.setattr(driver.time, "monotonic", lambda: next(monotonic_times))
+
+    piper.send_action(action)
+    original_servo = FakeCartesianServo.instances[-1]
+    assert piper.cartesian_servo_status()
+
+    piper.configure()
+
+    replacement_servo = FakeCartesianServo.instances[-1]
+    assert replacement_servo is not original_servo
+    assert replacement_servo.reset_count == 1
+    assert piper.cartesian_servo_status() == {}
+    assert piper._last_action_representation is None
+
+    piper.send_action(action)
+
+    assert replacement_servo.steps[-1][3] == pytest.approx(1.0 / 30.0)
+    assert [event for event in arm.events if event[0] == "set_motion_mode"] == [
+        ("set_motion_mode", "j"),
+        ("set_motion_mode", "j"),
+    ]
+
+
 def test_connect_and_disconnect_reset_and_clear_cartesian_servo(robot):
     piper, arm, _sdk_configs = robot
 

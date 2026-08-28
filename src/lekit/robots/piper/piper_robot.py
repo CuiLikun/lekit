@@ -320,7 +320,6 @@ class PiperRobot(Robot):
             arm.connect()
             self._wait_for_initial_feedback()
             self.configure()
-            self.reset_cartesian_servo()
             if self.config.auto_enable:
                 self._enable_arm()
             for camera in self.cameras.values():
@@ -402,6 +401,8 @@ class PiperRobot(Robot):
                 joint_limits=[self._joint_limits[key] for key in self._JOINT_KEYS],
                 fk_tcp=fk_tcp,
             )
+            self.reset_cartesian_servo()
+            self._last_action_representation = None
             self.arm.set_speed_percent(self.config.speed_percent)
             self.arm.set_tcp_offset(list(self.config.tcp_offset))
 
