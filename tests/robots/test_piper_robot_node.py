@@ -49,6 +49,8 @@ class FakePiper:
         self.config = config
         self.sent: list[dict[str, float]] = []
         self.send_error: Exception | None = None
+        self.reset_count = 0
+        self.servo_status = {"state": "holding", "limits": {"velocity": 0.2}}
 
     @property
     def observation_features(self):
@@ -67,6 +69,12 @@ class FakePiper:
         if self.send_error is not None:
             raise self.send_error
         return action
+
+    def reset_cartesian_servo(self) -> None:
+        self.reset_count += 1
+
+    def cartesian_servo_status(self) -> dict[str, object]:
+        return self.servo_status
 
 
 class UnusedRuntime:
@@ -111,6 +119,24 @@ def test_managed_processor_reset_accepts_first_neutral_engage_frame():
     for key, value in observation.items():
         assert result[key] == pytest.approx(value)
     assert processor.status()["processor_state"] == "engaged"
+
+
+def test_payload_processor_includes_cartesian_servo_diagnostics():
+    piper = FakePiper(PiperRobotConfig())
+    processor = PiperIsaacPayloadProcessor(FakePipeline(), servo_status=piper.cartesian_servo_status)
+
+    assert processor.status()["cartesian_servo"] == piper.servo_status
+
+
+def test_active_hold_resets_cartesian_servo_before_measured_hold():
+    piper = FakePiper(PiperRobotConfig())
+    observation = dict.fromkeys(PiperRobot._EEF_KEYS, 0.0)
+
+    result = piper_active_hold(piper, observation, "hand_over")
+
+    assert result.active is True
+    assert piper.reset_count == 1
+    assert piper.sent == [observation]
 
 
 def test_active_hold_sends_one_complete_measured_tcp_and_reports_passive_failures():

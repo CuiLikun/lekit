@@ -135,6 +135,11 @@ class FakeProcessor:
         }
 
 
+class CustomStatusProcessor(FakeProcessor):
+    def status(self) -> dict[str, object]:
+        return {"processor_state": "engaged", "custom": {"value": 3}}
+
+
 class RecordingReceiver:
     def __init__(self) -> None:
         self.frames: deque[ReceivedAction] = deque()
@@ -621,6 +626,20 @@ def test_status_includes_processor_observability_and_rejection_counters(
     assert status["rejections"] == {"wrong_fencing": 2}
 
 
+def test_status_preserves_complete_processor_diagnostics(
+    tmp_path: Path,
+    clock: Clock,
+    runtime: RecordingRuntime,
+    robot: FakeRobot,
+) -> None:
+    processor = CustomStatusProcessor()
+    node = unregistered_node(tmp_path, clock, runtime, robot, processor)
+    try:
+        assert node.status["processor_status"]["custom"] == {"value": 3}
+    finally:
+        node.stop()
+
+
 def test_management_status_carries_coalesced_robot_diagnostics(
     robot_node: RobotNode,
     robot: FakeRobot,
@@ -637,6 +656,12 @@ def test_management_status_carries_coalesced_robot_diagnostics(
         "rejections": {"stale_action": 3},
         "observation_sink_errors": {},
         "robot_connected": robot.is_connected,
+        "processor_status": {
+            "processor_state": "unarmed",
+            "tracking": True,
+            "engaged": False,
+            "error": None,
+        },
     }
 
 

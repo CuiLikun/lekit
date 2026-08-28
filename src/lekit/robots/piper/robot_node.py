@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import math
-from collections.abc import Mapping
+import os
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from numbers import Real
 from pathlib import Path
@@ -26,6 +29,8 @@ from lerobot.types import RobotAction, RobotObservation
 
 from .piper_robot import PiperRobot, PiperRobotConfig
 from .teleop_processor import PiperTeleopProcessorConfig, make_piper_isaac_processor
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(kw_only=True)
@@ -147,18 +152,46 @@ class PiperIsaacPayloadProcessor:
 
     accepted_payload_schemas = frozenset({f"{ACTION_SCHEMA}.v{ACTION_SCHEMA_VERSION}"})
 
-    def __init__(self, pipeline: RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction]):
+    def __init__(
+        self,
+        pipeline: RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction],
+        *,
+        servo_status: Callable[[], Mapping[str, Any]] | None = None,
+    ):
         self._pipeline = pipeline
+        self._servo_status = servo_status
         step = pipeline.steps[0]
         self._hand = step.config.hand
         self._tracking = False
         self._engaged = False
+        self._axis_trace = os.environ.get("LEKIT_PIPER_AXIS_TRACE") == "1"
+        self._last_axis_trace_s = 0.0
 
     def __call__(self, payload: bytes, observation: RobotObservation) -> RobotAction:
         frame = decode_action_frame(payload)
         self._tracking = bool(frame.action[f"{self._hand}.is_tracking"])
         self._engaged = bool(frame.action[f"{self._hand}.is_engaged"])
-        return self._pipeline((frame.action, observation))
+        action = self._pipeline((frame.action, observation))
+        now = time.monotonic()
+        if self._axis_trace and self._engaged and now - self._last_axis_trace_s >= 0.1:
+            self._last_axis_trace_s = now
+            hand = frame.action[f"{self._hand}.translation"]
+            logger.warning(
+                "PIPER_AXIS hand_rfu_mm=(%+.1f,%+.1f,%+.1f) "
+                "tcp_xyz_mm=(%+.1f,%+.1f,%+.1f) target_xyz_mm=(%+.1f,%+.1f,%+.1f) "
+                "hand_xyzw=(%+.3f,%+.3f,%+.3f,%+.3f) "
+                "tcp_rpy_deg=(%+.1f,%+.1f,%+.1f) target_rpy_deg=(%+.1f,%+.1f,%+.1f)",
+                *(float(value) * 1000.0 for value in hand),
+                *(float(observation[key]) * 1000.0 for key in ("ee.x", "ee.y", "ee.z")),
+                *(float(action.get(key, observation[key])) * 1000.0 for key in ("ee.x", "ee.y", "ee.z")),
+                *(float(value) for value in frame.action[f"{self._hand}.rotation"]),
+                *(math.degrees(float(observation[key])) for key in ("ee.roll", "ee.pitch", "ee.yaw")),
+                *(
+                    math.degrees(float(action.get(key, observation[key])))
+                    for key in ("ee.roll", "ee.pitch", "ee.yaw")
+                ),
+            )
+        return action
 
     def reset(self) -> None:
         self._pipeline.reset()
@@ -170,12 +203,15 @@ class PiperIsaacPayloadProcessor:
 
     def status(self) -> Mapping[str, Any]:
         step = self._pipeline.steps[0]
-        return {
+        status = {
             "processor_state": getattr(getattr(step, "state", None), "value", "unknown"),
             "tracking": self._tracking,
             "engaged": self._engaged,
             "error": getattr(step, "fault_reason", None),
         }
+        if self._servo_status is not None:
+            status["cartesian_servo"] = dict(self._servo_status())
+        return status
 
 
 def piper_active_hold(
@@ -198,6 +234,7 @@ def piper_active_hold(
         action[key] = float(value)
 
     try:
+        robot.reset_cartesian_servo()
         robot.send_action(action)
     except Exception as error:  # nosec B110 - callback must report SDK safety failure to RobotNode
         return HoldResult(active=False, detail=f"{reason}: Piper active hold failed: {error}")
@@ -219,7 +256,10 @@ def make_piper_robot_node(config: PiperNodeConfig, runtime: Runtime) -> RobotNod
         config.processor,
         include_gripper=config.processor.include_gripper and robot_config.include_gripper,
     )
-    processor = PiperIsaacPayloadProcessor(make_piper_isaac_processor(processor_config))
+    processor = PiperIsaacPayloadProcessor(
+        make_piper_isaac_processor(processor_config),
+        servo_status=robot.cartesian_servo_status,
+    )
     node_config = replace(config.node, control_enabled=config.node.control_enabled and config.enable_motion)
     hold = piper_active_hold if config.enable_motion else PassiveHold()
     return RobotNode(

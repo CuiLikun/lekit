@@ -238,10 +238,11 @@ class RobotNode:
         """Return a deterministic local diagnostic snapshot."""
         with self._lock:
             now = self._monotonic_ns()
-            report = self._report_locked(now)
+            processor_status = self._processor_status_locked()
+            report = self._report_locked(now, processor_status=processor_status)
             return {
                 "report": self._wire(report),
-                **self._diagnostics_locked(),
+                **self._diagnostics_locked(processor_status=processor_status),
             }
 
     def start(self) -> None:
@@ -657,11 +658,15 @@ class RobotNode:
                     self._next_heartbeat_ns = now + self.config.timing.heartbeat_interval_ns
                 return processed
             if now >= self._next_status_ns:
-                report = self._report_locked(now)
+                processor_status = self._processor_status_locked()
+                report = self._report_locked(now, processor_status=processor_status)
                 self._send_locked(
                     "status",
                     self._new_correlation("status"),
-                    {"report": self._wire(report), "diagnostics": self._diagnostics_locked()},
+                    {
+                        "report": self._wire(report),
+                        "diagnostics": self._diagnostics_locked(processor_status=processor_status),
+                    },
                 )
                 self._next_status_ns = now + round(1_000_000_000 / self.config.timing.status_rate_hz)
         return processed
@@ -1218,20 +1223,28 @@ class RobotNode:
         else:
             self._last_error = diagnostic
 
-    def _report_locked(self, now: int) -> NodeReport:
+    def _processor_status_locked(self) -> Mapping[str, Any]:
+        status_method = getattr(self.processor, "status", None)
+        if not callable(status_method):
+            return {}
+        try:
+            candidate = status_method()
+        except Exception as error:
+            return {"error": f"processor status failed: {error}"}
+        return dict(candidate) if isinstance(candidate, Mapping) else {}
+
+    def _report_locked(
+        self,
+        now: int,
+        *,
+        processor_status: Mapping[str, Any] | None = None,
+    ) -> NodeReport:
         self._trim_action_rate_locked(now)
         frame_age_ms = None
         if self._last_received_monotonic_ns is not None:
             frame_age_ms = max(0.0, (now - self._last_received_monotonic_ns) / 1_000_000)
-        processor_status: Mapping[str, Any] = {}
-        status_method = getattr(self.processor, "status", None)
-        if callable(status_method):
-            try:
-                candidate = status_method()
-                if isinstance(candidate, Mapping):
-                    processor_status = candidate
-            except Exception as error:
-                processor_status = {"error": f"processor status failed: {error}"}
+        if processor_status is None:
+            processor_status = self._processor_status_locked()
         processor_state = processor_status.get("processor_state", getattr(self.processor, "state", None))
         if isinstance(processor_state, Enum):
             processor_state = processor_state.value
@@ -1273,11 +1286,18 @@ class RobotNode:
             reported_at_ns=now,
         )
 
-    def _diagnostics_locked(self) -> dict[str, Any]:
+    def _diagnostics_locked(
+        self,
+        *,
+        processor_status: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if processor_status is None:
+            processor_status = self._processor_status_locked()
         return {
             "rejections": dict(sorted(self.rejections.items())),
             "observation_sink_errors": dict(sorted(self._observation_sink_errors.items())),
             "robot_connected": bool(self.robot.is_connected),
+            "processor_status": dict(processor_status),
         }
 
     def _trim_action_rate_locked(self, now: int) -> None:
