@@ -11,9 +11,9 @@ import numpy as np
 import pytest
 from rich.console import Console
 
-from lerobot.datasets import LeRobotDatasetMetadata
 from lekit.robots.jaka_robot.dataset_features import build_dataset_features
 from lekit.robots.jaka_robot.jaka_robot import JakaRobot, JakaRobotConfig
+from lerobot.datasets import LeRobotDatasetMetadata
 
 
 def test_trigger_gripper_toggle_changes_state_only_on_press_edges(monkeypatch):
@@ -1479,3 +1479,34 @@ def test_keyboard_dispatch_maps_episode_and_reset_redundancy(monkeypatch):
     assert events["reset_robot"] is True
     captured_dispatch("left")
     assert events["rerecord_episode"] is True
+
+
+def test_main_converts_process_signals_into_graceful_recording_interrupts(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
+    record_module = importlib.import_module("examples.isaac_teleop_to_jaka.record")
+    previous_int = object()
+    previous_term = object()
+
+    class FakeSignals:
+        SIGINT = 2
+        SIGTERM = 15
+
+        def __init__(self):
+            self.current = {self.SIGINT: previous_int, self.SIGTERM: previous_term}
+
+        def signal(self, signum, handler):
+            previous = self.current[signum]
+            self.current[signum] = handler
+            return previous
+
+    signals = FakeSignals()
+    monkeypatch.setattr(record_module, "signal", signals, raising=False)
+
+    def interrupted_recording():
+        signals.current[signals.SIGTERM](signals.SIGTERM, None)
+
+    monkeypatch.setattr(record_module, "record", interrupted_recording)
+
+    record_module.main()
+
+    assert signals.current == {signals.SIGINT: previous_int, signals.SIGTERM: previous_term}

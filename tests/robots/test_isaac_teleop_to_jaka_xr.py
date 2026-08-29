@@ -15,6 +15,22 @@ def _wrap_angles(angles: np.ndarray) -> np.ndarray:
     return (angles + math.pi) % (2.0 * math.pi) - math.pi
 
 
+def _rpy_matrix(rpy: tuple[float, float, float]) -> np.ndarray:
+    """Independent XYZ-Euler fixture used to reconstruct a commanded tool tip."""
+
+    roll, pitch, yaw = rpy
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    return np.array(
+        [
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * sp * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr],
+        ]
+    )
+
+
 def test_default_xr_base_transform_matches_jaka_operator_axes():
     """Right/forward/up controller motion must map to the matching robot axes.
 
@@ -386,21 +402,31 @@ def test_lock_pose_holds_measured_orientation_while_translation_follows_controll
     )
 
 
-def test_thumbstick_trims_locked_tcp_orientation_without_center_drift(monkeypatch):
+@pytest.mark.parametrize(
+    ("stick_x", "stick_y", "expected_rpy"),
+    [
+        (0.0, 1.0, (0.05, 0.0, 0.0)),
+        (0.0, -1.0, (-0.05, 0.0, 0.0)),
+        (1.0, 0.0, (0.0, -0.05, 0.0)),
+        (-1.0, 0.0, (0.0, 0.05, 0.0)),
+    ],
+)
+def test_thumbstick_tilts_flange_around_fixed_tool_tip(
+    monkeypatch, stick_x, stick_y, expected_rpy
+):
     xr = _xr_module()
     measured_pose = {
         "ee.x": 0.4,
         "ee.y": -0.1,
         "ee.z": 0.3,
-        "ee.roll": 0.1,
-        "ee.pitch": -0.2,
-        "ee.yaw": 0.3,
+        "ee.roll": 0.0,
+        "ee.pitch": 0.0,
+        "ee.yaw": 0.0,
     }
     actions = iter(
         [
             {"thumbstick_x": 0.0, "thumbstick_y": 0.0, "thumbstick_click": 0.0},
-            {"thumbstick_x": 1.0, "thumbstick_y": 1.0, "thumbstick_click": 0.0},
-            {"thumbstick_x": 1.0, "thumbstick_y": 0.0, "thumbstick_click": 1.0},
+            {"thumbstick_x": stick_x, "thumbstick_y": stick_y, "thumbstick_click": 0.0},
             {"thumbstick_x": 0.1, "thumbstick_y": -0.1, "thumbstick_click": 0.0},
         ]
     )
@@ -437,7 +463,7 @@ def test_thumbstick_trims_locked_tcp_orientation_without_center_drift(monkeypatc
         def servo_enable(self, _enabled, *, representation="joints"):
             pass
 
-    times = iter([10.0, 10.2, 10.3, 10.4])
+    times = iter([10.0, 10.1, 10.2])
     monkeypatch.setattr(xr, "XRController", FakeTeleop)
     monkeypatch.setattr(xr, "_wait_for_xr_controller", lambda _teleop: None)
     monkeypatch.setattr(xr.time, "monotonic", lambda: next(times))
@@ -446,28 +472,100 @@ def test_thumbstick_trims_locked_tcp_orientation_without_center_drift(monkeypatc
         use_head_yaw=False,
         thumbstick_deadband=0.15,
         thumbstick_angular_speed_rad_s=0.5,
+        tool_tip_offset_m=[0.0, 0.0, 0.27],
     )
     bundle = xr.make_xr_device(FakeRobot(), config)
     bundle["startup"]()
 
     origin = bundle["compute"](measured_pose)
-    pitch_yaw = bundle["compute"](measured_pose)
-    roll = bundle["compute"](measured_pose)
+    tilted = bundle["compute"](measured_pose)
     centered = bundle["compute"](measured_pose)
 
-    assert origin is not None and pitch_yaw is not None and roll is not None and centered is not None
-    assert [origin[f"ee.{axis}"] for axis in ("roll", "pitch", "yaw")] == pytest.approx(
-        [0.1, -0.2, 0.3]
-    )
-    # Elapsed time is capped at 0.1 s, so full deflection adds 0.05 rad per frame.
-    assert [pitch_yaw[f"ee.{axis}"] for axis in ("roll", "pitch", "yaw")] == pytest.approx(
-        [0.1, -0.15, 0.35]
-    )
-    assert [roll[f"ee.{axis}"] for axis in ("roll", "pitch", "yaw")] == pytest.approx(
-        [0.15, -0.15, 0.35]
-    )
+    assert origin is not None and tilted is not None and centered is not None
+    tilted_rpy = tuple(tilted[f"ee.{axis}"] for axis in ("roll", "pitch", "yaw"))
+    assert tilted_rpy == pytest.approx(expected_rpy)
     assert [centered[f"ee.{axis}"] for axis in ("roll", "pitch", "yaw")] == pytest.approx(
-        [0.15, -0.15, 0.35]
+        expected_rpy
+    )
+
+    offset = np.array([0.0, 0.0, 0.27])
+    origin_pos = np.array([origin[f"ee.{axis}"] for axis in ("x", "y", "z")])
+    tilted_pos = np.array([tilted[f"ee.{axis}"] for axis in ("x", "y", "z")])
+    origin_tip = origin_pos + offset
+    tilted_tip = tilted_pos + _rpy_matrix(tilted_rpy) @ offset
+    assert tilted_tip == pytest.approx(origin_tip, abs=1e-9)
+
+
+def test_clicked_thumbstick_turns_about_base_z_while_tool_tip_stays_fixed(monkeypatch):
+    xr = _xr_module()
+    measured_pose = {
+        "ee.x": 0.4,
+        "ee.y": -0.1,
+        "ee.z": 0.3,
+        "ee.roll": 0.0,
+        "ee.pitch": 0.0,
+        "ee.yaw": 0.0,
+    }
+    actions = iter(
+        [
+            {"thumbstick_x": 0.0, "thumbstick_y": 0.0, "thumbstick_click": 0.0},
+            {"thumbstick_x": 1.0, "thumbstick_y": 0.0, "thumbstick_click": 1.0},
+        ]
+    )
+
+    class FakeTeleop:
+        def __init__(self, _config):
+            self.is_connected = False
+
+        def connect(self):
+            self.is_connected = True
+
+        def get_action(self):
+            return {
+                "grip_pos": np.zeros(3),
+                "grip_quat": np.array([0.0, 0.0, 0.0, 1.0]),
+                "squeeze": 1.0,
+                "trigger": 0.0,
+                **next(actions),
+            }
+
+        def disconnect(self):
+            self.is_connected = False
+
+    class FakeRobot:
+        name = "jaka_robot"
+        is_connected = True
+
+        def get_eef_pose(self):
+            return tuple(
+                measured_pose[key]
+                for key in ("ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw")
+            )
+
+        def servo_enable(self, _enabled, *, representation="joints"):
+            pass
+
+    times = iter([10.0, 10.1])
+    monkeypatch.setattr(xr, "XRController", FakeTeleop)
+    monkeypatch.setattr(xr, "_wait_for_xr_controller", lambda _teleop: None)
+    monkeypatch.setattr(xr.time, "monotonic", lambda: next(times))
+    config = xr.XRControllerConfig(
+        lock_pose=True,
+        use_head_yaw=False,
+        tool_tip_offset_m=[0.0, 0.0, 0.27],
+    )
+    bundle = xr.make_xr_device(FakeRobot(), config)
+    bundle["startup"]()
+
+    origin = bundle["compute"](measured_pose)
+    turned = bundle["compute"](measured_pose)
+
+    assert origin is not None and turned is not None
+    assert [turned[f"ee.{axis}"] for axis in ("roll", "pitch", "yaw")] == pytest.approx(
+        [0.0, 0.0, 0.05]
+    )
+    assert [turned[f"ee.{axis}"] for axis in ("x", "y", "z")] == pytest.approx(
+        [origin[f"ee.{axis}"] for axis in ("x", "y", "z")]
     )
 
 
@@ -551,6 +649,8 @@ def test_lock_pose_requires_a_boolean():
         ({"thumbstick_deadband": 1.0}, "thumbstick_deadband"),
         ({"thumbstick_deadband": -0.1}, "thumbstick_deadband"),
         ({"thumbstick_angular_speed_rad_s": 0.0}, "thumbstick_angular_speed_rad_s"),
+        ({"tool_tip_offset_m": [0.0, 0.0]}, "tool_tip_offset_m"),
+        ({"tool_tip_offset_m": [0.0, 0.0, math.nan]}, "tool_tip_offset_m"),
     ],
 )
 def test_thumbstick_config_rejects_unsafe_values(kwargs, message):

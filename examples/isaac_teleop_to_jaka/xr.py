@@ -41,12 +41,12 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 
+from lekit.robots.jaka_robot.pose_math import matrix_to_rpy
 from lerobot.teleoperators.config import TeleoperatorConfig
 from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.types import RobotAction
 from lerobot.utils.import_utils import is_package_available
 from lerobot.utils.rotation import Rotation
-from lekit.robots.jaka_robot.pose_math import matrix_to_rpy
 
 from .clutch import Clutch
 
@@ -228,6 +228,9 @@ class XRControllerConfig(IsaacTeleopConfig):
     thumbstick_angular_speed_rad_s: float = 0.5
     """Maximum per-axis TCP orientation rate from a fully deflected thumbstick."""
 
+    tool_tip_offset_m: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    """Tool-0 flange to physical pivot point in tool-local XYZ metres."""
+
     position_deadband_m: float = 0.0002
     """Ignore Cartesian controller drift up to this distance from the last target."""
 
@@ -273,6 +276,10 @@ class XRControllerConfig(IsaacTeleopConfig):
             or self.thumbstick_angular_speed_rad_s <= 0.0
         ):
             raise ValueError("thumbstick_angular_speed_rad_s must be positive and finite")
+        tool_tip_offset = np.asarray(self.tool_tip_offset_m, dtype=float)
+        if tool_tip_offset.shape != (3,) or not np.all(np.isfinite(tool_tip_offset)):
+            raise ValueError("tool_tip_offset_m must contain exactly three finite XYZ values")
+        self.tool_tip_offset_m = [float(value) for value in tool_tip_offset]
         if not np.isfinite(self.position_deadband_m) or self.position_deadband_m < 0:
             raise ValueError("position_deadband_m must be finite and non-negative")
         if not np.isfinite(self.operator_yaw_deg):
@@ -783,13 +790,15 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
     teleop = XRController(teleop_config)
     clutch: Clutch | None = None
     prev_enabled = False
+    last_clutch_pos: np.ndarray | None = None
     last_pos: np.ndarray | None = None
     last_rpy: np.ndarray | None = None
     locked_rpy: np.ndarray | None = None
-    thumbstick_rpy_offset = np.zeros(3, dtype=float)
+    thumbstick_rotation = Rotation.from_rotvec(np.zeros(3, dtype=float))
     thumbstick_updated_at: float | None = None
     latched_base_t_anchor: np.ndarray | None = None
     telemetry: dict[str, object] = {}
+    tool_tip_offset = np.asarray(teleop_config.tool_tip_offset_m, dtype=float)
 
     def startup() -> None:
         nonlocal clutch
@@ -807,8 +816,8 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
         print("Starting teleop loop. Squeeze and move the controller to teleoperate the robot...")
 
     def compute(robot_obs) -> dict | None:
-        nonlocal clutch, prev_enabled, last_pos, last_rpy, locked_rpy
-        nonlocal latched_base_t_anchor, thumbstick_rpy_offset, thumbstick_updated_at
+        nonlocal clutch, prev_enabled, last_clutch_pos, last_pos, last_rpy, locked_rpy
+        nonlocal latched_base_t_anchor, thumbstick_rotation, thumbstick_updated_at
         if clutch is None:
             raise RuntimeError("compute() called before startup()")
 
@@ -893,19 +902,22 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
             measured_pose = tuple(float(robot_obs[key]) for key in eef_keys)
             measured_base_t_ee = _pose6_to_base_t_ee(measured_pose)
             clutch.engage(grip_pos, grip_quat, home_base_T_ee=measured_base_t_ee)
+            last_clutch_pos = None
             last_pos = None  # drop the rate-limit reference so we don't fight the new home
             last_rpy = np.asarray(measured_pose[3:], dtype=float)
             locked_rpy = last_rpy.copy() if teleop_config.lock_pose else None
-            thumbstick_rpy_offset.fill(0.0)
+            thumbstick_rotation = Rotation.from_rotvec(np.zeros(3, dtype=float))
             thumbstick_updated_at = frame_time
         prev_enabled = enabled
 
         # Hold the arm at the measured pose while the clutch is disengaged — the
         # recorder's HoldLatch freezes the value on the first idle frame.
         if not enabled:
+            last_clutch_pos = None
+            last_pos = None
             last_rpy = None
             locked_rpy = None
-            thumbstick_rpy_offset.fill(0.0)
+            thumbstick_rotation = Rotation.from_rotvec(np.zeros(3, dtype=float))
             thumbstick_updated_at = None
             if not requested_enabled:
                 latched_base_t_anchor = None
@@ -913,15 +925,15 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
 
         pos, quat = clutch.rebase(grip_pos, grip_quat)
 
-        # Per-frame position step limit (defence in depth; JAKA's own clamp is stricter).
-        if last_pos is not None:
-            delta = pos - last_pos
+        # Filter controller translation before adding the deterministic pivot compensation.
+        if last_clutch_pos is not None:
+            delta = pos - last_clutch_pos
             n = float(np.linalg.norm(delta))
             if n <= teleop_config.position_deadband_m:
-                pos = last_pos.copy()
+                pos = last_clutch_pos.copy()
             elif n > MAX_EE_STEP_M:
-                pos = last_pos + delta * (MAX_EE_STEP_M / n)
-        last_pos = pos.copy()
+                pos = last_clutch_pos + delta * (MAX_EE_STEP_M / n)
+        last_clutch_pos = pos.copy()
 
         if last_rpy is None:
             raise RuntimeError("XR orientation state was not initialized on clutch engage")
@@ -934,24 +946,48 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
         stick_x = _thumbstick_axis(thumbstick_x, teleop_config.thumbstick_deadband)
         stick_y = _thumbstick_axis(thumbstick_y, teleop_config.thumbstick_deadband)
         angular_step = teleop_config.thumbstick_angular_speed_rad_s * elapsed_s
-        # X normally trims yaw and Y trims pitch. Holding the stick click changes
-        # horizontal input to roll, making all three orientation axes reachable.
-        thumbstick_rpy_offset[1] += stick_y * angular_step
+        # Base-frame axes keep the mapping operator-relative: +X rotation tilts a
+        # downward tool forward, while -Y rotation tilts it right. Stick-click keeps
+        # the third degree of freedom available as base-frame yaw.
         if thumbstick_click >= 0.5:
-            thumbstick_rpy_offset[0] += stick_x * angular_step
+            incremental_rotvec = np.array(
+                [stick_y * angular_step, 0.0, stick_x * angular_step], dtype=float
+            )
         else:
-            thumbstick_rpy_offset[2] += stick_x * angular_step
+            incremental_rotvec = np.array(
+                [stick_y * angular_step, -stick_x * angular_step, 0.0], dtype=float
+            )
+        thumbstick_rotation = Rotation.from_rotvec(incremental_rotvec) * thumbstick_rotation
 
         if teleop_config.lock_pose:
             if locked_rpy is None:
                 raise RuntimeError("XR locked orientation was not initialized on clutch engage")
-            target_rpy = locked_rpy + thumbstick_rpy_offset
+            locked_pose = (0.0, 0.0, 0.0, *(float(value) for value in locked_rpy))
+            base_rotation = Rotation.from_matrix(_pose6_to_base_t_ee(locked_pose)[:3, :3])
         else:
-            hand_rpy = np.asarray(
-                _matrix_to_rpy(Rotation.from_quat(quat).as_matrix(), reference_rpy=last_rpy)
-            )
-            target_rpy = hand_rpy + thumbstick_rpy_offset
-            last_rpy = hand_rpy
+            base_rotation = Rotation.from_quat(quat)
+        target_rotation = thumbstick_rotation * base_rotation
+        target_rpy = np.asarray(
+            _matrix_to_rpy(target_rotation.as_matrix(), reference_rpy=last_rpy), dtype=float
+        )
+        last_rpy = target_rpy.copy()
+
+        # Keep the physical tool tip fixed while orientation changes. ``pos`` is the
+        # uncompensated tool-0 flange target; both offset terms are expressed in base.
+        pos = (
+            pos
+            + base_rotation.as_matrix() @ tool_tip_offset
+            - target_rotation.as_matrix() @ tool_tip_offset
+        )
+
+        # Apply the defence-in-depth Cartesian step limit to the final flange command.
+        if last_pos is not None:
+            delta = pos - last_pos
+            n = float(np.linalg.norm(delta))
+            if n > MAX_EE_STEP_M:
+                pos = last_pos + delta * (MAX_EE_STEP_M / n)
+        last_pos = pos.copy()
+
         roll, pitch, yaw = (float(value) for value in target_rpy)
         return {
             "ee.x": float(pos[0]),
@@ -973,14 +1009,15 @@ def make_xr_device(robot, teleop_config: XRControllerConfig) -> dict:
     def rearm() -> None:
         """Force the next squeeze frame to latch a fresh measured robot pose."""
 
-        nonlocal prev_enabled, last_pos, last_rpy, locked_rpy, latched_base_t_anchor
-        nonlocal thumbstick_rpy_offset, thumbstick_updated_at
+        nonlocal prev_enabled, last_clutch_pos, last_pos, last_rpy, locked_rpy
+        nonlocal latched_base_t_anchor, thumbstick_rotation, thumbstick_updated_at
         prev_enabled = False
+        last_clutch_pos = None
         last_pos = None
         last_rpy = None
         locked_rpy = None
         latched_base_t_anchor = None
-        thumbstick_rpy_offset.fill(0.0)
+        thumbstick_rotation = Rotation.from_rotvec(np.zeros(3, dtype=float))
         thumbstick_updated_at = None
         telemetry.update(clutch_engaged=False, clutch_released=True)
 

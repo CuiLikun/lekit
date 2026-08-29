@@ -34,7 +34,7 @@ where = ["src"]
 [tool.setuptools.package-data]
 "lekit.control" = ["hub.html"]
 "lekit.robots.jaka_robot" = ["web_debug.html"]
-"lekit.teleoperators.isaac_teleop" = ["teleop_node_monitor.html", "teleop_node_monitor.js", "three.*"]
+"lekit.teleoperators.isaac_teleop.node" = ["assets/*", "assets/vendor/*"]
 
 [tool.uv]
 package = true

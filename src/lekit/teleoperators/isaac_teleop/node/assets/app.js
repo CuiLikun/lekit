@@ -1,4 +1,5 @@
 import * as THREE from "./three.module.min.js";
+import { OrbitControls } from "./OrbitControls.js";
 import { EngagementTrajectory } from "./teleop_node_monitor_trajectory.js";
 
 const SIDES = ["left", "right"];
@@ -154,7 +155,7 @@ function applyStatus(status) {
 
 function showStreamDisconnected(message) {
   const badge = document.getElementById("badge");
-  badge.textContent = "monitor disconnected";
+  badge.textContent = "disconnected";
   badge.style.color = "var(--bad)";
   badge.style.borderColor = "var(--bad)";
   document.getElementById("updated").textContent = message;
@@ -210,6 +211,19 @@ class RelativePoseScene {
     this.camera = new THREE.PerspectiveCamera(40, 1, 0.01, 20);
     this.camera.position.set(0, 0.62, 1.45);
     this.camera.lookAt(0, 0.08, 0);
+    this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+    this.controls.target.set(0, 0.08, 0);
+    this.controls.enableDamping = true;
+    this.controls.dampingFactor = 0.08;
+    this.controls.screenSpacePanning = true;
+    this.controls.minDistance = 0.35;
+    this.controls.maxDistance = 3;
+    this.controls.minPolarAngle = 0.15;
+    this.controls.maxPolarAngle = Math.PI - 0.15;
+    this.controls.maxTargetRadius = 0.8;
+    this.controls.update();
+    this.controls.saveState();
+    this.renderer.domElement.addEventListener("dblclick", () => this.controls.reset());
 
     this.scene.add(new THREE.HemisphereLight(0xd8edff, 0x18202a, 2.4));
     const keyLight = new THREE.DirectionalLight(0xffffff, 2.2);
@@ -398,6 +412,7 @@ class RelativePoseScene {
         controller.pose.quaternion.slerp(controller.targetQuaternion, 0.22);
       }
     }
+    this.controls.update();
     this.renderer.render(this.scene, this.camera);
     this.renderFrames += 1;
     const elapsedMs = timestamp - this.renderWindowStartedAt;

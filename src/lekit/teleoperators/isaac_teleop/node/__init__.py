@@ -1,6 +1,7 @@
-"""Compatibility interface for the relocated Isaac teleop node runtime."""
+"""Independent Isaac teleop node runtime and monitor."""
 
-from .node.runtime import (
+from .monitor import TeleopNodeSnapshot, TeleopNodeState, create_monitor_app
+from .runtime import (
     IsaacControllerNodeConfig,
     MonitorServer,
     TeleopNode,
@@ -14,9 +15,9 @@ __all__ = [
     "MonitorServer",
     "TeleopNode",
     "TeleopNodeConfig",
+    "TeleopNodeSnapshot",
+    "TeleopNodeState",
+    "create_monitor_app",
     "main",
     "make_isaac_controller_node",
 ]
-
-if __name__ == "__main__":
-    main()

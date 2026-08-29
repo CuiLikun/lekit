@@ -16,7 +16,7 @@ from lekit.teleoperators.isaac_teleop.teleop_node import MonitorServer
 
 _NODE = shutil.which("node")
 _TRAJECTORY_MODULE = (
-    Path(__file__).parents[2] / "src/lekit/teleoperators/isaac_teleop/teleop_node_monitor_trajectory.js"
+    Path(__file__).parents[2] / "src/lekit/teleoperators/isaac_teleop/node/assets/trajectory.js"
 )
 
 
@@ -204,6 +204,7 @@ def test_monitor_serves_all_visualization_assets_locally() -> None:
     trajectory = client.get("/assets/teleop_node_monitor_trajectory.js")
     three = client.get("/assets/three.module.min.js")
     three_core = client.get("/assets/three.core.min.js")
+    orbit_controls = client.get("/assets/OrbitControls.js")
     license_file = client.get("/assets/three.LICENSE.txt")
 
     assert script.status_code == 200
@@ -217,6 +218,8 @@ def test_monitor_serves_all_visualization_assets_locally() -> None:
     assert three_core.status_code == 200
     assert "javascript" in three_core.headers["content-type"]
     assert len(three_core.content) > 300_000
+    assert orbit_controls.status_code == 200
+    assert "javascript" in orbit_controls.headers["content-type"]
     assert license_file.status_code == 200
     assert "MIT License" in license_file.text
 

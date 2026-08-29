@@ -1,0 +1,31 @@
+endpoints:
+  stream_pub: "tcp://127.0.0.1:5555"
+
+idle_policy:
+  enabled: true
+  sleep_after_s: 60
+
+cameras:
+  - name: "base_camera"
+    driver: "realsense"
+    device:
+      serial: "347522072196"
+    profile:
+      width: 640
+      height: 480
+      fps: 30
+    encoding:
+      codec: "jpeg"
+      jpeg_quality: 85
+
+  - name: "hand_camera"
+    driver: "realsense"
+    device:
+      serial: "342522070741"
+    profile:
+      width: 640
+      height: 480
+      fps: 30
+    encoding:
+      codec: "jpeg"
+      jpeg_quality: 85

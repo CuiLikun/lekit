@@ -5,6 +5,8 @@ set -uo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 PROJECT_ROOT=$(cd -- "$SCRIPT_DIR/../../.." && pwd -P)
 PIPER_CONFIG="$PROJECT_ROOT/configs/piper_lehub.json"
+PIPER_TRANSLATION_SCALE=${LEHUB_PIPER_TRANSLATION_SCALE:-1.0}
+PIPER_ROTATION_SCALE=${LEHUB_PIPER_ROTATION_SCALE:-0.1}
 HUB_PORT=8080
 PIDS=()
 NAMES=()
@@ -20,6 +22,10 @@ Usage:
 Environment:
   LEHUB_HOST       LAN IPv4 advertised to Quest and browser clients.
                    Defaults to the source address of the default IPv4 route.
+  LEHUB_PIPER_ROTATION_SCALE
+                   Quest-to-Piper rotation gain. Defaults to 0.1.
+  LEHUB_PIPER_TRANSLATION_SCALE
+                   Quest-to-Piper translation gain. Defaults to 1.0.
 EOF
 }
 
@@ -144,6 +150,11 @@ start_node "Piper Robot" uv run lekit robot \
   --video-host 0.0.0.0 \
   --video-port 8081 \
   --advertise-host "$ADVERTISE_HOST" \
+  --control-rate-hz 30 \
+  --processor.translation_scale "$PIPER_TRANSLATION_SCALE" \
+  --processor.rotation_scale "$PIPER_ROTATION_SCALE" \
+  --processor.max_translation_from_anchor_m 0.10 \
+  --processor.max_rotation_from_anchor_rad 0.17453292519943295 \
   --enable-motion
 
 echo

@@ -53,6 +53,7 @@ discards the current episode, and Esc/q stops immediately.
 
 import logging
 import math
+import signal
 import sys
 import time
 from collections import deque
@@ -1256,8 +1257,24 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     return dataset
 
 
-def main():
-    record()
+def _interrupt_recording(_signum: int, _frame: Any) -> None:
+    """Unwind through recorder cleanup for both interactive and supervised stops."""
+
+    raise KeyboardInterrupt
+
+
+def main() -> None:
+    previous_handlers = {
+        signum: signal.signal(signum, _interrupt_recording)
+        for signum in (signal.SIGINT, signal.SIGTERM)
+    }
+    try:
+        record()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 
 if __name__ == "__main__":

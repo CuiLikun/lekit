@@ -8,6 +8,16 @@ from lekit.teleoperators.isaac_teleop.protocol import ACTION_KEYS, decode_action
 from lekit.teleoperators.isaac_teleop.teleop_node import TeleopNode, TeleopNodeConfig
 
 
+def test_node_package_preserves_the_legacy_runtime_interface() -> None:
+    from lekit.teleoperators.isaac_teleop.node import (
+        TeleopNode as CanonicalTeleopNode,
+        TeleopNodeConfig as CanonicalTeleopNodeConfig,
+    )
+
+    assert CanonicalTeleopNode is TeleopNode
+    assert CanonicalTeleopNodeConfig is TeleopNodeConfig
+
+
 class ManualTime:
     def __init__(self) -> None:
         self.now = 10.0
@@ -85,6 +95,7 @@ class FakeControlNode:
         self.events: list[str] = []
         self.published = []
         self._published = published
+        self.current_handle = None
 
     def start(self) -> None:
         self.events.append("start")

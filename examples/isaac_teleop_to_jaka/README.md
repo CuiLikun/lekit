@@ -94,9 +94,23 @@ p_tcp_target = p_tcp_home + (p_grip_current - p_grip_origin)
 
 手柄方向四元数使用同一锁存旋转变换到 JAKA base，再由 clutch 计算相对旋转。使用
 `--teleop.lock_pose=true` 时，接合瞬间的实测 TCP roll/pitch/yaw 会作为姿态基准，手柄
-移动只控制平移。持续按住 squeeze 时，摇杆上下调节 pitch，左右调节 yaw；按住摇杆
-再左右推动可调节 roll。松开 squeeze 后停止姿态调节，下次接合会从新的实测 TCP 姿态
-重新开始，不会沿用上一次的姿态偏移。
+移动只控制平移。持续按住 squeeze 时，摇杆前后让工具向前后倾斜，左右让工具向左右
+倾斜；按住摇杆再左右推动可让工具水平转向。旋转按 JAKA base 坐标系累积，不直接累加
+Euler 角。松开 squeeze 后停止姿态调节，下次接合会从新的实测 TCP 姿态重新开始，不会
+沿用上一次的姿态偏移。
+
+`--teleop.tool_tip_offset_m` 表示 tool-0 法兰原点到物理旋转中心的工具坐标系 XYZ 偏移。
+例如夹爪末端位于工具 `+Z` 方向 0.27 m 时，设置
+`--teleop.tool_tip_offset_m='[0,0,0.27]'`。程序在改变姿态的同时按下式补偿法兰位置：
+
+```text
+p_tip = p_flange + R_base * tool_tip_offset
+p_flange_target = p_tip - R_target * tool_tip_offset
+```
+
+因此摇杆只改变姿态时，物理夹爪末端保持在同一点。默认偏移为 `[0,0,0]`，未配置的其他
+工具仍保持原有行为。这里的软件补偿以 `tool_id=0` 的反馈确实是法兰原点为前提；不要再在
+JAKA 控制器里给工具 0 配置同一个 0.27 m TCP 偏移，否则会发生重复补偿。
 
 摇杆中心死区和满量程角速度可分别通过
 `--teleop.thumbstick_deadband`（默认 `0.15`）与
